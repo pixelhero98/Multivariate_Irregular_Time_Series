@@ -169,6 +169,46 @@ def compute_metrics(
     return results
 
 
+def evaluate_model(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    task: str = 'regression',
+    threshold: float = 0.5,
+    device: torch.device | str | None = None,
+) -> dict:
+    """
+    Evaluate a PyTorch model on a DataLoader and compute metrics.
+
+    Parameters
+    ----------
+    model: PyTorch model to evaluate.     
+    loader: DataLoader yielding (x, y, date).
+    task: 'regression' or 'classification'.
+    threshold: cutoff for binary classification.
+    device: torch device (e.g., 'cuda' or 'cpu').
+
+    Returns
+    -------
+    metrics dict as returned by compute_metrics.
+    """
+    import numpy as np
+    model.eval()
+    all_preds, all_trues = [], []
+    with torch.no_grad():
+        for x, y, _ in loader:
+            if device:
+                x = x.to(device)
+            preds = model(x)
+            # If model returns logits for classification, apply sigmoid
+            preds_np = preds.cpu().numpy()
+            trues_np = y.cpu().numpy()
+            all_preds.append(preds_np)
+            all_trues.append(trues_np)
+    preds_array = np.vstack(all_preds)
+    trues_array = np.vstack(all_trues)
+    return compute_metrics(preds_array, trues_array, task=task, threshold=threshold)
+
+
 def prepare_data_and_backtester(
     df: pd.DataFrame,
     tickers: list[str],
@@ -216,25 +256,45 @@ def prepare_data_and_backtester(
 
     return ds, bt, train_loader, test_loader
 
-# === Example: Evaluate on Test Set and Compute Metrics ===
-# ds, bt, train_loader, test_loader = prepare_data_and_backtester(..., task='regression' or 'classification')
+# === Example: Training and Evaluation Workflow ===
 #
-# Collect predictions and true labels:
-# all_preds, all_trues, all_dates = [], [], []
-# model.eval()
+# 1) Prepare data and backtester:
+# ds, bt, train_loader, test_loader = \
+#     prepare_data_and_backtester(
+#         df, tickers, features, close_feature,
+#         window=10,
+#         split_ratio=0.8,
+#         batch_size=32,
+#         task='regression',  # or 'classification'
+#         use_log_returns=True,
+#         threshold=0.0
+#     )
+#
+# 2) Training loop (simplified):
+# model = YourModel(...)
+# optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+# for epoch in range(epochs):
+#     model.train()
+#     for x_batch, y_batch, _ in train_loader:
+#         preds = model(x_batch)
+#         # choose appropriate loss:
+#         # regression: loss_fn = nn.MSELoss(); loss = loss_fn(preds, y_batch)
+#         # classification: loss_fn = nn.BCEWithLogitsLoss(); loss = loss_fn(preds, y_batch.float())
+#         loss = loss_fn(preds, y_batch)
+#         optimizer.zero_grad(); loss.backward(); optimizer.step()
+#
+#     # 3) Evaluate ML metrics on test set
+#     dl_metrics = evaluate_model(model, test_loader, task='regression', threshold=0.0, device='cpu')
+#     print(f"Epoch {epoch}: DL metrics ->", dl_metrics)
+#
+# 4) Backtest test-set predictions
+# preds_all = []
+# dates_all = []
 # with torch.no_grad():
-#     for x, y, dates in test_loader:
-#         preds = model(x).numpy()
-#         all_preds.append(preds)
-#         all_trues.append(y.numpy())
-#         all_dates.extend(dates)
-# preds_array = np.vstack(all_preds)
-# trues_array = np.vstack(all_trues)
-#
-# 1) Deep learning metrics:
-# dl_metrics = compute_metrics(preds_array, trues_array, task=task, threshold=threshold)
-# print("DL metrics:", dl_metrics)
-#
-# 2) Backtest performance:
-# bt_results = bt.run_backtest(preds_array, all_dates)
+#     for x_batch, _, dates in test_loader:
+#         preds = model(x_batch).cpu().numpy()
+#         preds_all.append(preds)
+#         dates_all.extend(dates)
+# preds_array = np.vstack(preds_all)
+# bt_results = bt.run_backtest(preds_array, dates_all)
 # print("Backtest results:", bt_results)
