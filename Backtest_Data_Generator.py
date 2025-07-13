@@ -4,6 +4,8 @@ from torch.utils.data import Dataset
 from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score
 import torch
 import torch.nn as nn
+import yfinance as yf
+from torch.utils.data import DataLoader
 
 # ---------------------------------------------------------------------
 # 1. DATASET  (feature_names removed – only close_index is required)
@@ -160,11 +162,6 @@ def build_feature_cube(df: pd.DataFrame, tickers: list[str], feature_order: list
         wide = df[feat][tickers].ffill().values  # (T,N)
         cube[:, :, f_idx] = wide
     return cube
-
-
-
-import yfinance as yf
-from torch.utils.data import DataLoader
 
 def prepare_data_and_backtester(tickers, start, end, features, close_feature, window, split_ratio=0.45, batch_size=64):
     """
