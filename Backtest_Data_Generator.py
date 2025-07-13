@@ -1,201 +1,249 @@
 import numpy as np
 import pandas as pd
-from torch.utils.data import Dataset
-from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score
 import torch
-import torch.nn as nn
-import yfinance as yf
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 
-# ---------------------------------------------------------------------
-# 1. DATASET  (feature_names removed – only close_index is required)
-# ---------------------------------------------------------------------
-class CrossSectionDataset(Dataset):
-    """Sliding-window, multi-asset dataset.
 
-    Parameters
-    ----------
-    data : ndarray (T, N, F)
-        Daily feature cube (time × asset × feature).
-    dates : array-like (T,)
-        Matching datetime index.
-    window : int
-        Look-back length W.
-    close_index : int
-        Column index of the *close* price in axis-2.
-    produce_cls / produce_reg : bool
-        Toggle creation of classification / regression targets.
+def build_feature_cube(df: pd.DataFrame, features: list[str], tickers: list[str]) -> np.ndarray:
     """
-    def __init__(self,
-                 data: np.ndarray,
-                 dates: np.ndarray,
-                 window: int,
-                 close_index: int,
-                 produce_cls: bool = True,
-                 produce_reg: bool = True):
+    Build a 3D NumPy array of shape (T, N, F) from a DataFrame.
 
-        T, N, F = data.shape
+    Steps:
+    1. Select columns: subset df by features and tickers.
+    2. Forward-fill (ffill) then backward-fill (bfill) missing values to ensure no NaNs.
+    3. Extract underlying values array of shape (T, N, F).
+    """
+    # Slice DataFrame to get only the required features for each ticker
+    wide = df[features][tickers]
+    # Fill any missing data both forward and backward
+    wide_filled = wide.ffill().bfill().values
+    # Compute dimensions: T = time steps, N = tickers, F = features
+    T, N, F = wide_filled.shape[0], len(tickers), len(features)
+    # Reshape to (T, N, F) and return
+    return wide_filled.reshape(T, N, F)
+
+
+class CrossSectionDataset(Dataset):
+    """
+    PyTorch Dataset for cross-sectional modeling.
+
+    Each sample corresponds to one prediction date:
+      - Input X[i]: a tensor of shape (N, F, window) containing lookback features.
+      - Label y[i]: raw price, return, or binary up/down, per ticker.
+      - Date dates[i]: the prediction date for indexing/evaluation.
+    """
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        tickers: list[str],
+        features: list[str],
+        close_feature: str,
+        window: int = 10,
+        use_returns: bool = False,
+        classification: bool = False,
+        threshold: float = 0.0,
+    ):
+        super().__init__()
+        # Validate that the target column exists in features
+        if close_feature not in features:
+            raise ValueError(f"close_feature '{close_feature}' must be in features list")
+        # Classification mode requires computing returns first
+        if classification and not use_returns:
+            raise ValueError("Classification requires use_returns=True to compute return labels.")
+
+        # Store mode flags
+        self.use_returns = use_returns
+        self.classification = classification
+        self.threshold = threshold
+
+        # Build full feature cube of shape (T, N, F)
+        X_all = build_feature_cube(df, features, tickers)
+        dates = df.index.to_numpy()
+        T = X_all.shape[0]
+        # Number of samples: drop the first 'window' days + the last day (target uses t+1)
         S = T - window - 1
-        self.data        = data
-        self.dates_all   = np.asarray(dates)
-        self.close_index = close_index
-        self.produce_cls = produce_cls
-        self.produce_reg = produce_reg
-        self.N, self.F, self.W = N, F, window
 
-        self.X = np.zeros((S, N, window * F), dtype=np.float32)
-        self.y_cls = np.zeros((S, N), dtype=np.int64)   if produce_cls else None
-        self.y_reg = np.zeros((S, N), dtype=np.float32) if produce_reg else None
-        self.dates = []
+        # Initialize storage for inputs and labels
+        # X: (samples, tickers, features, window)
+        self.X = np.zeros((S, len(tickers), len(features), window), dtype=np.float32)
+        # y: int64 for classification, float32 for regression
+        label_dtype = np.int64 if classification else np.float32
+        self.y = np.zeros((S, len(tickers)), dtype=label_dtype)
+        self.dates = []  # store the date for each sample
 
+        # Determine which feature index is the 'close' price
+        idx_close = features.index(close_feature)
+
+        # Slide over time to populate X and y
         for t in range(window, T - 1):
-            i = t - window
-            past = data[t-window:t]  # (W,N,F)
-            self.X[i] = past.transpose(1, 0, 2).reshape(N, window * F)
+            i = t - window  # sample index
+            # Extract the previous `window` days of features for all tickers
+            block = X_all[t-window:t, :, :]  # shape (window, N, F)
+            # Rearrange to (N, F, window) for PyTorch conv/net compatibility
+            self.X[i] = np.transpose(block, (1, 2, 0))
 
-            today_close = data[t, :, close_index]
-            next_close  = data[t+1, :, close_index]
-            if produce_cls:
-                self.y_cls[i] = (next_close > today_close).astype(np.int64)
-            if produce_reg:
-                self.y_reg[i] = next_close
-            self.dates.append(pd.to_datetime(dates[t+1]))
+            # Next-day closing price for each ticker
+            next_price = X_all[t + 1, :, idx_close]
 
-    def __len__(self):
-        return self.X.shape[0]
+            if use_returns:
+                # Compute simple return: (P_{t+1} - P_t) / P_t
+                today_price = X_all[t, :, idx_close]
+                returns = (next_price - today_price) / today_price
+                if classification:
+                    # Binary classification: up/down based on threshold
+                    self.y[i] = (returns > self.threshold).astype(np.int64)
+                else:
+                    # Regression on simple returns
+                    self.y[i] = returns
+            else:
+                # Regression on raw next-day prices
+                self.y[i] = next_price
 
-    def __getitem__(self, idx):
-        feats = torch.from_numpy(self.X[idx])
-        cls   = torch.from_numpy(self.y_cls[idx]) if self.produce_cls else torch.empty(0)
-        reg   = torch.from_numpy(self.y_reg[idx]) if self.produce_reg else torch.empty(0)
-        return feats, cls, reg
+            # Record the target date corresponding to next_price
+            self.dates.append(pd.to_datetime(dates[t + 1]))
 
-    def split(self, ratio: float = 0.8):
-        S = int(len(self) * ratio)
-        self.dates_test = self.dates[S:]
-        return (self.X[:S],  self.y_cls[:S] if self.produce_cls else None, self.y_reg[:S] if self.produce_reg else None,
-                self.X[S:], self.y_cls[S:] if self.produce_cls else None, self.y_reg[S:] if self.produce_reg else None)
+    def __len__(self) -> int:
+        # Number of samples in the dataset
+        return len(self.y)
 
-# ---------------------------------------------------------------------
-# 2. BACKTESTER – simplified for direct compatibility (no reshape)
-# ---------------------------------------------------------------------
+    def __getitem__(self, idx: int):
+        # Return a single sample: (features, label, date)
+        x = torch.from_numpy(self.X[idx])  # tensor shape (N, F, window)
+        y = torch.from_numpy(self.y[idx])  # tensor shape (N,)
+        date = self.dates[idx]             # pandas.Timestamp
+        return x, y, date
+
+
 class Backtester:
-    """Evaluate a pre-trained model and compute back-test metrics."""
+    """
+    Utility for evaluating predictions against true series.
 
-    def __init__(self, dataset: CrossSectionDataset, split_ratio: float = .45):
-        (self.X_tr, self.yc_tr, self.yr_tr,
-         self.X_te, self.yc_te, self.yr_te) = dataset.split(split_ratio)
-        self.dates_test  = np.asarray(dataset.dates_test)
-        self.data        = dataset.data
-        self.dates_all   = dataset.dates_all
-        self.close_idx   = dataset.close_index
-        self.N, self.F, self.W = dataset.N, dataset.F, dataset.W
-        self.num_test    = self.X_te.shape[0]
+    Attributes
+    ----------
+    dates_all: np.ndarray of all prediction dates (matching y).  
+    prices_all: np.ndarray of true labels (prices or returns) aligned to df index.
+    date_to_index: mapping from np.datetime64(date) -> integer index.
+    """
+    def __init__(self, dates_all: list[pd.Timestamp], prices_all: np.ndarray):
+        # Store arrays for fast indexing
+        self.dates_all = np.array(dates_all)
+        self.prices_all = prices_all
+        # Build dict for O(1) date lookups
+        self.date_to_index = {np.datetime64(dt): i for i, dt in enumerate(self.dates_all)}
 
-    def run(self, model: nn.Module, thresh: float = 0.5):
-        X_test_np = self.X_te.copy()  # already (S, N, W*F)
-        y_r   = model.predict_reg(X_test_np)              # (S,N)
-        y_prob= model.predict_clf(X_test_np)              # (S,N)
-        y_sig = (y_prob > thresh).astype(int)
+    def _index_of(self, date: pd.Timestamp) -> int:
+        # Convert to np.datetime64 for dict key lookup
+        key = np.datetime64(date)
+        if key not in self.date_to_index:
+            raise KeyError(f"Date {date} not found in index")
+        return self.date_to_index[key]
 
-        ml = {}
-        if self.yr_te is not None:
-            ml['mse'] = mean_squared_error(self.yr_te.flatten(), y_r.flatten())
-            ml['mae'] = mean_absolute_error(self.yr_te.flatten(), y_r.flatten())
-        if self.yc_te is not None:
-            ml['acc'] = accuracy_score(self.yc_te.flatten(), y_sig.flatten())
+    def run_backtest(self, pred: np.ndarray, dates: list[pd.Timestamp]) -> dict:
+        """
+        Compare predictions to true values and compute performance metrics.
 
-        rets = np.zeros_like(y_r)
-        p_t  = np.zeros_like(y_r)
-        for i, dt in enumerate(self.dates_test):
-            idx = np.where(self.dates_all == np.datetime64(dt))[0][0]
-            p_t[i]  = self.data[idx-1, :, self.close_idx]
-            nxt     = self.data[idx,   :, self.close_idx]
-            rets[i] = nxt / p_t[i] - 1
+        pred: array of predicted labels (shape: S×N or flattened)
+        dates: list of target dates aligning each pred to actual price/return
 
-        pnl_c  = (y_sig * rets).mean(axis=1)
-        pred_r = (y_r - p_t) / p_t
-        pnl_rb = ((pred_r > 0).astype(int) * rets).mean(axis=1)
-        abs_sum= np.abs(pred_r).sum(axis=1, keepdims=True)
-        weights= np.divide(pred_r, abs_sum, where=abs_sum>0)
-        pnl_rc = (weights * rets).sum(axis=1)
+        Returns a dict with:
+          - equity: cumulative P&L series
+          - return: final P&L
+          - sharpe: annualized Sharpe ratio
+          - max_drawdown: maximum peak-to-trough drawdown
+        """
+        # Map each prediction date to the index in `prices_all`
+        idxs = [self._index_of(d) for d in dates]
+        preds = pred.flatten()
+        trues = self.prices_all[idxs].flatten()
 
-        def perf(pnl):
-            eq = np.cumprod(1+pnl)
-            cum = eq[-1]-1
-            std = pnl.std()
-            sharpe = pnl.mean()/std*np.sqrt(252) if std>0 else np.nan
-            dd = (eq - np.maximum.accumulate(eq)) / np.maximum.accumulate(eq)
-            return cum, sharpe, dd.min()
+        # Compute cumulative P&L: sum of (pred - true)
+        eq = np.cumsum(preds - trues)
+        rtn = eq[-1]
+        # Period returns are daily P&L increments
+        returns = np.diff(eq, prepend=0)
+        # Annualized Sharpe: mean/std * sqrt(252)
+        sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252)
 
-        bt = pd.DataFrame([perf(pnl_c), perf(pnl_rb), perf(pnl_rc)],
-                          index=['classification','regression-binary','regression-continuous'],
-                          columns=['cumulative_return','sharpe','max_drawdown'])
-        return ml, bt
+        # Peak-to-trough drawdown
+        peak = np.maximum.accumulate(eq)
+        drawdowns = (peak - eq) / peak
+        max_dd = np.max(drawdowns)
 
-# ---------------------------------------------------------------------
-# 3. HELPER – convert yfinance DataFrame → (T, N, F) cube
-# ---------------------------------------------------------------------
+        return {"equity": eq, "return": rtn, "sharpe": sharpe, "max_drawdown": max_dd}
 
-def build_feature_cube(df: pd.DataFrame, tickers: list[str], feature_order: list[str]) -> np.ndarray:
-    """Convert a yfinance OHLCV DataFrame to a 3‑D numpy cube.
+
+def prepare_data_and_backtester(
+    df: pd.DataFrame,
+    tickers: list[str],
+    features: list[str],
+    close_feature: str,
+    window: int = 10,
+    split_ratio: float = 0.8,
+    batch_size: int = 32,
+    task: str = 'regression',  # 'regression' or 'classification'
+    use_returns: bool = False,  # only used in regression mode
+    threshold: float = 0.0,      # classification cutoff on returns
+):
+    """
+    Top-level function to instantiate dataset, dataloaders, and backtester.
 
     Parameters
     ----------
-    df : DataFrame
-        Multi‑index columns: level‑0 = feature (e.g. 'Open'), level‑1 = ticker.
-    tickers : list[str]
-        Tickers in the order you want along axis‑1 (N).
-    feature_order : list[str]
-        Features in the order you want along axis‑2 (F).  The index of 'Close'
-        in this list is the close_index you supply to CrossSectionDataset.
+    df: DataFrame indexed by date, with columns for each ticker and feature.
+    tickers: list of ticker symbols to include.
+    features: list of feature names that appear in df columns.
+    close_feature: feature name used as price target.
+    window: number of lookback days per sample.
+    split_ratio: fraction of samples for training set.
+    batch_size: samples per batch in DataLoader.
+    task: 'regression' (price/return) or 'classification' (binary up/down).
+    use_returns: if True, regress on simple returns; otherwise regress on raw price.
+    threshold: for classification, the return cutoff for labeling up/down.
 
     Returns
     -------
-    cube : ndarray (T, N, F)
+    ds: CrossSectionDataset instance.
+    bt: Backtester instance for performance evaluation.
+    train_loader: DataLoader for training split.
+    test_loader: DataLoader for testing split.
     """
-    T = len(df)
-    N = len(tickers)
-    F = len(feature_order)
-    cube = np.empty((T, N, F), dtype=np.float32)
-    for f_idx, feat in enumerate(feature_order):
-        wide = df[feat][tickers].ffill().values  # (T,N)
-        cube[:, :, f_idx] = wide
-    return cube
+    # Determine classification mode
+    classification = (task == 'classification')
+    # Force returns if classifying
+    if classification:
+        use_returns = True
 
-def prepare_data_and_backtester(tickers, start, end, features, close_feature, window, split_ratio=0.45, batch_size=64):
-    """
-    Downloads market data, creates dataset and backtester, and returns DataLoader.
-
-    Parameters:
-    - tickers: list[str] - stock symbols
-    - start, end: str - date range
-    - features: list[str] - features to use (e.g., ['Open', 'High', 'Low', 'Close'])
-    - close_feature: str - the feature to use as the close price (e.g., 'Close')
-    - window: int - historical window length
-    - split_ratio: float - train/test split ratio
-    - batch_size: int - DataLoader batch size
-
-    Returns:
-    - ds: CrossSectionDataset instance
-    - bt: Backtester instance
-    - train_loader: DataLoader for training data
-    """
-
-    raw = yf.download(tickers, start=start, end=end, auto_adjust=True)
-    cube = build_feature_cube(raw, tickers=tickers, feature_order=features)
-
-    close_index = features.index(close_feature)
+    # Create dataset
     ds = CrossSectionDataset(
-        data=cube,
-        dates=raw.index.to_numpy(),
-        window=window,
-        close_index=close_index,
-        produce_cls=True,
-        produce_reg=True
+        df,
+        tickers,
+        features,
+        close_feature,
+        window,
+        use_returns=use_returns,
+        classification=classification,
+        threshold=threshold,
+    )
+    # Split indices for train/test
+    n = len(ds)
+    split_idx = int(split_ratio * n)
+    train_idx = list(range(split_idx))
+    test_idx = list(range(split_idx, n))
+
+    # Instantiate PyTorch DataLoaders
+    train_loader = DataLoader(
+        torch.utils.data.Subset(ds, train_idx),
+        batch_size=batch_size,
+        shuffle=True
+    )
+    test_loader = DataLoader(
+        torch.utils.data.Subset(ds, test_idx),
+        batch_size=batch_size,
+        shuffle=False
     )
 
-    bt = Backtester(ds, split_ratio=split_ratio)
-    train_loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+    # Prepare backtester using true close prices
+    prices_all = np.array(df[close_feature])
+    bt = Backtester(ds.dates, prices_all)
 
-    return ds, bt, train_loader
+    return ds, bt, train_loader, test_loader
