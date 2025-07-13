@@ -160,3 +160,45 @@ def build_feature_cube(df: pd.DataFrame, tickers: list[str], feature_order: list
         wide = df[feat][tickers].ffill().values  # (T,N)
         cube[:, :, f_idx] = wide
     return cube
+
+
+
+import yfinance as yf
+from torch.utils.data import DataLoader
+
+def prepare_data_and_backtester(tickers, start, end, features, close_feature, window, split_ratio=0.45, batch_size=64):
+    """
+    Downloads market data, creates dataset and backtester, and returns DataLoader.
+
+    Parameters:
+    - tickers: list[str] - stock symbols
+    - start, end: str - date range
+    - features: list[str] - features to use (e.g., ['Open', 'High', 'Low', 'Close'])
+    - close_feature: str - the feature to use as the close price (e.g., 'Close')
+    - window: int - historical window length
+    - split_ratio: float - train/test split ratio
+    - batch_size: int - DataLoader batch size
+
+    Returns:
+    - ds: CrossSectionDataset instance
+    - bt: Backtester instance
+    - train_loader: DataLoader for training data
+    """
+
+    raw = yf.download(tickers, start=start, end=end, auto_adjust=True)
+    cube = build_feature_cube(raw, tickers=tickers, feature_order=features)
+
+    close_index = features.index(close_feature)
+    ds = CrossSectionDataset(
+        data=cube,
+        dates=raw.index.to_numpy(),
+        window=window,
+        close_index=close_index,
+        produce_cls=True,
+        produce_reg=True
+    )
+
+    bt = Backtester(ds, split_ratio=split_ratio)
+    train_loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+    return ds, bt, train_loader
