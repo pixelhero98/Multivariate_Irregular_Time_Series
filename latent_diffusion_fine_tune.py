@@ -1,84 +1,98 @@
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
+# === Imports from model definitions ===
+# from transformer_vae import TransformerVAE, vae_loss
+# from diffusion import LatentDiffusion, ConditionedDiffusion, q_sample, linear_beta_schedule, cosine_beta_schedule
+# (Assume the classes/functions are available in the same environment)
 
-class ConditionedDiffusion(nn.Module):
-    def __init__(self, latent_dim, d_model=128, num_layers=6,
-                 num_heads=8):
-        super().__init__()
-        # Transformer denoiser
-        layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=num_heads,
-            dim_feedforward=d_model*4, activation='gelu')
-        self.encoder = nn.TransformerEncoder(layer, num_layers)
-        self.to_eps = nn.Linear(d_model, latent_dim)
-        self.time_embed = nn.Sequential(
-            nn.Linear(1, d_model), nn.GELU(), nn.Linear(d_model, d_model)
-        )
-        self.input_proj = nn.Linear(latent_dim, d_model)
-        self.label_proj = nn.Embedding(1, d_model)  # placeholder
-        self.d_model = d_model
+# === Hyperparameters ===
+INPUT_DIM = D            # e.g., number of time-series channels
+SEQ_LEN   = T            # e.g., sequence length
+LATENT_DIM = 128
+DMODEL    = 128
+NUM_LAYERS = 6
+NUM_HEADS = 8
+EPOCHS_PRE = 50
+EPOCHS_FT  = 20
+BATCH_SIZE = 64
+LR_PRE     = 1e-4
+LR_FT      = 5e-5
+T_DIFF     = 200
+P_UNCOND   = 0.1
+SCHEDULE   = 'cosine'
+NUM_CLASSES = 2
 
-    def forward(self, z_t, t, y=None):
-        h = self.input_proj(z_t)
-        te = self.time_embed(t)
-        h = h + te
-        if y is not None:
-            lb = self.label_proj(y)
-        else:
-            lb = torch.zeros_like(h)
-        h = h + lb
-        h = h.unsqueeze(1).transpose(0,1)
-        h = self.encoder(h)
-        h = h.transpose(0,1).squeeze(1)
-        return self.to_eps(h)
+# === Datasets ===
+# unlabeled_dataset: yields x tensors
+# labeled_dataset: yields (x, y) pairs
 
+# === 1. Pre-train Unconditional Diffusion ===
+# 1.1 Initialize VAE & train (not shown here)
+vae = TransformerVAE(INPUT_DIM, SEQ_LEN)
+# train_vae(vae, unlabeled_dataset)  # user-defined
+# torch.save({'model_state': vae.state_dict()}, 'vae.pth')
 
-def linear_beta_schedule(T, beta_start=1e-4, beta_end=0.02):
-    return torch.linspace(beta_start, beta_end, T)
+# 1.2 Initialize and train unconditional diffusion
+uncond_diff = LatentDiffusion(
+    latent_dim=LATENT_DIM,
+    d_model=DMODEL,
+    num_layers=NUM_LAYERS,
+    num_heads=NUM_HEADS
+)
+# Train:
+train_diffusion(
+    vae=vae,
+    diffusion=uncond_diff,
+    dataset=unlabeled_dataset,
+    epochs=EPOCHS_PRE,
+    batch_size=BATCH_SIZE,
+    lr=LR_PRE,
+    T=T_DIFF,
+    schedule=SCHEDULE
+)
+# Save checkpoint
+torch.save({'model_state': uncond_diff.state_dict()}, 'uncond_diff.pth')
 
+# === 2. Fine-tune Conditional Diffusion ===
+# 2.1 Initialize conditional model
+cond_diff = ConditionedDiffusion(
+    latent_dim=LATENT_DIM,
+    d_model=DMODEL,
+    num_layers=NUM_LAYERS,
+    num_heads=NUM_HEADS
+)
+# 2.2 Transfer weights from unconditional model
+ckpt = torch.load('uncond_diff.pth')
+cond_diff.encoder.load_state_dict(uncond_diff.encoder.state_dict())
+cond_diff.to_eps.load_state_dict(uncond_diff.to_eps.state_dict())
+cond_diff.input_proj.load_state_dict(uncond_diff.input_proj.state_dict())
+cond_diff.time_embed.load_state_dict(uncond_diff.time_embed.state_dict())
 
-def cosine_beta_schedule(T, s: float = 0.008):
-    steps = T + 1
-    t = torch.linspace(0, T, steps) / T
-    alphas_cum = torch.cos(((t + s) / (1 + s)) * (math.pi / 2))**2
-    alphas_cum = alphas_cum / alphas_cum[0]
-    betas = 1 - (alphas_cum[1:] / alphas_cum[:-1])
-    return betas.clamp(max=0.999)
+# 2.3 Fine-tune with labels
+train_conditional_diffusion(
+    vae=vae,
+    diffusion=cond_diff,
+    dataset=labeled_dataset,
+    num_classes=NUM_CLASSES,
+    epochs=EPOCHS_FT,
+    batch_size=BATCH_SIZE,
+    lr=LR_FT,
+    T=T_DIFF,
+    schedule=SCHEDULE,
+    p_uncond=P_UNCOND
+)
+# Save fine-tuned model
+torch.save({'model_state': cond_diff.state_dict()}, 'cond_diff.pth')
 
+# === 3. Inference Example ===
+# Load fine-tuned conditional model
+cond_loaded = ConditionedDiffusion(LATENT_DIM, DMODEL)
+state = torch.load('cond_diff.pth')['model_state']
+cond_loaded.load_state_dict(state)
+cond_loaded.eval()
 
-def q_sample(z0, t, betas):
-    alphas = 1 - betas
-    alpha_bar = torch.cumprod(alphas, dim=0)[t]
-    noise = torch.randn_like(z0)
-    return alpha_bar.sqrt().unsqueeze(-1)*z0 + (1-alpha_bar).sqrt().unsqueeze(-1)*noise, noise
-
-
-def train_conditional_diffusion(vae, diffusion, dataset, num_classes,
-                                epochs=10, batch_size=32, lr=1e-4,
-                                T=100, schedule='linear', p_uncond=0.1):
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    vae.to(device).eval()
-    diffusion.to(device).train()
-    diffusion.label_proj = nn.Embedding(num_classes, diffusion.d_model).to(device)
-    betas = (cosine_beta_schedule(T) if schedule=='cosine' else linear_beta_schedule(T)).to(device)
-    optim = torch.optim.Adam(diffusion.parameters(), lr=lr)
-    for ep in range(epochs):
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            with torch.no_grad():
-                mu, logvar = vae.encode(x)
-                z0 = vae.reparameterize(mu, logvar)
-            t = torch.randint(0, T, (x.size(0),), device=device)
-            z_t, noise = q_sample(z0, t, betas)
-            t_norm = t.float().unsqueeze(-1) / T
-            mask = torch.rand(x.size(0), device=device) < p_uncond
-            y_input = y.clone()
-            y_input[mask] = num_classes
-            pred_noise = diffusion(z_t, t_norm, y_input)
-            loss = F.mse_loss(pred_noise, noise)
-            optim.zero_grad(); loss.backward(); optim.step()
-        print(f"Epoch {ep+1}, Loss: {loss.item():.4f}")
+# Sample a latent for class c with guidance
+# z_sampled = sample_with_guidance(cond_loaded, class_id=c, guidance=w)
+# x_generated = vae.decode(z_sampled)
