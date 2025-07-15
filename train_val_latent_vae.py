@@ -46,7 +46,7 @@ def prepare_dataloaders(tickers, start, end, features, window, batch_size,
     EPOCHS = 200
     LR = 1e-3
     VAL_FRAC = 0.1
-    TEST_FRAC = 0.1
+    TEST_FRAC = 0.45
     SEED = 42
 
     # Prepare data loaders
