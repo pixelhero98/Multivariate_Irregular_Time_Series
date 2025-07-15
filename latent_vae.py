@@ -1,134 +1,129 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 5000):
+# Sparse Top-K Graph Transformer Layer
+class TopKGraphTransformerLayer(nn.Module):
+    def __init__(self, dim, num_heads=8, k=8):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() *
-                             (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
-        self.register_buffer('pe', pe)
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.k = k
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch_size, seq_len, d_model)
-        seq_len = x.size(1)
-        x = x + self.pe[:, :seq_len]
-        return x
+    def forward(self, x):
+        B, N, D = x.shape
+        residual = x
+        x_norm = self.norm1(x)
+        Q = self.q_proj(x_norm).view(B, N, self.num_heads, self.head_dim)
+        K = self.k_proj(x_norm).view(B, N, self.num_heads, self.head_dim)
+        V = self.v_proj(x_norm).view(B, N, self.num_heads, self.head_dim)
+        logits = torch.einsum('bnhd,bmhd->bhnm', Q, K) * self.scale
+        topk_vals, topk_idx = logits.topk(self.k, dim=-1)
+        mask = torch.full_like(logits, float('-inf'))
+        mask.scatter_(-1, topk_idx, topk_vals)
+        attn = torch.softmax(mask, dim=-1)
+        out = torch.einsum('bhnm,bmhd->bnhd', attn, V).contiguous().view(B, N, D)
+        out = self.out_proj(out)
+        x = residual + out
+        return x + self.ff(self.norm2(x))
 
-
-class TransformerVAE(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        seq_len: int,
-        d_model: int = 128,
-        latent_dim: int = 128,
-        num_layers: int = 4,
-        num_heads: int = 8,
-        dim_ff: int = 512,
-        dropout: float = 0.1,
-        downsample_stride: int = 2,
-    ):
+# Transformer-based Encoder
+class TransformerEncoder(nn.Module):
+    def __init__(self, input_dim, seq_len, latent_dim, num_layers=2, num_heads=4, ff_dim=256):
         super().__init__()
-        self.input_dim = input_dim
-        self.d_model = d_model
-        self.latent_dim = latent_dim
-        self.downsample_stride = downsample_stride
-        self.seq_len = seq_len
-
-        # MLP downsample: flatten patches of length stride
-        self.mlp_down = nn.Linear(downsample_stride * input_dim, d_model)
-        self.pos_enc = PositionalEncoding(d_model)
-
-        # Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
+        self.pos_emb = nn.Parameter(torch.randn(1, seq_len, latent_dim))
+        self.input_proj = nn.Linear(input_dim, latent_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=latent_dim,
             nhead=num_heads,
-            dim_feedforward=dim_ff,
-            dropout=dropout,
-            activation='gelu'
+            dim_feedforward=ff_dim,
+            activation='gelu',
+            batch_first=True
         )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers
-        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
 
-        # Latent projections
-        self.fc_mu = nn.Linear(d_model, latent_dim)
-        self.fc_logvar = nn.Linear(d_model, latent_dim)
+    def forward(self, x):
+        h = self.input_proj(x) + self.pos_emb  # [B, T, D]
+        return self.encoder(h)
 
-        # Latent to sequence
-        self.fc_z_to_seq = nn.Linear(latent_dim, d_model)
-
-        # Transformer Decoder
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
+# Transformer-based Decoder
+class TransformerDecoder(nn.Module):
+    def __init__(self, latent_dim, seq_len, num_layers=2, num_heads=4, ff_dim=256, input_dim=None):
+        super().__init__()
+        self.pos_emb = nn.Parameter(torch.randn(1, seq_len, latent_dim))
+        layer = nn.TransformerDecoderLayer(
+            d_model=latent_dim,
             nhead=num_heads,
-            dim_feedforward=dim_ff,
-            dropout=dropout,
-            activation='gelu'
+            dim_feedforward=ff_dim,
+            activation='gelu',
+            batch_first=True
         )
-        self.transformer_decoder = nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=num_layers
+        self.decoder = nn.TransformerDecoder(layer, num_layers=num_layers)
+        # Final projection back to original feature space
+        self.out_proj = nn.Linear(latent_dim, input_dim or latent_dim)
+
+    def forward(self, z):
+        # z: [B, T, D]
+        tgt = z + self.pos_emb
+        # Self-attend with memory equal to z itself
+        dec = self.decoder(tgt, memory=z)
+        return self.out_proj(dec)
+
+# VAE with GT Latent Processor and Symmetric Transformer Decoder
+class VAEWithTransformerDecoder(nn.Module):
+    def __init__(self, input_dim, seq_len, latent_dim,
+                 enc_layers=2, enc_heads=4, enc_ff=256,
+                 gt_layers=2, gt_heads=8, gt_k=8,
+                 dec_layers=2, dec_heads=4, dec_ff=256):
+        super().__init__()
+        # Encoder
+        self.encoder = TransformerEncoder(
+            input_dim, seq_len, latent_dim,
+            num_layers=enc_layers, num_heads=enc_heads, ff_dim=enc_ff
+        )
+        # GT latent processor
+        self.gt_layers = nn.ModuleList([
+            TopKGraphTransformerLayer(latent_dim, num_heads=gt_heads, k=gt_k)
+            for _ in range(gt_layers)
+        ])
+        # VAE heads
+        self.mu_head = nn.Linear(latent_dim, latent_dim)
+        self.logvar_head = nn.Linear(latent_dim, latent_dim)
+        # Decoder
+        self.decoder = TransformerDecoder(
+            latent_dim, seq_len,
+            num_layers=dec_layers, num_heads=dec_heads, ff_dim=dec_ff,
+            input_dim=input_dim
         )
 
-        # MLP upsample: map back to patches
-        self.mlp_up = nn.Linear(d_model, downsample_stride * input_dim)
-
-    def encode(self, x: torch.Tensor) -> (torch.Tensor, torch.Tensor):
-        # x: (batch, T, D)
-        batch, T, D = x.size()
-        # ensure divisible
-        assert T % self.downsample_stride == 0, "Sequence length must be divisible by stride"
-        T_down = T // self.downsample_stride
-        # reshape into patches
-        x_patches = x.view(batch, T_down, self.downsample_stride * D)
-        # MLP projection
-        h = self.mlp_down(x_patches)  # (batch, T_down, d_model)
-        h = self.pos_enc(h)
-        h = h.transpose(0, 1)  # (T_down, batch, d_model)
-        h = self.transformer_encoder(h)
-        h = h.transpose(0, 1)  # (batch, T_down, d_model)
-        # Pool over time
-        h_pool = h.mean(dim=1)
-        mu = self.fc_mu(h_pool)
-        logvar = self.fc_logvar(h_pool)
-        return mu, logvar
-
-    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        # z: (batch, latent_dim)
-        batch = z.size(0)
-        T = self.seq_len
-        D = self.input_dim
-        T_down = T // self.downsample_stride
-        # project z to sequence embeddings
-        h_seq = self.fc_z_to_seq(z)  # (batch, d_model)
-        h_seq = h_seq.unsqueeze(1).repeat(1, T_down, 1)
-        h_seq = self.pos_enc(h_seq)
-        tgt = h_seq.transpose(0, 1)
-        memory = tgt
-        decoded = self.transformer_decoder(tgt, memory)
-        decoded = decoded.transpose(0, 1)  # (batch, T_down, d_model)
-        # MLP upsample
-        x_patches = self.mlp_up(decoded)  # (batch, T_down, stride*D)
-        x_rec = x_patches.view(batch, T, D)
-        return x_rec
+    def process_latent(self, z):
+        for layer in self.gt_layers:
+            z = z + layer(z)
+        return z
 
-    def forward(self, x: torch.Tensor) -> (torch.Tensor, torch.Tensor, torch.Tensor):
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        x_rec = self.decode(z)
-        return x_rec, mu, logvar
+    def forward(self, x):
+        # x: [B, T, F]
+        z = self.encoder(x)                 # [B, T, D]
+        z = self.process_latent(z)         # GT processing
+        mu = self.mu_head(z)
+        logvar = self.logvar_head(z)
+        z_sample = self.reparameterize(mu, logvar)
+        x_hat = self.decoder(z_sample)     # [B, T, F]
+        return x_hat, mu, logvar
