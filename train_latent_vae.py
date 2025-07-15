@@ -79,22 +79,28 @@ dataloader = DataLoader(dataset, BATCH_SIZE, shuffle=True)
             optimizer.step()
             total_recon += recon.item() * batch.size(0)
             total_kl += kl.item() * batch.size(0)
-        train_elbo = (total_recon + total_kl) / train_size
+        # Compute train metrics
+        train_recon = total_recon / train_size
+        train_kl = total_kl / train_size
 
         # Validation
         model.eval()
         with torch.no_grad():
-            val_recon, val_kl = 0.0, 0.0
+            val_recon_sum, val_kl_sum = 0.0, 0.0
             for batch in val_loader:
                 batch = batch.to(device)
                 x_hat, mu, logvar = model(batch)
                 recon = F.mse_loss(x_hat, batch, reduction='sum') / batch.size(0)
                 kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / batch.size(0)
-                val_recon += recon.item() * batch.size(0)
-                val_kl += kl.item() * batch.size(0)
-            val_elbo = (val_recon + val_kl) / val_size
+                val_recon_sum += recon.item() * batch.size(0)
+                val_kl_sum += kl.item() * batch.size(0)
+            val_recon = val_recon_sum / val_size
+            val_kl = val_kl_sum / val_size
 
-        print(f"Epoch {epoch}/{EPOCHS} - β={beta:.2f} Train ELBO: {train_elbo:.4f}, Val ELBO: {val_elbo:.4f}")
+        # Print detailed metrics
+        print(f"Epoch {epoch}/{EPOCHS} - β={beta:.2f} "
+              f"Train Recon: {train_recon:.4f}, Train KL: {train_kl:.4f} | "
+              f"Val Recon: {val_recon:.4f}, Val KL: {val_kl:.4f}")f"Epoch {epoch}/{EPOCHS} - β={beta:.2f} Train ELBO: {train_elbo:.4f}, Val ELBO: {val_elbo:.4f}")
 
         # Checkpointing
         if val_elbo < best_val_elbo:
