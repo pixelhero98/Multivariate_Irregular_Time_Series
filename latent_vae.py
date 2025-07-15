@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # Sparse Top-K Graph Transformer Layer
 class SparseGraphTransformerLayer(nn.Module):
