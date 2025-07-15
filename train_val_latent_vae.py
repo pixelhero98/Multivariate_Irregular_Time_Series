@@ -8,32 +8,103 @@ class WindowDataset(Dataset):
         def __len__(self): return len(self.array)
         def __getitem__(self, idx): return torch.from_numpy(self.array[idx]).float()
 
-def prepare_dataloaders(tickers, start, end, features, window, batch_size,
-                        val_fraction=0.1, test_fraction=0.45, seed=None):
-    raw = yf.download(tickers, start=start, end=end, auto_adjust=True)[features]
-    windows = []
-    for ticker in tickers:
-        df = raw.xs(ticker, axis=1, level=1)
-        arr = np.log1p(df.values)
-        mu, sigma = arr.mean(0, keepdims=True), arr.std(0, keepdims=True) + 1e-6
-        arr_norm = (arr - mu) / sigma
-        for i in range(len(arr_norm) - window + 1):
-            windows.append(arr_norm[i:i+window])
-    data_array = np.stack(windows)
-    dataset = WindowDataset(data_array)
-    total = len(dataset)
-    val_size = int(val_fraction * total)
-    test_size = int(test_fraction * total)
-    train_size = total - val_size - test_size
-    generator = torch.Generator().manual_seed(seed) if seed is not None else None
-    train_ds, val_ds, test_ds = torch.utils.data.random_split(
-        dataset, [train_size, val_size, test_size], generator=generator
-    )
+
+def prepare_dataloaders(
+    tickers, start, end, features, window, batch_size,
+    val_fraction=0.1, test_fraction=0.1, seed=None,
+    data_dir='./data'):
+    """
+    Download and preprocess financial data or load from cached .npy files in data_dir.
+    Constructs sliding windows, splits into train/val/test, and returns DataLoaders and split sizes.
+
+    Args:
+        tickers (list of str): List of ticker symbols.
+        start, end (str): Date strings for yfinance.
+        features (list of str): OHLC feature names.
+        window (int): Sliding window length.
+        batch_size (int): DataLoader batch size.
+        val_fraction, test_fraction (float): Fractions for splits.
+        seed (int or None): Random seed for reproducibility.
+        data_dir (str): Directory path to load/save dataset files.
+    """
+    import os
+    os.makedirs(data_dir, exist_ok=True)
+    # Filenames
+    train_file = os.path.join(data_dir, 'train_data.npy')
+    val_file = os.path.join(data_dir, 'val_data.npy')
+    test_file = os.path.join(data_dir, 'test_data.npy')
+
+    # Check for cached files\    
+    if os.path.exists(train_file) and os.path.exists(val_file) and os.path.exists(test_file):
+        # Load preprocessed arrays
+        train_array = np.load(train_file)
+        val_array = np.load(val_file)
+        test_array = np.load(test_file)
+        # Integrity checks: shapes should match expected dimensions
+        for arr, name in [(train_array, 'train'), (val_array, 'val'), (test_array, 'test')]:
+            assert arr.ndim == 3, f"{name}_data.npy must be 3D [N, window, features]."
+            assert arr.shape[1] == window, f"{name}_data.npy second dimension (window) mismatch."
+            assert arr.shape[2] == len(features), f"{name}_data.npy third dimension (features) mismatch."
+        # Check non-empty
+        assert train_array.shape[0] > 0, "train_data.npy is empty."
+        assert val_array.shape[0] > 0, "val_data.npy is empty."
+        assert test_array.shape[0] > 0, "test_data.npy is empty."
+        # Verify total samples matches expected windows per ticker
+        raw_check = yf.download(tickers, start=start, end=end, auto_adjust=True)[features]
+        expected = 0
+        for ticker in tickers:
+            df_check = raw_check.xs(ticker, axis=1, level=1)
+            expected += max(0, len(df_check) - window + 1)
+        total_loaded = train_array.shape[0] + val_array.shape[0] + test_array.shape[0]
+        assert total_loaded == expected, f"Cached data total {total_loaded} does not match expected {expected}."
+    else:
+        # Download & preprocess
+        raw = yf.download(tickers, start=start, end=end, auto_adjust=True)[features]
+        windows = []
+        for ticker in tickers:
+            df = raw.xs(ticker, axis=1, level=1)
+            arr = np.log1p(df.values)
+            mu, sigma = arr.mean(0, keepdims=True), arr.std(0, keepdims=True) + 1e-6
+            arr_norm = (arr - mu) / sigma
+            for i in range(len(arr_norm) - window + 1):
+                windows.append(arr_norm[i:i+window])
+        data_array = np.stack(windows)
+        # Determine split sizes
+        total = len(data_array)
+        val_size = int(val_fraction * total)
+        test_size = int(test_fraction * total)
+        train_size = total - val_size - test_size
+        # Shuffle indices
+        indices = np.arange(total)
+        if seed is not None:
+            np.random.seed(seed)
+        np.random.shuffle(indices)
+        train_idx = indices[:train_size]
+        val_idx = indices[train_size:train_size+val_size]
+        test_idx = indices[train_size+val_size:]
+        train_array = data_array[train_idx]
+        val_array = data_array[val_idx]
+        test_array = data_array[test_idx]
+        # Save for future
+        np.save(train_file, train_array)
+        np.save(val_file, val_array)
+        np.save(test_file, test_array)
+
+    # Create datasets and loaders
+    train_ds = WindowDataset(train_array)
+    val_ds = WindowDataset(val_array)
+    test_ds = WindowDataset(test_array)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
-                          
+
+    # Sizes
+    train_size = len(train_ds)
+    val_size = len(val_ds)
+    test_size = len(test_ds)
+            
     return train_loader, val_loader, test_loader, (train_size, val_size, test_size)
+
 
     TICKERS = [
         'AAPL','MSFT','GOOG','AMZN','META','TSLA','BRK-B','JPM','JNJ','V',
@@ -48,12 +119,13 @@ def prepare_dataloaders(tickers, start, end, features, window, batch_size,
     VAL_FRAC = 0.1
     TEST_FRAC = 0.45
     SEED = 42
+    PATH = './data'
 
     # Prepare data loaders
     train_loader, val_loader, test_loader, (train_size, val_size, test_size) = \
         prepare_dataloaders(
             TICKERS, START, END, FEATURES, WINDOW, BATCH_SIZE,
-            val_fraction=VAL_FRAC, test_fraction=TEST_FRAC, seed=SEED
+            val_fraction=VAL_FRAC, test_fraction=TEST_FRAC, seed=SEED, data_dir=PATH
         )
 
     # Device and model
