@@ -4,7 +4,7 @@ from torch.utils.data import Dataset, DataLoader
 
 
 def prepare_dataloaders(tickers, start, end, features, window, batch_size,
-                        val_fraction=0.1, test_fraction=0.1, seed=None):
+                        val_fraction=0.1, test_fraction=0.45, seed=None):
     raw = yf.download(tickers, start=start, end=end, auto_adjust=True)[features]
     windows = []
     for ticker in tickers:
