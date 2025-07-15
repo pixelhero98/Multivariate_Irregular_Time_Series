@@ -3,6 +3,11 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 
 
+class WindowDataset(Dataset):
+        def __init__(self, array): self.array = array
+        def __len__(self): return len(self.array)
+        def __getitem__(self, idx): return torch.from_numpy(self.array[idx]).float()
+
 def prepare_dataloaders(tickers, start, end, features, window, batch_size,
                         val_fraction=0.1, test_fraction=0.45, seed=None):
     raw = yf.download(tickers, start=start, end=end, auto_adjust=True)[features]
@@ -15,12 +20,6 @@ def prepare_dataloaders(tickers, start, end, features, window, batch_size,
         for i in range(len(arr_norm) - window + 1):
             windows.append(arr_norm[i:i+window])
     data_array = np.stack(windows)
-
-    class WindowDataset(Dataset):
-        def __init__(self, array): self.array = array
-        def __len__(self): return len(self.array)
-        def __getitem__(self, idx): return torch.from_numpy(self.array[idx]).float()
-
     dataset = WindowDataset(data_array)
     total = len(dataset)
     val_size = int(val_fraction * total)
@@ -33,6 +32,7 @@ def prepare_dataloaders(tickers, start, end, features, window, batch_size,
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+                          
     return train_loader, val_loader, test_loader, (train_size, val_size, test_size)
 
     TICKERS = [
