@@ -2,49 +2,62 @@ import yfinance as yf
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 
-# Config: list company tickers
-TICKERS = [
-    'AAPL','MSFT','GOOG','AMZN','META','TSLA','BRK-B','JPM','JNJ','V',
-    'NVDA','HD','PG','MA','DIS','BAC','XOM','PFE','ADBE','CSCO'
-]
-START, END = "2020-01-01", "2024-12-31"
-WINDOW = 30
-FEATURES = ['Open', 'High', 'Low', 'Close']
-BATCH_SIZE = 16
-EPOCHS = 200
-LR = 1e-3
 
-# Download & preprocess
-raw = yf.download(TICKERS, start=START, end=END, auto_adjust=True)[FEATURES]
-data = []
-for ticker in TICKERS:
-    df = raw.xs(ticker, axis=1, level=1)
-    arr = np.log1p(df.values)
-    mu, sigma = arr.mean(0, keepdims=True), arr.std(0, keepdims=True) + 1e-6
-    arr_norm = (arr - mu) / sigma
-    for i in range(len(arr_norm) - WINDOW + 1):
-        data.append(arr_norm[i:i+WINDOW])
-data = np.stack(data)  # [N, WINDOW, F]
+def prepare_dataloaders(tickers, start, end, features, window, batch_size,
+                        val_fraction=0.1, test_fraction=0.1, seed=None):
+    raw = yf.download(tickers, start=start, end=end, auto_adjust=True)[features]
+    windows = []
+    for ticker in tickers:
+        df = raw.xs(ticker, axis=1, level=1)
+        arr = np.log1p(df.values)
+        mu, sigma = arr.mean(0, keepdims=True), arr.std(0, keepdims=True) + 1e-6
+        arr_norm = (arr - mu) / sigma
+        for i in range(len(arr_norm) - window + 1):
+            windows.append(arr_norm[i:i+window])
+    data_array = np.stack(windows)
 
-class TimeSeriesDataset(Dataset):
-    def __init__(self, array): self.array = array
-    def __len__(self): return len(self.array)
-    def __getitem__(self, idx): return torch.from_numpy(self.array[idx]).float()
+    class WindowDataset(Dataset):
+        def __init__(self, array): self.array = array
+        def __len__(self): return len(self.array)
+        def __getitem__(self, idx): return torch.from_numpy(self.array[idx]).float()
 
-dataset = TimeSeriesDataset(data)
-dataloader = DataLoader(dataset, BATCH_SIZE, shuffle=True)
+    dataset = WindowDataset(data_array)
+    total = len(dataset)
+    val_size = int(val_fraction * total)
+    test_size = int(test_fraction * total)
+    train_size = total - val_size - test_size
+    generator = torch.Generator().manual_seed(seed) if seed is not None else None
+    train_ds, val_ds, test_ds = torch.utils.data.random_split(
+        dataset, [train_size, val_size, test_size], generator=generator
+    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader, test_loader, (train_size, val_size, test_size)
 
-# Model, device, optimizer
+    TICKERS = [
+        'AAPL','MSFT','GOOG','AMZN','META','TSLA','BRK-B','JPM','JNJ','V',
+        'NVDA','HD','PG','MA','DIS','BAC','XOM','PFE','ADBE','CSCO'
+    ]
+    START, END = "2020-01-01", "2024-12-31"
+    WINDOW = 30
+    FEATURES = ['Open', 'High', 'Low', 'Close']
+    BATCH_SIZE = 32
+    EPOCHS = 200
+    LR = 1e-3
+    VAL_FRAC = 0.1
+    TEST_FRAC = 0.1
+    SEED = 42
+
+    # Prepare data loaders
+    train_loader, val_loader, test_loader, (train_size, val_size, test_size) = \
+        prepare_dataloaders(
+            TICKERS, START, END, FEATURES, WINDOW, BATCH_SIZE,
+            val_fraction=VAL_FRAC, test_fraction=TEST_FRAC, seed=SEED
+        )
+
+    # Device and model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Split dataset into train and validation
-    val_fraction = 0.1
-    total_samples = len(dataset)
-    val_size = int(val_fraction * total_samples)
-    train_size = total_samples - val_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     # Instantiate VAE with Transformer Decoder and GT processor
     model = VAEWithTransformerDecoder(
