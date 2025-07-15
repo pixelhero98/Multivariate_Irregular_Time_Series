@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Sparse Top-K Graph Transformer Layer
-class TopKGraphTransformerLayer(nn.Module):
+class SparseGraphTransformerLayer(nn.Module):
     def __init__(self, dim, num_heads=8, k=8):
         super().__init__()
         self.num_heads = num_heads
@@ -95,7 +95,7 @@ class VAEWithTransformerDecoder(nn.Module):
         )
         # GT latent processor
         self.gt_layers = nn.ModuleList([
-            TopKGraphTransformerLayer(latent_dim, num_heads=gt_heads, k=gt_k)
+            SparseGraphTransformerLayer(latent_dim, num_heads=gt_heads, k=gt_k)
             for _ in range(gt_layers)
         ])
         # VAE heads
