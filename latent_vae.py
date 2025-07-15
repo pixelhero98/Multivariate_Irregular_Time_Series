@@ -82,7 +82,7 @@ class TransformerDecoder(nn.Module):
         return self.out_proj(dec)
 
 # VAE with GT Latent Processor and Symmetric Transformer Decoder
-class VAEWithTransformerDecoder(nn.Module):
+class LatentGTVAE(nn.Module):
     def __init__(self, input_dim, seq_len, latent_dim,
                  enc_layers=2, enc_heads=4, enc_ff=256,
                  gt_layers=2, gt_heads=8, gt_k=8,
