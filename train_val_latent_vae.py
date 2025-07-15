@@ -2,6 +2,7 @@ import yfinance as yf
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 
 
 class WindowDataset(Dataset):
@@ -182,7 +183,8 @@ def prepare_dataloaders(
                 val_kl_sum += kl.item() * batch.size(0)
             val_recon = val_recon_sum / val_size
             val_kl = val_kl_sum / val_size
-
+            train_elbo = train_recon + train_kl
+            val_elbo = val_recon + val_kl
         # Print detailed metrics
         print(f"Epoch {epoch}/{EPOCHS} - β={beta:.2f} "
               f"Train Recon: {train_recon:.4f}, Train KL: {train_kl:.4f} | "
