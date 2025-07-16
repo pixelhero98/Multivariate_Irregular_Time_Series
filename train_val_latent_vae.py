@@ -3,6 +3,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
+from latent_vae import LatentGTVAE
+import os
 
 
 class WindowDataset(Dataset):
@@ -26,10 +28,9 @@ def prepare_dataloaders(
         window (int): Sliding window length.
         batch_size (int): DataLoader batch size.
         val_fraction, test_fraction (float): Fractions for splits.
-        seed (int or None): Random seed for reproducibility.
         data_dir (str): Directory path to load/save dataset files.
     """
-    import os
+    
     os.makedirs(data_dir, exist_ok=True)
     # Filenames
     train_file = os.path.join(data_dir, 'train_data.npy')
@@ -38,6 +39,7 @@ def prepare_dataloaders(
 
     # Check for cached files\    
     if os.path.exists(train_file) and os.path.exists(val_file) and os.path.exists(test_file):
+        print("Loading pre-split and normalized data from cache...")
         # Load preprocessed arrays
         train_array = np.load(train_file)
         val_array = np.load(val_file)
@@ -60,33 +62,39 @@ def prepare_dataloaders(
         total_loaded = train_array.shape[0] + val_array.shape[0] + test_array.shape[0]
         assert total_loaded == expected, f"Cached data total {total_loaded} does not match expected {expected}."
     else:
+        print("Processing data from scratch: downloading, splitting chronologically, and normalizing...")
         # Download & preprocess
         raw = yf.download(tickers, start=start, end=end, auto_adjust=True)[features]
         windows = []
         for ticker in tickers:
             df = raw.xs(ticker, axis=1, level=1)
+            dates = df.index
             arr = np.log1p(df.values)
-            mu, sigma = arr.mean(0, keepdims=True), arr.std(0, keepdims=True) + 1e-6
-            arr_norm = (arr - mu) / sigma
-            for i in range(len(arr_norm) - window + 1):
-                windows.append(arr_norm[i:i+window])
-        data_array = np.stack(windows)
+
+            if len(arr) >= window:
+                for i in range(len(arr) - window + 1):
+                    window_end_date = dates[i + window - 1]
+                    windows.append((arr[i:i+window], window_end_date))
+                        
+        windows.sort(key=lambda x: x[1])
+        data_array = np.stack([item[0] for item in windows])
+
         # Determine split sizes
         total = len(data_array)
         val_size = int(val_fraction * total)
         test_size = int(test_fraction * total)
         train_size = total - val_size - test_size
+        print(f"Total windows: {total_windows} | Train: {train_size}, Val: {val_size}, Test: {test_size}")
+
         # Shuffle indices
-        indices = np.arange(total)
-        if seed is not None:
-            np.random.seed(seed)
-        np.random.shuffle(indices)
-        train_idx = indices[:train_size]
-        val_idx = indices[train_size:train_size+val_size]
-        test_idx = indices[train_size+val_size:]
-        train_array = data_array[train_idx]
-        val_array = data_array[val_idx]
-        test_array = data_array[test_idx]
+        train_array = data_array[:train_size]
+        val_array = data_array[train_size : train_size + val_size]
+        test_array = data_array[train_size + val_size : ]
+        mu, sigma = train_array.mean(0, keepdims=True), train_array.std(0, keepdims=True) + 1e-6
+        arr_norm = (arr - mu) / sigma
+        train_array = (train_array - mu) / sigma
+        val_array = (val_array - mu) / sigma
+        test_array = (test_array - mu) / sigma
         # Save for future
         np.save(train_file, train_array)
         np.save(val_file, val_array)
@@ -186,10 +194,9 @@ def prepare_dataloaders(
             train_elbo = train_recon + train_kl
             val_elbo = val_recon + val_kl
         # Print detailed metrics
-        print(f"Epoch {epoch}/{EPOCHS} - β={beta:.2f} "
-              f"Train Recon: {train_recon:.4f}, Train KL: {train_kl:.4f} | "
-              f"Val Recon: {val_recon:.4f}, Val KL: {val_kl:.4f}")f"Epoch {epoch}/{EPOCHS} - β={beta:.2f} Train ELBO: {train_elbo:.4f}, Val ELBO: {val_elbo:.4f}")
-
+        # Corrected print statement
+        print(f"Epoch {epoch}/{EPOCHS} - β={beta:.2f} | Train ELBO: {train_elbo:.4f} (Recon: {train_recon:.4f}, KL: {train_kl:.4f}) | "
+              f"Val ELBO: {val_elbo:.4f} (Recon: {val_recon:.4f}, KL: {val_kl:.4f})")
         # Checkpointing
         if val_elbo < best_val_elbo:
             best_val_elbo = val_elbo
