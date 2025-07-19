@@ -184,6 +184,7 @@ class DiffusionTransformer(nn.Module):
         scalars: [B] (optional)
         """
         B, L, _ = x_latent.shape
+        assert L <= self.pos_embed.shape[1]
         # Time embedding
         t_norm = t.float() / self.scheduler.timesteps
         t_emb = self.time_embed(t_norm.view(-1, 1))  # [B, time_embed_dim]
