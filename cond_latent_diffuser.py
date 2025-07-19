@@ -3,29 +3,83 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+import torch
+import math
+from typing import Tuple
+
 class NoiseScheduler:
     """
-    A linear beta schedule and corresponding alphas for diffusion.
+    A noise scheduler supporting either:
+      - 'linear':  β_t = linspace(beta_start, beta_end)
+      - 'cosine':  ᾱ_t = cos^2((t/T + s)/(1 + s) * π/2),
+                   β_t = clamp(1 − ᾱ_t / ᾱ_{t−1}, 0, 0.999)
     """
-    def __init__(self, timesteps: int = 1000, beta_start: float = 1e-4, beta_end: float = 2e-2):
+    def __init__(
+        self,
+        timesteps: int = 1000,
+        beta_start: float = 1e-4,
+        beta_end:   float = 2e-2,
+        schedule:   str   = "linear",     # "linear" or "cosine"
+        cosine_s:   float = 0.008,
+        dtype=torch.float32
+    ):
         self.timesteps = timesteps
-        self.betas = torch.linspace(beta_start, beta_end, timesteps)
-        self.alphas = 1.0 - self.betas
-        self.alpha_bars = torch.cumprod(self.alphas, dim=0)
+        self.schedule  = schedule.lower()
+        T = timesteps
 
-    def q_sample(self, x0: torch.Tensor, t: torch.LongTensor, noise: torch.Tensor = None):
+        if self.schedule == "linear":
+            # 1) Linearly spaced betas
+            betas = torch.linspace(beta_start, beta_end, T, dtype=dtype)
+            alphas = 1.0 - betas
+            alpha_bars = torch.cumprod(alphas, dim=0)
+
+        elif self.schedule == "cosine":
+            # 1) Compute the cumulative alphas using the cosine schedule
+            steps = torch.arange(T + 1, dtype=torch.float64) / float(T)
+            alphas_cum = torch.cos((steps + cosine_s) / (1 + cosine_s) * math.pi / 2) ** 2
+            alphas_cum = alphas_cum / alphas_cum[0]  # normalize so ᾱ₀ = 1
+
+            # 2) Derive betas = 1 − ᾱ_t / ᾱ_{t−1}, then clamp to [0, .999]
+            beta = 1.0 - (alphas_cum[1:] / alphas_cum[:-1])
+            betas = beta.clamp(max=0.999).to(dtype)
+
+            # 3) Derive alphas and alpha_bars in the same form as linear branch
+            alphas = 1.0 - betas
+            alpha_bars = torch.cumprod(alphas, dim=0)
+
+        else:
+            raise ValueError(f"Unknown schedule: {schedule!r}")
+
+        # Store everything
+        self.betas      = betas
+        self.alphas     = alphas
+        self.alpha_bars = alpha_bars
+
+    def q_sample(
+        self,
+        x0: torch.Tensor,
+        t:  torch.LongTensor,
+        noise: torch.Tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Diffuse the clean sample x0 at timestep t by adding noise.
+        Returns (noisy_x, noise).
         """
         if noise is None:
             noise = torch.randn_like(x0)
         device = x0.device
-        # move the alpha schedule to the data device before indexing
-        alpha_bars = self.alpha_bars.to(device)  # → [T]
-        # gather the right scalars per batch
-        ab_t = alpha_bars[t]  # → [B]
-        sqrt_ab = ab_t.sqrt().view(-1, *([1] * (x0.dim() - 1)))
-        sqrt_1_ab = (1.0 - ab_t).sqrt().view(-1, *([1] * (x0.dim() - 1)))
+
+        # Pull the cumulative alphas onto the right device
+        alpha_bars = self.alpha_bars.to(device)
+
+        # Gather ᾱ_t for each batch element
+        ab_t = alpha_bars[t]  # shape: [B]
+
+        # Reshape for broadcasting back onto x0
+        shape = [ -1 ] + [1] * (x0.ndim - 1)
+        sqrt_ab   = ab_t.sqrt().view(*shape)
+        sqrt_1_ab = (1.0 - ab_t).sqrt().view(*shape)
+
         return sqrt_ab * x0 + sqrt_1_ab * noise, noise
 
 
