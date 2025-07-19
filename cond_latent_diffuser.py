@@ -127,7 +127,8 @@ class DiffusionTransformer(nn.Module):
             num_heads: int = 8,
             mlp_dim: int = None,
             max_timesteps: int = 1000,
-            num_classes: int = None
+            num_classes: int = None,
+            max_length: int = 256
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -153,6 +154,7 @@ class DiffusionTransformer(nn.Module):
 
         # Position embedding for the concatenated hidden dimension
         self.pos_embed = nn.Parameter(torch.randn(1, 1, hidden_dim))
+        # self.pos_embed = nn.Parameter(torch.randn(1, max_length, hidden_dim))
 
         # Project condition embeddings to hidden dimension
         self.cond_proj = nn.Linear(cond_embed_dim, hidden_dim)
@@ -205,6 +207,7 @@ class DiffusionTransformer(nn.Module):
         h = torch.cat([x_latent, t_emb], dim=-1)  # [B, L, hidden_dim]
         # Add positional embedding (broadcasted)
         h = h + self.pos_embed
+        # h = h + self.pos_embed[:, :L, :]
 
         # Pass through transformer layers
         for layer in self.layers:
