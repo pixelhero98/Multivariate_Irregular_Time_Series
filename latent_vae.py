@@ -156,7 +156,8 @@ class LatentGTVAE(nn.Module):
     def __init__(self, input_dim: int, seq_len: int, latent_dim: int,
                  enc_layers: int = 2, enc_heads: int = 4, enc_ff: int = 256,
                  enc_dropout: float = 0.1,
-                 gt_layers: int = 2, gt_heads: int = 8, gt_k: int = 8, gt_dropout: float = 0.1,
+                 gt_layers: int = 2, gt_heads: int = 8, gt_k: int = 8,
+                 gt_dropout: float = 0.1,
                  dec_layers: int = 2, dec_heads: int = 4, dec_ff: int = 256, dec_dropout: float = 0.1):
         super().__init__()
         self.encoder = TransformerEncoder(
@@ -164,7 +165,13 @@ class LatentGTVAE(nn.Module):
             num_layers=enc_layers, num_heads=enc_heads, ff_dim=enc_ff, dropout=enc_dropout
         )
         self.gt_layers = nn.ModuleList([
-            SparseGraphTransformerLayer(latent_dim, num_heads=gt_heads, k=gt_k, dropout=gt_dropout)
+            SparseGraphTransformerLayer(
+                latent_dim,
+                num_heads=gt_heads,
+                k=gt_k,
+                dropout=gt_dropout,
+                max_seq_len=seq_len
+            )
             for _ in range(gt_layers)
         ])
         self.mu_head = nn.Linear(latent_dim, latent_dim)
@@ -184,9 +191,6 @@ class LatentGTVAE(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
-        """
-        Reparameterization trick with stability clamp on logvar.
-        """
         logvar = logvar.clamp(min=-10.0, max=10.0)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
@@ -198,10 +202,6 @@ class LatentGTVAE(nn.Module):
         return z
 
     def forward(self, x: Tensor):
-        """
-        x: [B, T, input_dim]
-        returns x_hat: [B, T, input_dim], mu, logvar
-        """
         z = self.encoder(x)
         z = self.process_latent(z)
         mu = self.mu_head(z)
