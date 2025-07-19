@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 class NoiseScheduler:
     """
-    Implements a simple linear beta schedule and corresponding alphas for diffusion.
+    A linear beta schedule and corresponding alphas for diffusion.
     """
     def __init__(self, timesteps: int = 1000, beta_start: float = 1e-4, beta_end: float = 2e-2):
         self.timesteps = timesteps
@@ -219,4 +219,5 @@ def classify_latent(
 
     # pick class with lowest error
     preds = errors.argmin(dim=0)
+    
     return preds
