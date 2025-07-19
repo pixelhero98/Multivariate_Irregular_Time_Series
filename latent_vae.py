@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+
 # Sparse Top-K Graph Transformer Layer
 class SparseGraphTransformerLayer(nn.Module):
     def __init__(self, dim, num_heads=8, k=16):
