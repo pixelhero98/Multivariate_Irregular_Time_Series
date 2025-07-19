@@ -6,30 +6,36 @@ from torch import Tensor
 # Sparse Top-K Graph Transformer Layer
 class SparseGraphTransformerLayer(nn.Module):
     """
-    Sparse Top-K Graph Transformer Layer with pre-norm, dropout, and FF dropout.
+    Sparse Top-K Graph Transformer Layer with temporal relative bias, pre-norm, dropout, and FF dropout.
     Args:
         dim: input and output feature dimension.
         num_heads: number of attention heads.
         k: top-K sparse connections per query.
         dropout: dropout probability for attention and feed-forward.
+        max_seq_len: maximum sequence length for relative time embeddings.
     """
-    def __init__(self, dim: int, num_heads: int = 8, k: int = 16, dropout: float = 0.1):
+    def __init__(self, dim: int, num_heads: int = 8, k: int = 16,
+                 dropout: float = 0.1, max_seq_len: int = 512):
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.k = k
+        self.max_seq_len = max_seq_len
 
+        # Projections
         self.q_proj = nn.Linear(dim, dim)
         self.k_proj = nn.Linear(dim, dim)
         self.v_proj = nn.Linear(dim, dim)
         self.attn_dropout = nn.Dropout(dropout)
         self.out_proj = nn.Linear(dim, dim)
 
+        # Layer Norms
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
 
+        # Feed-Forward
         self.ff = nn.Sequential(
             nn.Linear(dim, dim * 4),
             nn.GELU(),
@@ -38,25 +44,49 @@ class SparseGraphTransformerLayer(nn.Module):
             nn.Dropout(dropout)
         )
 
+        # Relative temporal bias embeddings
+        # indices range from -(max_seq_len-1) to +(max_seq_len-1), offset by max_seq_len-1
+        num_rel = 2 * max_seq_len - 1
+        self.rel_time_emb = nn.Embedding(num_rel, num_heads)
+
     def forward(self, x: Tensor) -> Tensor:
         # x: [B, N, D]
         B, N, D = x.shape
-        # Multi-head attention with pre-norm
+        # Pre-norm
         x_norm = self.norm1(x)
+        # Project Q, K, V
         Q = self.q_proj(x_norm).view(B, N, self.num_heads, self.head_dim)
         K = self.k_proj(x_norm).view(B, N, self.num_heads, self.head_dim)
         V = self.v_proj(x_norm).view(B, N, self.num_heads, self.head_dim)
+        # Compute raw attention logits [B, heads, N, N]
         logits = torch.einsum('bnhd,bmhd->bhnm', Q, K) * self.scale
+
+        # Add relative temporal bias
+        pos = torch.arange(N, device=x.device)
+        # shape [N, N], values in [-(N-1)...+(N-1)]
+        d = pos[None, :] - pos[:, None]
+        # shift to [0...(2*max_seq_len-2)] for embedding lookup
+        d = d + (self.max_seq_len - 1)
+        # embed and reshape to [1, heads, N, N]
+        rel_bias = self.rel_time_emb(d)               # [N, N, heads]
+        rel_bias = rel_bias.permute(2, 0, 1).unsqueeze(0)
+        logits = logits + rel_bias
+
+        # Top-K sparsity
         topk_vals, topk_idx = logits.topk(self.k, dim=-1)
         sparse_logits = torch.full_like(logits, float('-inf'))
         sparse_logits.scatter_(-1, topk_idx, topk_vals)
+
+        # Softmax + dropout
         attn = torch.softmax(sparse_logits, dim=-1)
         attn = self.attn_dropout(attn)
+
+        # Attention output
         out = torch.einsum('bhnm,bmhd->bnhd', attn, V).contiguous().view(B, N, D)
         out = self.out_proj(out)
-        x = x + out  # residual
+        x = x + out  # residual connection
 
-        # Feed-forward with pre-norm
+        # Feed-forward
         x_norm = self.norm2(x)
         ff_out = self.ff(x_norm)
         return x + ff_out
