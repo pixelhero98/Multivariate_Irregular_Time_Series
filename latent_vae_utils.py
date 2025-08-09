@@ -7,70 +7,6 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 
 
-def check_samples_per_class(loader: DataLoader) -> None:
-    """
-    Quickly count and print the number of samples per class in a classification DataLoader.
-
-    Args:
-        loader (DataLoader): Yields (x, y) batches, where y contains integer class labels.
-    """
-    counts = None
-    for _, y in loader:
-        # ensure labels on CPU and flattened 1D
-        if torch.is_tensor(y):
-            labels = y.detach().cpu().flatten()
-        else:
-            labels = torch.tensor(y, dtype=torch.long).flatten()
-        # initialize counts tensor based on max class
-        if counts is None:
-            num_classes = int(labels.max().item()) + 1
-            counts = torch.zeros(num_classes, dtype=torch.long)
-        # accumulate batch counts
-        batch_counts = torch.bincount(labels, minlength=counts.size(0))
-        counts += batch_counts
-    # print results
-    for cls, cnt in enumerate(counts.tolist()):
-        print(f"Class {cls}: {cnt} samples")
-
-def label_check(train_loader):
-    all_labels = []
-    # collect every label
-    for _, labels in train_loader:
-        all_labels.append(labels.view(-1))
-
-    # concatenate into one big vector
-    all_labels = torch.cat(all_labels)
-
-    # get each unique class and its count
-    unique_classes, counts = torch.unique(all_labels, return_counts=True)
-
-    print("Classes:", unique_classes.tolist())
-    print("Counts :", counts.tolist())
-
-def latent_space_check(train_z):
-    # --- sanity checks ---
-    # 1) Shape & dtype
-    print("train_mus.shape:", train_z.shape)
-    print("dtype:", train_z.dtype)
-
-    # 2) Global mean & std (should be ≈0, ≈1 if your encoder outputs are normalized)
-    all_vals = train_z.view(-1)
-    print("global mean:", all_vals.mean().item())
-    print("global std: ", all_vals.std().item())
-
-    # 3) Per‑dimension stats
-    per_dim_mean = train_z.mean(dim=(0, 1))  # → [D]
-    per_dim_std = train_z.std(dim=(0, 1))  # → [D]
-    for i in range(min(100, train_z.size(-1))):
-        print(f"dim {i:2d}: mean={per_dim_mean[i]:6.3f}, std={per_dim_std[i]:6.3f}")
-
-    # 4) Histogram (optional, but very informative)
-    plt.hist(all_vals.numpy(), bins=500)
-    plt.title("Histogram of μ values")
-    plt.xlabel("μ value")
-    plt.ylabel("count")
-    plt.show()
-
 def compute_per_dim_stats(all_mu: torch.Tensor):
     """
     Compute per–latent‐dimension mean & std from raw latents.
@@ -116,13 +52,17 @@ def normalize_and_check(all_mu: torch.Tensor):
         print(f" dim {i:2d}: mean={per_dim_mean[i]:6.3f}, std={per_dim_std[i]:6.3f}")
 
     # 3) optional histogram
+    plt.clf()
     plt.figure(figsize=(4,3))
-    plt.hist(all_vals.cpu().numpy(), bins=200)
+    plt.hist(all_vals.cpu().numpy(), bins=500, range=(-5, 5))
     plt.title("Histogram of normalized μ values")
     plt.xlabel("Value")
     plt.ylabel("Count")
     plt.show()
-
+    print(f"Number of NaNs: {torch.isnan(all_mu_norm).sum().item()}")
+    print(f"Number of Infs: {torch.isinf(all_mu_norm).sum().item()}")
+    print(f"Min value in normalized data: {all_mu_norm.min().item()}")
+    print(f"Max value in normalized data: {all_mu_norm.max().item()}")
     return all_mu_norm, mu_per_dim, std_per_dim
 
 
@@ -135,11 +75,11 @@ class LabeledWindowDataset(Dataset):
         self,
         data_array: np.ndarray,
         labels_array: np.ndarray,
-        classification: bool
+        regression: bool
     ):
         self.data_array = data_array
         self.labels_array = labels_array
-        self.classification = classification
+        self.regression = regression
 
     def __len__(self) -> int:
         return len(self.data_array)
@@ -147,10 +87,10 @@ class LabeledWindowDataset(Dataset):
     def __getitem__(self, idx: int):
         x = torch.from_numpy(self.data_array[idx]).float()
         y_np = self.labels_array[idx]
-        if self.classification:
+        if not self.regression:
             y = torch.tensor(int(y_np), dtype=torch.int64)
         else:
-            y = torch.tensor(float(y_np), dtype=torch.float32)
+            y = torch.from_numpy(y_np).float().unsqueeze(-1)
         return x, y
 
 def _cache_sliding_windows(
@@ -159,11 +99,12 @@ def _cache_sliding_windows(
     end,
     features,
     window,
-    classification,
+    regression,
     close_feature,
     data_dir,
     val_ratio: float = 0.1,
-    test_ratio: float = 0.1
+    test_ratio: float = 0.4,
+    horizon: int = 24
 ):
     """
     Generate (data_array, labels_array) and cache them in data_dir.
@@ -193,10 +134,11 @@ def _cache_sliding_windows(
             meta.get('end') == end and
             meta.get('features') == features and
             meta.get('window') == window and
-            meta.get('classification') == classification and
+            meta.get('regression') == regression and
             meta.get('close_feature') == close_feature and
             meta.get('val_ratio') == val_ratio and
-            meta.get('test_ratio') == test_ratio
+            meta.get('test_ratio') == test_ratio and
+            meta.get('horizon') == horizon
         ):
             train = np.load(cache['train'])
             val   = np.load(cache['val'])
@@ -218,14 +160,13 @@ def _cache_sliding_windows(
         closes = df_ret[close_feature].values
 
         # Slide windows with stride=1
-        for i in range(len(arr) - window):
+        for i in range(len(arr) - window - horizon + 1):
             w = arr[i:i + window]  # shape: (n_features, window)
             # target return for close feature
-            ret = closes[i + window]
-            if classification:
-                lbl = int(ret > 0)
+            if regression:
+                lbl = closes[i + window : i + window + horizon]
             else:
-                lbl = float(ret)
+                raise NotImplementedError("Multi-step regression label is not defined.")
             windows.append((w, lbl))
 
     # Chronological split
@@ -252,10 +193,11 @@ def _cache_sliding_windows(
         'end': end,
         'features': features,
         'window': window,
-        'classification': classification,
+        'regression': regression,
         'close_feature': close_feature,
         'val_ratio': val_ratio,
-        'test_ratio': test_ratio
+        'test_ratio': test_ratio,
+        'horizon': horizon
     }
     with open(cache['meta'], 'w') as f:
         json.dump(meta, f)
@@ -266,7 +208,7 @@ def _cache_sliding_windows(
 def load_dataloaders_from_cache(
     batch_size: int,
     data_dir: str = './data',
-    classification: bool = False,
+    regression: bool = True,
     pin_memory: bool = True,
     shuffle_train: bool = True
 ):
@@ -283,7 +225,7 @@ def load_dataloaders_from_cache(
     loaders = {}
     for split in ('train', 'val', 'test'):
         ds = LabeledWindowDataset(
-            arrs[split], arrs[f"{split}_lbl"], classification
+            arrs[split], arrs[f"{split}_lbl"], regression
         )
         loaders[split] = DataLoader(
             ds,
@@ -304,15 +246,16 @@ def prepare_data_and_cache(
     window,
     data_dir: str = './data',
     close_feature: str = 'Close',
-    classification: bool = False,
+    regression: bool = True,
     val_ratio: float = 0.1,
-    test_ratio: float = 0.1
+    test_ratio: float = 0.4,
+    horizon: int = 24,
 ):
     """
     Call this once up‑front to generate & cache your windows.
     """
     return _cache_sliding_windows(
         tickers, start, end, features, window,
-        classification, close_feature, data_dir,
-        val_ratio, test_ratio
+        regression, close_feature, data_dir,
+        val_ratio, test_ratio, horizon
     )
