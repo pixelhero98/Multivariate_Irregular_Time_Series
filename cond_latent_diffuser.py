@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
-from latent_vae import LearnableLaplacianBasis, LearnableInverseLaplacianBasis
 from cond_diffusion_utils import NoiseScheduler
+import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
+import math
+
 
 def get_sinusoidal_pos_emb(L: int, dim: int, device: torch.device) -> torch.Tensor:
     """
@@ -20,62 +23,133 @@ def get_sinusoidal_pos_emb(L: int, dim: int, device: torch.device) -> torch.Tens
     return pe.unsqueeze(0)  # (1, L, dim)
 
 
+class LearnableLaplacianBasis(nn.Module):
+    def __init__(self, k: int, feat_dim: int, alpha_min: float = 1e-6):
+        """
+        Args:
+            k: number of complex Laplacian basis elements
+            feat_dim: feature dimension of x
+            alpha_min: minimum decay rate (small positive)
+        """
+        super().__init__()
+        self.k = k
+        self.alpha_min = alpha_min
+
+        # trainable poles α_raw, β
+        self.s_real = nn.Parameter(torch.empty(k))
+        self.s_imag = nn.Parameter(torch.empty(k))
+        self.reset_parameters()
+
+        # learned projection from feat_dim → k with spectral normalization
+        self.proj = spectral_norm(
+            nn.Linear(feat_dim, k, bias=True),
+            n_power_iterations=1,
+            eps=1e-6
+        )
+
+    def reset_parameters(self):
+        nn.init.uniform_(self.s_real, a=0.0, b=0.1)
+        nn.init.uniform_(self.s_imag, a=-math.pi, b=math.pi)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, feat_dim)
+        Returns:
+            lap_feats: (B, T, 2*k)
+        """
+        B, T, _ = x.shape
+        device, dtype = x.device, x.dtype
+
+        # build decaying/oscillatory poles
+        alpha = F.softplus(self.s_real) + self.alpha_min
+        beta = self.s_imag
+        s = torch.complex(-alpha, beta)
+
+        # time indices 0…T-1 → (T,1) cast to complex
+        t_idx = torch.arange(T, device=device, dtype=dtype).unsqueeze(1).to(s.dtype)
+
+        # compute Laplace basis kernels → (T, k)
+        expo = torch.exp(t_idx * s.unsqueeze(0))
+        re_basis, im_basis = expo.real, expo.imag
+
+        # project features → (B, T, k)
+        proj_feats = self.proj(x)
+
+        # modulate and concat real+imag → (B, T, 2*k)
+        real_proj = proj_feats * re_basis.unsqueeze(0)
+        imag_proj = proj_feats * im_basis.unsqueeze(0)
+        return torch.cat([real_proj, imag_proj], dim=2)
+
+
+class LearnableInverseLaplacianBasis(nn.Module):
+    def __init__(self, laplace_basis: LearnableLaplacianBasis):
+        """
+        Learnable inverse map (not strict inverse) from Laplace features → input space.
+        """
+        super().__init__()
+        feat_dim = laplace_basis.proj.in_features
+        self.inv_proj = spectral_norm(
+            nn.Linear(2 * laplace_basis.k, feat_dim, bias=True),
+            n_power_iterations=1,
+            eps=1e-6
+        )
+
+    def forward(self, lap_feats: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            lap_feats: (B, T, 2*k)
+        Returns:
+            x_hat: (B, T, feat_dim)
+        """
+        return self.inv_proj(lap_feats)
+
+
 class LapFormer(nn.Module):
     """
     Transformer block with:
       - Laplace transform → Norm → Self‑Attention → Cross‑Attention
       - Norm → Learned Inverse → Residual‑Lap skip → MLP
     """
-    def __init__(self, dim, num_heads, k, cond_dim=None, mlp_dim=None):
+    def __init__(self, dim, num_heads, k, mlp_dim=None):
         super().__init__()
-        # Frequency-domain modules
+        # 1. Conditioning module (Cross-Attention first)
+        self.norm_cross = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=dim,
+                                                num_heads=num_heads,
+                                                batch_first=True)
+        # 2. Laplace-domain modules
         self.Lap = LearnableLaplacianBasis(k, dim)
-        self.norm_lap = nn.LayerNorm(2 * k)        # before self-attn
+        self.norm_lap = nn.LayerNorm(2 * k)
         self.self_attn = nn.MultiheadAttention(embed_dim=2 * k,
                                                num_heads=num_heads,
                                                batch_first=True)
-
-        if cond_dim is not None:
-            self.cross_attn = nn.MultiheadAttention(embed_dim=2 * k,
-                                                    num_heads=num_heads,
-                                                    batch_first=True)
-            self.norm_cross = nn.LayerNorm(2 * k)
-        else:
-            self.cross_attn = None
-
-        self.norm_inv = nn.LayerNorm(2 * k)        # before inverse
+        self.norm_inv = nn.LayerNorm(2 * k)
         self.InvLap = LearnableInverseLaplacianBasis(self.Lap)
 
-        # Time-domain MLP
+        # 3. Time-domain MLP
         mlp_dim = mlp_dim or 4 * dim
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp   = nn.Sequential(
+        self.norm_mlp = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
             nn.Linear(dim, mlp_dim),
             nn.GELU(),
             nn.Linear(mlp_dim, dim)
         )
 
     def forward(self, x, cond=None):
-        # 1) Laplace → Norm → Self‑Attention
+        if cond is not None:
+            # 1) Cross-Attention with pre-norm and residual
+            x = x + self.cross_attn(self.norm_cross(x), cond, cond)[0]
+
+        # 2) Laplace processing on the conditioned data
         lap = self.Lap(x)                       # → (B, T, 2k)
-        h_lap = self.norm_lap(lap)
-        lap = lap + self.self_attn(h_lap, h_lap, h_lap)[0]
+        lap = lap + self.self_attn(self.norm_lap(lap), lap, lap)[0]
+        x_rec = self.InvLap(self.norm_inv(lap)) # → (B, T, dim)
 
-        # 2) (Optional) Cross‑Attention
-        if cond is not None and self.cross_attn:
-            h2 = self.norm_cross(lap)
-            lap = lap + self.cross_attn(h2, cond, cond)[0]
-
-        # 3) Norm → Inverse Laplace
-        lap_normed = self.norm_inv(lap)
-        x_rec = self.InvLap(lap_normed)        # → (B, T, dim)
-
-        # 4) Residual “Lap skip”
-        x_res = x + x_rec
-
-        # 5) MLP + residual
-        h3 = self.norm2(x_res)
-        return x_res + self.mlp(h3)
+        # 4) Residual and MLP
+        x = x + x_rec
+        x = x + self.mlp(self.norm_mlp(x))
+        return x
 
 
 class LapDiT(nn.Module):
@@ -87,16 +161,16 @@ class LapDiT(nn.Module):
             self,
             latent_dim: int,
             time_embed_dim: int,
+            his_dim: int = 4,
             lap_kernel: int = 32,
-            cond_embed_dim: int = 64,
             num_layers: int = 4,
             num_heads: int = 8,
             mlp_dim: int = None,
             max_timesteps: int = 1000,
-            num_classes: int = None
     ):
         super().__init__()
         self.latent_dim = latent_dim
+        self.his_dim = his_dim
         self.time_embed = nn.Sequential(
             nn.Linear(1, time_embed_dim),
             nn.GELU(),
@@ -104,34 +178,21 @@ class LapDiT(nn.Module):
         )
 
         max_L = 512
-
-        # Optional class embedding
-        self.class_embed = nn.Embedding(num_classes, cond_embed_dim) if num_classes else None
-
-        # Regression scalar embedding
-        self.scalar_embed = nn.Linear(1, cond_embed_dim)
-
+        hidden_dim = latent_dim + time_embed_dim
         # Masked time-series embedding (project per-feature)
         # Assume input series shape (B, L, F)
-        self.series_proj = nn.Linear(latent_dim, cond_embed_dim)
-
-        # Combined hidden dimension (latent + time)
-        hidden_dim = latent_dim + time_embed_dim
-        self.hidden_dim = hidden_dim
-
-        # Project and normalize condition embeddings to hidden dimension
-        self.cond_proj = nn.Linear(cond_embed_dim, hidden_dim)
+        self.conditioning_encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=his_dim, nhead=num_heads, batch_first=True),
+            num_layers=2  # A shallow encoder is usually enough
+        )
+        self.conditioning_proj = nn.Linear(his_dim, hidden_dim)
         self.cond_norm = nn.LayerNorm(hidden_dim)
-        # Project hidden conditions into Lap domain for cross-attention
-        self.cond_to_lap = nn.Linear(hidden_dim, 2 * lap_kernel)
         self.k = lap_kernel
-        # Build transformer layers
         self.layers = nn.ModuleList([
             LapFormer(
                 dim=hidden_dim,
                 num_heads=num_heads,
                 k=lap_kernel,
-                cond_dim=2 * lap_kernel,  # now matches LapFormer cross-attn embedding
                 mlp_dim=mlp_dim
             ) for _ in range(num_layers)
         ])
@@ -143,11 +204,10 @@ class LapDiT(nn.Module):
 
         # Project back to latent space
         self.output_proj = nn.Linear(hidden_dim, latent_dim)
-
         # Noise scheduler
         self.scheduler = NoiseScheduler(timesteps=max_timesteps)
 
-    def forward(self, x_latent, t, class_labels=None, series=None, scalars=None):
+    def forward(self, x_latent, t, series=None):
         """
         x_latent: [B, L, latent_dim]
         t: [B] integer timesteps
@@ -162,26 +222,12 @@ class LapDiT(nn.Module):
         t_emb = self.time_embed(t_norm.view(-1, 1))  # [B, time_embed_dim]
         t_emb = t_emb.unsqueeze(1).repeat(1, L, 1)  # [B, L, time_embed_dim]
 
-        # Prepare conditioning tensor
-        conds = []
-        if class_labels is not None and self.class_embed:
-            conds.append(self.class_embed(class_labels).unsqueeze(1))  # [B,1,cond_dim]
+        # First, create the Zx conditioning signal ONCE.
+        # The raw 'series' is your lookback window X.
+        cond_tensor = None
         if series is not None:
-            conds.append(self.series_proj(series))  # [B,L,cond_dim]
-        if scalars is not None:
-            conds.append(self.scalar_embed(scalars.view(-1, 1)).unsqueeze(1))  # [B,1,cond_dim]
-        cond_tensor = torch.cat(conds, dim=1) if conds else None  # [B, C', cond_dim]
-
-        # Lift cond embeddings to hidden size
-        if cond_tensor is not None:
-            # Lift cond embeddings to hidden size
-            cond_tensor = self.cond_proj(cond_tensor)  # [B, C', hidden_dim]
-            cond_tensor = self.cond_norm(cond_tensor)
-            # Project into Lap domain for cross-attention
-            cond_tensor = self.cond_to_lap(cond_tensor)  # [B, C', 2*k]
-            # Shape assertion for safety
-            assert cond_tensor.shape[-1] == 2 * self.k, \
-                f"Expected cond last dim {2 * self.k}, got {cond_tensor.shape[-1]}"
+            cond_tensor = self.conditioning_encoder(series)
+            cond_tensor = self.conditioning_proj(cond_tensor)
 
         # Input projection + concat time embedding
         h = torch.cat([x_latent, t_emb], dim=-1)  # [B, L, hidden_dim]
@@ -198,5 +244,42 @@ class LapDiT(nn.Module):
         # Predict noise of shape [B,L,latent_dim]
         return out
 
+    # Replace the existing generate method in your LapDiT class
 
+    @torch.no_grad()
+    def generate(
+            self,
+            context_series: torch.Tensor,
+            horizon: int,
+            num_inference_steps: int = 50,  # Control the speed/quality trade-off
+            guidance_strength: float = 3.0,
+            eta: float = 0.1  # 0.0 for deterministic DDIM
+    ):
+        """
+        Generate a future sequence using the faster DDIM sampler.
+        """
+        self.eval()
+        device = self.time_embed[0].weight.device
+        B = context_series.size(0)
 
+        # 1. Create the DDIM timestep schedule
+        step_ratio = self.scheduler.timesteps // num_inference_steps
+        timesteps = (torch.arange(0, num_inference_steps) * step_ratio).round().long().flip(0).to(device)
+
+        # 2. Start with pure Gaussian noise
+        x_t = torch.randn(B, horizon, self.latent_dim, device=device)
+
+        # 3. Iteratively denoise using the DDIM schedule
+        for i, t in enumerate(timesteps):
+            # Get the previous timestep, handling the last step
+            t_prev = timesteps[i + 1] if i < len(timesteps) - 1 else torch.tensor(-1, device=device)
+
+            # --- Classifier-Free Guidance ---
+            noise_uncond = self.forward(x_t, t.expand(B), series=None)
+            noise_cond = self.forward(x_t, t.expand(B), series=context_series)
+            noise_pred = noise_uncond + guidance_strength * (noise_cond - noise_uncond)
+
+            # --- DDIM Sampling Step ---
+            x_t = self.scheduler.ddim_sample(x_t, t.expand(B), t_prev.expand(B), noise_pred, eta)
+
+        return x_t
