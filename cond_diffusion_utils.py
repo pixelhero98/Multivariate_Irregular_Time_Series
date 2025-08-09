@@ -1,7 +1,5 @@
 import torch
-import torch.nn as nn
-from tqdm import tqdm
-from cond_latent_diffuser import DiffusionTransformer
+
 
 class NoiseScheduler:
     """
@@ -28,124 +26,55 @@ class NoiseScheduler:
         sqrt_1_ab = (1.0 - ab_t).sqrt().view(-1, *([1] * (x0.dim() - 1)))
         return sqrt_ab * x0 + sqrt_1_ab * noise, noise
 
+    # def p_sample(self, xt: torch.Tensor, t: torch.LongTensor, noise_pred: torch.Tensor):
+    #     """
+    #     Performs one step of the reverse diffusion process (DDPM sampling).
+    #     """
+    #     device = xt.device
+    #     # Move schedules to the correct device
+    #     betas_t = self.betas.to(device)[t]
+    #     sqrt_one_minus_alpha_bars_t = (1.0 - self.alpha_bars.to(device)[t]).sqrt()
+    #     sqrt_recip_alphas_t = (1.0 / self.alphas.to(device)[t]).sqrt()
+    #
+    #     # Reshape for broadcasting
+    #     sqrt_recip_alphas_t = sqrt_recip_alphas_t.view(-1, *([1] * (xt.dim() - 1)))
+    #     sqrt_one_minus_alpha_bars_t = sqrt_one_minus_alpha_bars_t.view(-1, *([1] * (xt.dim() - 1)))
+    #     betas_t = betas_t.view(-1, *([1] * (xt.dim() - 1)))
+    #
+    #     # Calculate the mean of the distribution for x_{t-1}
+    #     model_mean = sqrt_recip_alphas_t * (xt - betas_t * noise_pred / sqrt_one_minus_alpha_bars_t)
+    #
+    #     # Add noise to get the final sample, unless it's the last step
+    #     posterior_variance = betas_t
+    #     noise = torch.randn_like(xt) if t[0] > 0 else 0
+    #
+    #     return model_mean + (posterior_variance ** 0.5) * noise
 
-# ----------------- Inference for Classification -----------------
-@torch.no_grad()
-def classify_latent(
-    mu: torch.Tensor,
-    scheduler: NoiseScheduler,
-    model: DiffusionTransformer,
-    num_class: int = 2,
-    num_trials: int = 100,
-) -> torch.LongTensor:
-    """
-    Classify each latent μ by choosing the class (0…num_class-1)
-    that yields lowest average denoising error.
-    """
-    model.eval()
-    B = mu.size(0)
-    device = mu.device
+    def ddim_sample(self, xt: torch.Tensor, t: torch.LongTensor, t_prev: torch.LongTensor, noise_pred: torch.Tensor,
+                    eta: float = 0.1):
+        """
+        Performs one step of the reverse diffusion process using DDIM.
+        """
+        device = xt.device
 
-    # accumulator of shape (num_class, B)
-    errors = torch.zeros(num_class, B, device=device)
+        # Get alpha schedules for current and previous timesteps
+        alpha_bar_t = self.alpha_bars.to(device)[t]
+        alpha_bar_t_prev = self.alpha_bars.to(device)[t_prev] if t_prev[0] >= 0 else torch.tensor(1.0, device=device)
 
-    for _ in range(num_trials):
-        # sample random timestep and noise
-        t = torch.randint(0, scheduler.timesteps, (B,), device=device)
-        noise = torch.randn_like(mu)
-        x_noisy, actual_noise = scheduler.q_sample(mu, t, noise)
+        # Reshape for broadcasting
+        alpha_bar_t = alpha_bar_t.view(-1, *([1] * (xt.dim() - 1)))
+        alpha_bar_t_prev = alpha_bar_t_prev.view(-1, *([1] * (xt.dim() - 1)))
 
-        # prepare to batch over classes
-        # cls_labels: (num_class * B,)
-        cls_labels = (
-            torch.arange(num_class, device=device)
-            .unsqueeze(1)
-            .expand(num_class, B)
-            .reshape(-1)
-        )
-        # repeat x_noisy and actual_noise
-        x_rep = x_noisy.unsqueeze(0).expand(num_class, B, *x_noisy.shape[1:]) \
-                    .reshape(-1, *x_noisy.shape[1:])
-        t_rep = t.unsqueeze(0).expand(num_class, B).reshape(-1)
+        # 1. Predict the original sample (x0) from xt and noise_pred
+        pred_x0 = (xt - (1 - alpha_bar_t).sqrt() * noise_pred) / alpha_bar_t.sqrt()
 
-        # single forward pass for all classes
-        pred_noise = model(x_rep, t_rep, cls_labels)
-        # reshape back: (num_class, B, *)
-        pred_noise = pred_noise.view(num_class, B, *pred_noise.shape[1:])
-        actual_noise = actual_noise.unsqueeze(0) \
-                                  .expand(num_class, B, *actual_noise.shape[1:]) \
-                                  .reshape(num_class, B, *actual_noise.shape[1:])
+        # 2. Calculate the variance and direction for the step
+        sigma = eta * ((1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev)).sqrt()
+        direction = (1 - alpha_bar_t_prev - sigma ** 2).sqrt() * noise_pred
 
-        # squared error per sample, per class
-        # adjust dims (here assuming noise has shape [B, C, L])
-        err = ((pred_noise - actual_noise) ** 2).mean(dim=(2,3))
-        errors += err
+        # 3. Add noise for stochasticity (if eta > 0)
+        noise = torch.randn_like(xt) if t[0] > 0 else 0
 
-    # average
-    errors /= num_trials
-
-    # pick class with minimum error
-    preds = errors.argmin(dim=0)
-
-    return preds
-
-
-def regress_latent_grad(
-    mu: torch.Tensor,
-    scheduler,
-    model: nn.Module,
-    init_y: float | torch.Tensor,
-    lr: float = 1e-2,
-    steps: int = 20,
-    trials: int = 10,
-    clamp_range: tuple[float, float] | None = None,
-    show_progress: bool = True,             # new flag
-) -> torch.Tensor:
-    """
-    Perform gradient-based inversion to regress scalar y from latent means mu.
-    """
-    model.eval()
-    device, dtype = mu.device, mu.dtype
-
-    # Initialize y
-    if isinstance(init_y, (float, int)):
-        y = torch.full((mu.size(0),), float(init_y), device=device, dtype=dtype)
-    elif torch.is_tensor(init_y):
-        y = init_y.to(device=device, dtype=dtype).clone()
-        if y.ndim == 0 or y.numel() == 1:
-            y = y.expand(mu.size(0))
-    else:
-        raise ValueError(f"init_y must be float or Tensor, got {type(init_y)}")
-
-    y.requires_grad_(True)
-    optimizer = torch.optim.Adam([y], lr=lr)
-
-    # choose iterator based on show_progress
-    iterator = (
-        tqdm(range(steps), desc="Regressing y", leave=False)
-        if show_progress else
-        range(steps)
-    )
-    for _ in iterator:
-        optimizer.zero_grad()
-        total_loss = 0.0
-
-        for _ in range(trials):
-            t = torch.randint(0, scheduler.timesteps, (mu.size(0),), device=device)
-            noise = torch.randn_like(mu)
-            x_noisy, actual_noise = scheduler.q_sample(mu, t, noise)
-
-            pred_noise = model(x_noisy, t, scalars=y)
-            mse = ((pred_noise - actual_noise) ** 2).mean(
-                dim=list(range(1, pred_noise.ndim))
-            )
-            total_loss += mse
-
-        loss = (total_loss / trials).mean()
-        loss.backward()
-        optimizer.step()
-
-        if clamp_range is not None:
-            y.data.clamp_(clamp_range[0], clamp_range[1])
-
-    return y.detach()
+        # 4. Calculate x_{t-1}
+        xt_prev = alpha_bar_t_prev.sqrt() * pred_x0 + direction + sigma * noise
+        return xt_prev
