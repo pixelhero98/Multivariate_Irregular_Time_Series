@@ -1,3 +1,12 @@
+import yfinance as yf
+import numpy as np
+import torch
+import os
+import json
+from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+
+
 def _cache_sliding_windows(
     tickers,
     start,
@@ -188,3 +197,30 @@ def _cache_sliding_windows(
         json.dump(norm_stats, f)
 
     return splits['train'], splits['val'], splits['test']
+
+
+def load_norm_stats(data_dir: str = './data') -> dict:
+    """
+    Load train-only normalization stats saved by prepare_data_and_cache().
+    Returns:
+        {
+          'mean_x': np.ndarray [1, 1, F],
+          'std_x':  np.ndarray [1, 1, F],
+          'mean_y': np.ndarray [1, H] or None,
+          'std_y':  np.ndarray [1, H] or None,
+        }
+    """
+    path = os.path.join(data_dir, 'norm_stats.json')
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"norm_stats.json not found in {data_dir}. "
+                                "Run prepare_data_and_cache(...) first.")
+    with open(path, 'r') as f:
+        stats = json.load(f)
+
+    # Convert to float32 numpy arrays
+    for k in ('mean_x', 'std_x', 'mean_y', 'std_y'):
+        if k in stats and stats[k] is not None:
+            stats[k] = np.array(stats[k], dtype=np.float32)
+        else:
+            stats[k] = None
+    return stats
