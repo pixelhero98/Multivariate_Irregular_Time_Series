@@ -73,7 +73,7 @@ with torch.no_grad():
         all_mu.append(mu.cpu())
 all_mu = torch.cat(all_mu, dim=0)  # [N, L, D]
 _, mu_d, std_d = normalize_and_check(all_mu)
-
+mu_d, std_d = mu_d.to(device), std_d.to(device)
 # -------------------------------------------
 latent_dim = all_mu.size(-1)
 time_embed_dim = 256  # embedding dimension for timesteps
@@ -112,7 +112,7 @@ for epoch in range(1, EPOCHS + 1):
 
         with torch.no_grad():
             _, mu, _ = vae(y)
-        mu = (mu - mu_d.to(device)) / std_d.to(device)
+        mu = (mu - mu_d) / std_d
         mu = torch.clamp(mu, min=-5, max=5)
 
         timesteps = torch.randint(
@@ -128,15 +128,15 @@ for epoch in range(1, EPOCHS + 1):
 
         with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
             noisy_mu, actual_noise = noise_scheduler.q_sample(mu, timesteps, noise)
-            noise_pred = diff_model(noisy_mu, timesteps, cond_tensor)
+            noise_pred = diff_model(noisy_mu, timesteps, series=cond_tensor)  # <- be explicit
             loss = torch.nn.functional.mse_loss(noise_pred, actual_noise)
         
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)  # <-- unscale before clipping
         torch.nn.utils.clip_grad_norm_(diff_model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
-        optimizer.step()
         train_loss += loss.item() * mu.size(0)
 
     avg_train_loss = train_loss / train_size
@@ -148,14 +148,12 @@ for epoch in range(1, EPOCHS + 1):
             x = x.to(device)
             y = y.to(device)
             _, mu, _ = vae(y)
-            mu = (mu - mu_d.to(device)) / std_d.to(device)
+            mu = (mu - mu_d) / std_d
             mu = torch.clamp(mu, min=-5, max=5)
 
-            cond_tensor = x
-            t = torch.randint(0, noise_scheduler.timesteps, (mu.size(0),), device=device)
-            noise = torch.randn_like(mu)
-            noisy_mu, actual_noise = noise_scheduler.q_sample(mu, t, noise)
-            noise_pred = diff_model(noisy_mu, t, cond_tensor)
+            t = torch.randint(0, noise_scheduler.timesteps, (mu.size(0),), device=device).long()
+            noisy_mu, actual_noise = noise_scheduler.q_sample(mu, t, torch.randn_like(mu))
+            noise_pred = diff_model(noisy_mu, t, series=x)
             val_loss += torch.nn.functional.mse_loss(noise_pred, actual_noise).item() * mu.size(0)
 
     avg_val_loss = val_loss / val_size
@@ -206,7 +204,7 @@ for epoch in range(1, EPOCHS + 1):
                             context_series=x,
                             horizon=y_true.size(1),
                             num_inference_steps=100,
-                            guidance_strength=0.2,
+                            guidance_strength=0.1,
                         )
                         output_samples_latent.append(z_pred_sample)
     
@@ -227,5 +225,6 @@ for epoch in range(1, EPOCHS + 1):
     
         print("Stopping training due to early stopping.")
         break
+
 
 
