@@ -101,11 +101,12 @@ val_patience = 0
 best_val_loss = np.inf
 current_best_ckpt_path = "./ldt/checkpoints/best_model_epoch_107_val_0.0120.pt"
 # --- Training loop ---
+scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 for epoch in range(1, EPOCHS + 1):
     diff_model.train()
     train_loss = 0.0
     p_unconditional = 0.25
-    all_logvar = []
+
     for x, y in train_loader:
         x = x.to(device)
         y = y.to(device)
@@ -126,12 +127,16 @@ for epoch in range(1, EPOCHS + 1):
         else:
             cond_tensor = x
 
-        noisy_mu, actual_noise = noise_scheduler.q_sample(mu, timesteps, noise)
-        noise_pred = diff_model(noisy_mu, timesteps, cond_tensor)
-
-        loss = torch.nn.functional.mse_loss(noise_pred, actual_noise)
+        with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            noisy_mu, actual_noise = noise_scheduler.q_sample(mu, timesteps, noise)
+            noise_pred = diff_model(noisy_mu, timesteps, cond_tensor)
+            loss = torch.nn.functional.mse_loss(noise_pred, actual_noise)
+        
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(diff_model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
         optimizer.step()
         train_loss += loss.item() * mu.size(0)
 
@@ -223,3 +228,4 @@ for epoch in range(1, EPOCHS + 1):
     
         print("Stopping training due to early stopping.")
         break
+
