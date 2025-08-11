@@ -22,6 +22,7 @@ START, END = "2020-01-01", "2024-12-31"
 WINDOW = 60
 PRED = 10
 FEATURES = ['Open', 'High', 'Low', 'Close']
+PRED_FEAT = ['Close']
 BATCH_SIZE = 64
 EPOCHS = 500
 LR = 5e-4
@@ -50,7 +51,7 @@ train_loader, val_loader, test_loader, (train_size, val_size, test_size) = \
 
 # --- Load pre-trained VAE ---
 vae = LatentVAE(
-    input_dim=1, seq_len=PRED,
+    input_dim=len(PRED_FEAT), seq_len=PRED,
     latent_dim=64,
     enc_layers=3, enc_heads=4, enc_ff=256,
     dec_layers=3, dec_heads=4, dec_ff=256,
@@ -225,3 +226,4 @@ for epoch in range(1, EPOCHS + 1):
     
         print("Stopping training due to early stopping.")
         break
+
