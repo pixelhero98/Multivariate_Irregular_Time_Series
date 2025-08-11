@@ -2,7 +2,7 @@ from latent_vae_utils import *
 from latent_vae import LatentVAE
 import torch.nn.functional as F
 import torch
-import os  # <- needed
+import os
 
 # -------------------- Config --------------------
 TICKERS = [
@@ -144,3 +144,4 @@ for epoch in range(1, EPOCHS + 1):
         break
 
 print(f"\nTraining complete. Best Val Recon: {best_val_recon:.4f}")
+
