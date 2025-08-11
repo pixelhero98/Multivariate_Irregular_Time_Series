@@ -47,7 +47,7 @@ def load_dataloaders_from_cache(
     batch_size: int,
     data_dir: str = "./data",
     regression: bool = True,
-    pin_memory: bool | None = None,
+    pin_memory: bool = None,
     shuffle_train: bool = True,
     num_workers: int = 2,
 ):
@@ -383,10 +383,10 @@ def prepare_dataframe_and_cache(
     regression: bool = True,
     val_ratio: float = 0.1,
     test_ratio: float = 0.4,
-    feature_transform: str | callable = "none",   # "none" | "pct" | callable(df)->df
-    target_transform: str | callable = "pct",     # "none" | "pct" | callable(s)->s
+    feature_transform: str = "none",   # "none" | "pct" | callable(df)->df
+    target_transform: str = "pct",     # "none" | "pct" | callable(s)->s
     embargo: int = 0,                              # gap between splits to avoid overlap
-    min_points: int | None = None,
+    min_points: int = None,
     save_meta_name: str = "meta.json",
     save_norm_name: str = "norm_stats.json",
     verbose: bool = True,
@@ -561,3 +561,4 @@ def prepare_dataframe_and_cache(
         print(f"[prepare_dataframe_and_cache] done. N per split: {nx}. Saved to {data_dir}")
 
     return splits["train"], splits["val"], splits["test"]
+
