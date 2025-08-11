@@ -130,9 +130,6 @@ class LatentVAE(nn.Module):
             input_dim=input_dim
         )
 
-        # batch‐norm over latent channels
-        self.latent_bn = nn.BatchNorm1d(latent_dim)
-
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
@@ -140,13 +137,8 @@ class LatentVAE(nn.Module):
 
     def forward(self, x):
         # encode
-        encoder_skips = self.encoder(x)      # List of [B, T, 2*latent_dim]
-        z = encoder_skips[-1]               # final encoder output
-
-        # batch‐norm across feature dim
-        # z_perm = z0.permute(0, 2, 1)         # [B, D, T]
-        # z_norm = self.latent_bn(z_perm)
-        # z = z_norm.permute(0, 2, 1)          # [B, T, D]
+        encoder_hidden_states = self.encoder(x)      # List of [B, T, 2*latent_dim]
+        z = encoder_hidden_states[-1]               # final encoder output
 
         # VAE bottleneck
         mu     = self.mu_head(z)
@@ -154,5 +146,7 @@ class LatentVAE(nn.Module):
         z_sample = self.reparameterize(mu, logvar)
 
         # decode
-        x_hat = self.decoder(z_sample)
+        x_hat = self.decoder(z_sample, None)
         return x_hat, mu, logvar
+
+

@@ -182,6 +182,39 @@ def _cache_sliding_windows(
         'test':  (data[tr + v:], labels[tr + v:])
     }
 
+    # --- MODIFICATION START ---
+    # Standardize the data after splitting to prevent data leakage.
+    # 1. Calculate the mean and standard deviation ONLY from the training data.
+    train_data_x, train_data_y = splits['train']
+
+    # For context data X (shape: [N, window, features])
+    mean_x = np.mean(train_data_x, axis=(0, 1), keepdims=True)  # -> [1, 1, features]
+    std_x = np.std(train_data_x, axis=(0, 1), keepdims=True)
+    std_x[std_x == 0] = 1.0  # Avoid division by zero for flat features
+
+    # For target data Y (shape: [N, horizon]) - assuming it's a single feature (close_feature)
+    mean_y = np.mean(train_data_y, axis=0, keepdims=True)  # -> [1, horizon]
+    std_y = np.std(train_data_y, axis=0, keepdims=True)
+    std_y[std_y == 0] = 1.0
+
+    # 2. Apply this normalization to all splits (train, val, and test).
+    for split_name in ['train', 'val', 'test']:
+        data_x, data_y = splits[split_name]
+        # Normalize context X
+        normalized_data_x = (data_x - mean_x) / std_x
+        # Normalize target Y
+        normalized_data_y = (data_y - mean_y) / std_y
+        # Update the splits dictionary with normalized data
+        splits[split_name] = (normalized_data_x, normalized_data_y)
+
+    # Also save the normalization stats so you can de-normalize predictions later
+    norm_stats = {
+        'mean_x': mean_x.tolist(), 'std_x': std_x.tolist(),
+        'mean_y': mean_y.tolist(), 'std_y': std_y.tolist()
+    }
+    # --- MODIFICATION END ---
+
+
     # Save splits
     for key, (da, la) in splits.items():
         np.save(cache[key], da)

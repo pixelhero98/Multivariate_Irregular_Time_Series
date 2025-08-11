@@ -21,10 +21,10 @@ TICKERS = [
 ]
 START, END = "2020-01-01", "2024-12-31"
 WINDOW = 60
-PRED = 30
+PRED = 10
 FEATURES = ['Open', 'High', 'Low', 'Close']
-BATCH_SIZE = 32
-EPOCHS = 200
+BATCH_SIZE = 64
+EPOCHS = 500
 LR = 5e-4
 VAL_FRAC = 0.1
 TEST_FRAC = 0.4
@@ -57,7 +57,7 @@ vae = LatentVAE(
     dec_layers=3, dec_heads=4, dec_ff=256,
 ).to(device)
 vae.load_state_dict(torch.load(
-    './ldt/saved_model/recon_0.0008_epoch_51.pt',
+    './ldt/saved_model/recon_0.0559_epoch_4.pt',
     map_location=device
 ))
 vae.eval()
@@ -75,49 +75,47 @@ with torch.no_grad():
 all_mu = torch.cat(all_mu, dim=0)  # [N, L, D]
 _, mu_d, std_d = normalize_and_check(all_mu)
 latent_dim = all_mu.size(-1)
-time_embed_dim = 128  # embedding dimension for timesteps
-lap_kernel = 64
+time_embed_dim = 256  # embedding dimension for timesteps
+lap_kernel = 128
 num_layers = 4
 num_heads = 4
 # --- Instantiate diffusion model ---
 diff_model = LapDiT(
     latent_dim=latent_dim,
     time_embed_dim=time_embed_dim,
+    horizon=PRED,
     lap_kernel= lap_kernel,
     num_layers=num_layers,
     num_heads=num_heads,
     mlp_dim=latent_dim
 ).to(device)
 
-# Noise scheduler with default 1000 timesteps
-noise_scheduler = NoiseScheduler(timesteps=1200)
-optimizer = torch.optim.Adam(diff_model.parameters(), lr=LR)
+noise_scheduler = NoiseScheduler(timesteps=1500)
+optimizer = torch.optim.AdamW(diff_model.parameters(), lr=LR)
 val_patience = 0
 best_val_loss = np.inf
-current_best_ckpt_path = ""
+current_best_ckpt_path = "./ldt/checkpoints/best_model_epoch_107_val_0.0120.pt"
 # --- Training loop ---
 for epoch in range(1, EPOCHS + 1):
     diff_model.train()
     train_loss = 0.0
-    p_unconditional = 0.2
+    p_unconditional = 0.25
+    all_logvar = []
     for x, y in train_loader:
         x = x.to(device)
         y = y.to(device)
 
-        # 1) Encode and normalize μ
         with torch.no_grad():
             _, mu, _ = vae(y)
         mu = (mu - mu_d.to(device)) / std_d.to(device)
         mu = torch.clamp(mu, min=-5, max=5)
 
-        # 2) Sample timesteps & noise
         timesteps = torch.randint(
             0, noise_scheduler.timesteps,
             (mu.size(0),), device=device
         ).long()
         noise = torch.randn_like(mu)
 
-        # 3) Create noisy input
         if torch.rand(1).item() < p_unconditional:
             cond_tensor = None
         else:
@@ -133,54 +131,52 @@ for epoch in range(1, EPOCHS + 1):
         train_loss += loss.item() * mu.size(0)
 
     avg_train_loss = train_loss / train_size
-
     # --- Validation ---
     val_loss = 0.0
+
     with torch.no_grad():
         for x, y in val_loader:
             x = x.to(device)
             y = y.to(device)
-            # encode + normalize
             _, mu, _ = vae(y)
             mu = (mu - mu_d.to(device)) / std_d.to(device)
+            mu = torch.clamp(mu, min=-5, max=5)
+
             cond_tensor = x
-            # sample noise & timestep
             t = torch.randint(0, noise_scheduler.timesteps, (mu.size(0),), device=device)
             noise = torch.randn_like(mu)
             noisy_mu, actual_noise = noise_scheduler.q_sample(mu, t, noise)
-            # always condition during val-loss computation
             noise_pred = diff_model(noisy_mu, t, cond_tensor)
             val_loss += torch.nn.functional.mse_loss(noise_pred, actual_noise).item() * mu.size(0)
 
     avg_val_loss = val_loss / val_size
     print(f"Epoch {epoch}  train loss: {avg_train_loss:.6f} |  val loss: {avg_val_loss:.6f}")
 
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        val_patience = 0
+    # if avg_val_loss < best_val_loss:
+    #     best_val_loss = avg_val_loss
+    #     val_patience = 0
+    #
+    #     if os.path.exists(current_best_ckpt_path):
+    #         os.remove(current_best_ckpt_path)
+    #
+    #     best_ckpt_path = os.path.join(
+    #         CHECKPOINT_DIR,
+    #         f"best_model_epoch_{epoch:03d}_val_{avg_val_loss:.4f}.pt"
+    #     )
+    #
+    #     print(f"  -> New best model saved to {os.path.basename(best_ckpt_path)}")
+    #     torch.save({
+    #         'epoch': epoch,
+    #         'model_state': diff_model.state_dict(),
+    #         'optimizer_state': optimizer.state_dict(),
+    #         'mu_mean': mu_d,
+    #         'mu_std': std_d
+    #     }, best_ckpt_path)
+    #     current_best_ckpt_path = best_ckpt_path
+    # else:
+    #     val_patience += 1
 
-        if os.path.exists(current_best_ckpt_path):
-            os.remove(current_best_ckpt_path)
-
-        best_ckpt_path = os.path.join(
-            CHECKPOINT_DIR,
-            f"best_model_epoch_{epoch:03d}_val_{avg_val_loss:.4f}.pt"
-        )
-
-        print(f"  -> New best model saved to {os.path.basename(best_ckpt_path)}")
-        torch.save({
-            'epoch': epoch,
-            'model_state': diff_model.state_dict(),
-            'optimizer_state': optimizer.state_dict(),
-            'mu_mean': mu_d,
-            'mu_std': std_d
-        }, best_ckpt_path)
-        current_best_ckpt_path = best_ckpt_path
-    else:
-        val_patience += 1
-
-    # 3) Regression performance
-    if val_patience >= 15:
+    if val_patience >= 0:
         if not os.path.exists(current_best_ckpt_path):
             print("Error: Best checkpoint path not found. Cannot perform final validation.")
         else:
@@ -188,11 +184,9 @@ for epoch in range(1, EPOCHS + 1):
             diff_model.load_state_dict(best_checkpoint['model_state'])
             diff_model.eval()
 
-            # 2) Initialize for evaluation
             val_reg_loss = 0.0
-            N_SAMPLES = 20  # Number of samples to generate per forecast for a stable estimate
+            N_SAMPLES = 50
 
-            # 3) Loop through validation set and generate predictions
             with torch.no_grad():
                 for x, y_true in tqdm(val_loader, desc="Validating"):
                     x = x.to(device)
@@ -204,28 +198,26 @@ for epoch in range(1, EPOCHS + 1):
                         z_pred_sample = diff_model.generate(
                             context_series=x,
                             horizon=y_true.size(1),
-                            num_inference_steps=60,
-                            guidance_strength=3.0
+                            num_inference_steps=100,
+                            guidance_strength=0.2,
                         )
                         output_samples_latent.append(z_pred_sample)
 
-                    # Take the median across the generated samples for a stable prediction
                     stacked_samples = torch.stack(output_samples_latent)
-                    z_pred = stacked_samples.median(dim=0).values
+                    z_pred_normalized = stacked_samples.median(dim=0).values
+                    mu_d_device = best_checkpoint['mu_mean'].to(device)
+                    std_d_device = best_checkpoint['mu_std'].to(device)
+                    z_pred_raw = z_pred_normalized * std_d_device + mu_d_device
+                    y_pred = vae.decoder(z_pred_raw)
 
-                    # Call the decoder with the placeholder for skips
-                    y_pred = vae.decoder(z_pred)
+                    val_reg_loss += torch.nn.functional.mse_loss(y_pred, y_true).item() * y_true.size(0)
 
-                    # 4) Calculate and accumulate the regression loss (MSE)
-                    val_reg_loss += torch.nn.functional.mse_loss(y_pred, y_true).item() * x.size(0)
-
-            # 5) Compute and print the final average loss
             avg_val_reg_loss = val_reg_loss / val_size
             print(f"\n--- Final Validation Results ---")
             print(f"Using Best Model from Epoch: {best_checkpoint['epoch']}")
             print(f"Final Validation Regression MSE: {avg_val_reg_loss:.6f}")
             print("---------------------------------")
 
-        # 6) Stop training
         print("Stopping training due to early stopping.")
         break
+

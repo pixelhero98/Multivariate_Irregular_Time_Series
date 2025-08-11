@@ -18,9 +18,9 @@ TICKERS = [
 ]
 START, END = "2020-01-01", "2024-12-31"
 WINDOW = 60
-PRED = 30
+PRED = 10
 FEATURES = ['Open', 'High', 'Low', 'Close']
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 EPOCHS = 500
 LR = 5e-4
 max_patience = 20
@@ -53,7 +53,7 @@ model = LatentVAE(
     dec_layers=3, dec_heads=4, dec_ff=256
 ).to(device)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 # --- Training Setup ---
 # Define a directory to store the models
 model_dir = './ldt/saved_model'
@@ -64,9 +64,7 @@ current_best_elbo_path = None
 current_best_recon_path = None
 
 # Best values and patience counters for each metric
-best_val_elbo = float('inf')
-best_val_recon = float('inf')
-patience_counter_elbo = 0
+best_val_recon= float('inf')
 patience_counter_recon = 0
 
 print("Starting training...")
@@ -75,7 +73,8 @@ for epoch in range(1, EPOCHS + 1):
     model.train()
     total_recon, total_kl = 0.0, 0.0
     # Linear KL weight annealing (β-VAE)
-    beta = min(0.05, epoch / 1000) # Assuming an annealing period of 300 epochs
+    annealing_period = 500  # The number of epochs to reach the full KL penalty
+    beta = min(0.5, epoch / annealing_period)
 
     for _, y in train_loader:
         y = y.to(device)
@@ -131,8 +130,9 @@ for epoch in range(1, EPOCHS + 1):
         patience_counter_recon += 1
 
     # 3. Check the early stopping condition
-    if patience_counter_elbo >= max_patience or patience_counter_recon >= max_patience:
+    if patience_counter_recon >= max_patience:
         print(f"\nEarly stopping triggered at epoch {epoch}: Both metrics haven't improved in {max_patience} epochs.")
         break
 
-print(f"\nTraining complete. Best Val ELBO: {best_val_elbo:.4f}, Best Val Recon: {best_val_recon:.4f}")
+print(f"\nTraining complete. Best Val Recon: {best_val_recon:.4f}")
+

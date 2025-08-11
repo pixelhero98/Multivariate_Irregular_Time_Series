@@ -23,6 +23,45 @@ def get_sinusoidal_pos_emb(L: int, dim: int, device: torch.device) -> torch.Tens
     return pe.unsqueeze(0)  # (1, L, dim)
 
 
+class ContextSummarizer(nn.Module):
+    """
+    Encodes and summarizes a context series to a fixed sequence length.
+    Uses attention pooling with learnable queries.
+    """
+
+    def __init__(self, input_dim, output_seq_len, hidden_dim, num_heads=4):
+        super().__init__()
+        # Project input features (e.g., 4 for OHLC) into the model's hidden dimension
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+
+        # The learnable queries that will "ask" for summary information.
+        # Their number determines the output sequence length.
+        self.summary_queries = nn.Parameter(torch.randn(1, output_seq_len, hidden_dim))
+
+        # Standard cross-attention layer
+        self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, context_series):
+        """
+        Args:
+            context_series: Tensor of shape [B, context_L, input_dim] (e.g., [B, 60, 4])
+        Returns:
+            Tensor of shape [B, output_seq_len, hidden_dim] (e.g., [B, 30, 192])
+        """
+        # 1. Project context features into the hidden dimension
+        context_embedding = self.input_proj(context_series)  # -> [B, 60, hidden_dim]
+
+        # 2. Expand queries to match the batch size
+        B = context_embedding.size(0)
+        queries = self.summary_queries.expand(B, -1, -1)
+
+        # 3. The queries attend to the context to create the summary
+        summary, _ = self.cross_attn(queries, context_embedding, context_embedding)
+
+        return self.norm(summary)
+
+
 class LearnableLaplacianBasis(nn.Module):
     def __init__(self, k: int, feat_dim: int, alpha_min: float = 1e-6):
         """
@@ -161,6 +200,7 @@ class LapDiT(nn.Module):
             self,
             latent_dim: int,
             time_embed_dim: int,
+            horizon: int = 10,
             his_dim: int = 4,
             lap_kernel: int = 32,
             num_layers: int = 4,
@@ -181,12 +221,12 @@ class LapDiT(nn.Module):
         hidden_dim = latent_dim + time_embed_dim
         # Masked time-series embedding (project per-feature)
         # Assume input series shape (B, L, F)
-        self.conditioning_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=his_dim, nhead=num_heads, batch_first=True),
-            num_layers=2  # A shallow encoder is usually enough
+        self.conditioning_encoder = ContextSummarizer(
+            input_dim=self.his_dim,
+            output_seq_len=horizon,  # Output length matches prediction horizon
+            hidden_dim=hidden_dim,
+            num_heads=num_heads
         )
-        self.conditioning_proj = nn.Linear(his_dim, hidden_dim)
-        self.cond_norm = nn.LayerNorm(hidden_dim)
         self.k = lap_kernel
         self.layers = nn.ModuleList([
             LapFormer(
@@ -222,18 +262,15 @@ class LapDiT(nn.Module):
         t_emb = self.time_embed(t_norm.view(-1, 1))  # [B, time_embed_dim]
         t_emb = t_emb.unsqueeze(1).repeat(1, L, 1)  # [B, L, time_embed_dim]
 
-        # First, create the Zx conditioning signal ONCE.
-        # The raw 'series' is your lookback window X.
-        cond_tensor = None
-        if series is not None:
-            cond_tensor = self.conditioning_encoder(series)
-            cond_tensor = self.conditioning_proj(cond_tensor)
-
-        # Input projection + concat time embedding
-        h = torch.cat([x_latent, t_emb], dim=-1)  # [B, L, hidden_dim]
-        # Add sinusoidal positional embedding
+        h = torch.cat([x_latent, t_emb], dim=-1)
         pos_emb = self.pos_table[:, :L, :].to(device)  # (1,L,hidden_dim)
         h = h + pos_emb
+
+        cond_tensor = None
+        if series is not None:
+            summarized_context = self.conditioning_encoder(series)  # -> [B, L, hidden_dim]
+            h = h + summarized_context
+            cond_tensor = summarized_context
 
         # Pass through transformer layers
         for layer in self.layers:
@@ -251,35 +288,31 @@ class LapDiT(nn.Module):
             self,
             context_series: torch.Tensor,
             horizon: int,
-            num_inference_steps: int = 50,  # Control the speed/quality trade-off
+            num_inference_steps: int = 50,
             guidance_strength: float = 3.0,
-            eta: float = 0.1  # 0.0 for deterministic DDIM
+            eta: float = 0.0
     ):
         """
         Generate a future sequence using the faster DDIM sampler.
         """
+        # This method does not need to change, as the logic inside the forward pass
+        # has been updated to handle the new conditioning scheme.
         self.eval()
         device = self.time_embed[0].weight.device
         B = context_series.size(0)
 
-        # 1. Create the DDIM timestep schedule
         step_ratio = self.scheduler.timesteps // num_inference_steps
         timesteps = (torch.arange(0, num_inference_steps) * step_ratio).round().long().flip(0).to(device)
 
-        # 2. Start with pure Gaussian noise
         x_t = torch.randn(B, horizon, self.latent_dim, device=device)
 
-        # 3. Iteratively denoise using the DDIM schedule
         for i, t in enumerate(timesteps):
-            # Get the previous timestep, handling the last step
             t_prev = timesteps[i + 1] if i < len(timesteps) - 1 else torch.tensor(-1, device=device)
 
-            # --- Classifier-Free Guidance ---
             noise_uncond = self.forward(x_t, t.expand(B), series=None)
             noise_cond = self.forward(x_t, t.expand(B), series=context_series)
             noise_pred = noise_uncond + guidance_strength * (noise_cond - noise_uncond)
 
-            # --- DDIM Sampling Step ---
             x_t = self.scheduler.ddim_sample(x_t, t.expand(B), t_prev.expand(B), noise_pred, eta)
 
         return x_t
