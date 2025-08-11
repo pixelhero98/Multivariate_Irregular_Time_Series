@@ -301,8 +301,9 @@ class LapDiT(nn.Module):
         device = self.time_embed[0].weight.device
         B = context_series.size(0)
 
-        step_ratio = self.scheduler.timesteps // num_inference_steps
-        timesteps = (torch.arange(0, num_inference_steps) * step_ratio).round().long().flip(0).to(device)
+        T = self.scheduler.timesteps
+        assert 1 <= num_inference_steps <= T, "num_inference_steps must be <= total timesteps"
+        timesteps = torch.linspace(T - 1, 0, num_inference_steps, device=device).long()
 
         x_t = torch.randn(B, horizon, self.latent_dim, device=device)
 
@@ -314,5 +315,6 @@ class LapDiT(nn.Module):
             noise_pred = noise_uncond + guidance_strength * (noise_cond - noise_uncond)
 
             x_t = self.scheduler.ddim_sample(x_t, t.expand(B), t_prev.expand(B), noise_pred, eta)
+
 
         return x_t
