@@ -152,29 +152,29 @@ for epoch in range(1, EPOCHS + 1):
     avg_val_loss = val_loss / val_size
     print(f"Epoch {epoch}  train loss: {avg_train_loss:.6f} |  val loss: {avg_val_loss:.6f}")
 
-    # if avg_val_loss < best_val_loss:
-    #     best_val_loss = avg_val_loss
-    #     val_patience = 0
-    #
-    #     if os.path.exists(current_best_ckpt_path):
-    #         os.remove(current_best_ckpt_path)
-    #
-    #     best_ckpt_path = os.path.join(
-    #         CHECKPOINT_DIR,
-    #         f"best_model_epoch_{epoch:03d}_val_{avg_val_loss:.4f}.pt"
-    #     )
-    #
-    #     print(f"  -> New best model saved to {os.path.basename(best_ckpt_path)}")
-    #     torch.save({
-    #         'epoch': epoch,
-    #         'model_state': diff_model.state_dict(),
-    #         'optimizer_state': optimizer.state_dict(),
-    #         'mu_mean': mu_d,
-    #         'mu_std': std_d
-    #     }, best_ckpt_path)
-    #     current_best_ckpt_path = best_ckpt_path
-    # else:
-    #     val_patience += 1
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        val_patience = 0
+    
+        if os.path.exists(current_best_ckpt_path):
+            os.remove(current_best_ckpt_path)
+    
+        best_ckpt_path = os.path.join(
+            CHECKPOINT_DIR,
+            f"best_model_epoch_{epoch:03d}_val_{avg_val_loss:.4f}.pt"
+        )
+    
+        print(f"  -> New best model saved to {os.path.basename(best_ckpt_path)}")
+        torch.save({
+            'epoch': epoch,
+            'model_state': diff_model.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+            'mu_mean': mu_d,
+            'mu_std': std_d
+        }, best_ckpt_path)
+        current_best_ckpt_path = best_ckpt_path
+    else:
+        val_patience += 1
 
     if val_patience >= 0:
         if not os.path.exists(current_best_ckpt_path):
@@ -220,4 +220,5 @@ for epoch in range(1, EPOCHS + 1):
 
         print("Stopping training due to early stopping.")
         break
+
 
