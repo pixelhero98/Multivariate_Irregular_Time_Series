@@ -49,16 +49,13 @@ class ContextSummarizer(nn.Module):
         Returns:
             Tensor of shape [B, output_seq_len, hidden_dim] (e.g., [B, 30, 192])
         """
-        # 1. Project context features into the hidden dimension
-        context_embedding = self.input_proj(context_series)  # -> [B, 60, hidden_dim]
-
-        # 2. Expand queries to match the batch size
+        context_embedding = self.input_proj(context_series)      # [B, Lc, H]
         B = context_embedding.size(0)
-        queries = self.summary_queries.expand(B, -1, -1)
-
-        # 3. The queries attend to the context to create the summary
-        summary, _ = self.cross_attn(queries, context_embedding, context_embedding)
-
+        queries = self.summary_queries.expand(B, -1, -1)         # [B, Lh, H]
+        summary, _ = self.cross_attn(
+            queries, context_embedding, context_embedding,
+            key_padding_mask=context_mask  # <-- new
+        )
         return self.norm(summary)
 
 
@@ -175,17 +172,19 @@ class LapFormer(nn.Module):
             nn.Linear(mlp_dim, dim)
         )
 
-    def forward(self, x, cond=None):
+    def forward(self, x, cond=None, tgt_mask: torch.Tensor | None = None, cond_mask: torch.Tensor | None = None):
         if cond is not None:
-            # 1) Cross-Attention with pre-norm and residual
-            x = x + self.cross_attn(self.norm_cross(x), cond, cond)[0]
-
-        # 2) Laplace processing on the conditioned data
-        lap = self.Lap(x)                       # → (B, T, 2k)
-        lap = lap + self.self_attn(self.norm_lap(lap), lap, lap)[0]
-        x_rec = self.InvLap(self.norm_inv(lap)) # → (B, T, dim)
-
-        # 4) Residual and MLP
+            x = x + self.cross_attn(
+                self.norm_cross(x), cond, cond,
+                key_padding_mask=cond_mask       # <-- new
+            )[0]
+    
+        lap = self.Lap(x)  # (B, T, 2k)
+        lap = lap + self.self_attn(
+            self.norm_lap(lap), lap, lap,
+            key_padding_mask=tgt_mask           # <-- new
+        )[0]
+        x_rec = self.InvLap(self.norm_inv(lap))
         x = x + x_rec
         x = x + self.mlp(self.norm_mlp(x))
         return x
@@ -247,39 +246,25 @@ class LapDiT(nn.Module):
         # Noise scheduler
         self.scheduler = NoiseScheduler(timesteps=max_timesteps)
 
-    def forward(self, x_latent, t, series=None, cond_summary=None):
-        """
-        x_latent: [B, L, latent_dim]
-        t: [B] integer timesteps
-        series: [B, context_L, his_dim] (optional)
-        cond_summary: [B, L, hidden_dim] (optional) precomputed context summary
-        """
+    def forward(self, x_latent, t, series=None, 
+                context_mask: torch.Tensor | None = None, 
+                tgt_mask: torch.Tensor | None = None):
         B, L, _ = x_latent.shape
         device = x_latent.device
-    
-        # time embedding (unchanged) ...
+        # time + pos (unchanged) ...
         t_norm = t.float() / self.scheduler.timesteps
         t_emb = self.time_embed(t_norm.view(-1, 1)).unsqueeze(1).repeat(1, L, 1)
-    
         h = torch.cat([x_latent, t_emb], dim=-1)
-        pos_emb = self.pos_table[:, :L, :].to(device)
-        h = h + pos_emb
+        h = h + self.pos_table[:, :L, :].to(device)
     
-        # --- new: pick one conditioning source ---
-        assert not (series is not None and cond_summary is not None), \
-            "Pass either 'series' or 'cond_summary', not both."
+        cond_tensor = None
+        if series is not None:
+            summarized_context = self.conditioning_encoder(series, context_mask=context_mask)
+            h = h + summarized_context
+            cond_tensor = summarized_context
     
-        if cond_summary is None and series is not None:
-            cond_summary = self.conditioning_encoder(series)  # [B, L, hidden_dim]
-        # Optional sanity check:
-        if cond_summary is not None:
-            assert cond_summary.shape[:2] == (B, L), "cond_summary must match [B, L, hidden_dim]"
-            h = h + cond_summary
-    
-        # pass through layers with cond
-        cond_tensor = cond_summary
         for layer in self.layers:
-            h = layer(h, cond=cond_tensor)
+            h = layer(h, cond=cond_tensor, tgt_mask=tgt_mask, cond_mask=context_mask)
     
         return self.output_proj(h)
 
@@ -292,7 +277,8 @@ class LapDiT(nn.Module):
             horizon: int,
             num_inference_steps: int = 50,
             guidance_strength: float = 3.0,
-            eta: float = 0.0
+            eta: float = 0.0,
+            context_mask: torch.Tensor | None = None
     ):
         """
         Generate a future sequence using the faster DDIM sampler.
@@ -324,3 +310,4 @@ class LapDiT(nn.Module):
             x_t = self.scheduler.ddim_sample(x_t, t.expand(B), t_prev.expand(B), noise_pred, eta)
     
         return x_t
+
