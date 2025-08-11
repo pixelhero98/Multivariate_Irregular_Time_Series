@@ -247,39 +247,41 @@ class LapDiT(nn.Module):
         # Noise scheduler
         self.scheduler = NoiseScheduler(timesteps=max_timesteps)
 
-    def forward(self, x_latent, t, series=None):
+    def forward(self, x_latent, t, series=None, cond_summary=None):
         """
         x_latent: [B, L, latent_dim]
         t: [B] integer timesteps
-        class_labels: [B] (optional)
-        series: [B, L, latent_dim] (optional)
-        scalars: [B] (optional)
+        series: [B, context_L, his_dim] (optional)
+        cond_summary: [B, L, hidden_dim] (optional) precomputed context summary
         """
         B, L, _ = x_latent.shape
         device = x_latent.device
-        # Time embedding
+    
+        # time embedding (unchanged) ...
         t_norm = t.float() / self.scheduler.timesteps
-        t_emb = self.time_embed(t_norm.view(-1, 1))  # [B, time_embed_dim]
-        t_emb = t_emb.unsqueeze(1).repeat(1, L, 1)  # [B, L, time_embed_dim]
-
+        t_emb = self.time_embed(t_norm.view(-1, 1)).unsqueeze(1).repeat(1, L, 1)
+    
         h = torch.cat([x_latent, t_emb], dim=-1)
-        pos_emb = self.pos_table[:, :L, :].to(device)  # (1,L,hidden_dim)
+        pos_emb = self.pos_table[:, :L, :].to(device)
         h = h + pos_emb
-
-        cond_tensor = None
-        if series is not None:
-            summarized_context = self.conditioning_encoder(series)  # -> [B, L, hidden_dim]
-            h = h + summarized_context
-            cond_tensor = summarized_context
-
-        # Pass through transformer layers
+    
+        # --- new: pick one conditioning source ---
+        assert not (series is not None and cond_summary is not None), \
+            "Pass either 'series' or 'cond_summary', not both."
+    
+        if cond_summary is None and series is not None:
+            cond_summary = self.conditioning_encoder(series)  # [B, L, hidden_dim]
+        # Optional sanity check:
+        if cond_summary is not None:
+            assert cond_summary.shape[:2] == (B, L), "cond_summary must match [B, L, hidden_dim]"
+            h = h + cond_summary
+    
+        # pass through layers with cond
+        cond_tensor = cond_summary
         for layer in self.layers:
             h = layer(h, cond=cond_tensor)
-
-        # Project to predict noise
-        out = self.output_proj(h)
-        # Predict noise of shape [B,L,latent_dim]
-        return out
+    
+        return self.output_proj(h)
 
     # Replace the existing generate method in your LapDiT class
 
@@ -300,21 +302,25 @@ class LapDiT(nn.Module):
         self.eval()
         device = self.time_embed[0].weight.device
         B = context_series.size(0)
-
+    
+        # timesteps (from #1)
         T = self.scheduler.timesteps
-        assert 1 <= num_inference_steps <= T, "num_inference_steps must be <= total timesteps"
+        assert 1 <= num_inference_steps <= T
         timesteps = torch.linspace(T - 1, 0, num_inference_steps, device=device).long()
-
+    
+        # precompute conditioning summary once
+        cond_summary = self.conditioning_encoder(context_series)   # [B, L=horizon, hidden_dim]
+    
         x_t = torch.randn(B, horizon, self.latent_dim, device=device)
-
+    
         for i, t in enumerate(timesteps):
             t_prev = timesteps[i + 1] if i < len(timesteps) - 1 else torch.tensor(-1, device=device)
-
-            noise_uncond = self.forward(x_t, t.expand(B), series=None)
-            noise_cond = self.forward(x_t, t.expand(B), series=context_series)
+    
+            # uncond & cond passes (reuse summary)
+            noise_uncond = self.forward(x_t, t.expand(B), series=None, cond_summary=None)
+            noise_cond   = self.forward(x_t, t.expand(B), series=None, cond_summary=cond_summary)
+    
             noise_pred = noise_uncond + guidance_strength * (noise_cond - noise_uncond)
-
             x_t = self.scheduler.ddim_sample(x_t, t.expand(B), t_prev.expand(B), noise_pred, eta)
-
-
+    
         return x_t
