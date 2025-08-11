@@ -73,8 +73,9 @@ class NoiseScheduler:
         direction = (1 - alpha_bar_t_prev - sigma ** 2).sqrt() * noise_pred
 
         # 3. Add noise for stochasticity (if eta > 0)
-        noise = torch.randn_like(xt) if t[0] > 0 else 0
+        noise = torch.randn_like(xt) if t[0] > 0 else torch.zeros_like(xt)
 
         # 4. Calculate x_{t-1}
         xt_prev = alpha_bar_t_prev.sqrt() * pred_x0 + direction + sigma * noise
+
         return xt_prev
