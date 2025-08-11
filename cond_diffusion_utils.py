@@ -23,7 +23,7 @@ class NoiseScheduler(nn.Module):
         self.register_buffer("alpha_bars", alpha_bars)
 
     @torch.no_grad()
-    def q_sample(self, x0: torch.Tensor, t: torch.LongTensor, noise: torch.Tensor | None = None):
+    def q_sample(self, x0: torch.Tensor, t: torch.LongTensor, noise: torch.Tensor = None):
         """
         Forward (noising) process.
 
@@ -99,3 +99,4 @@ class NoiseScheduler(nn.Module):
         # 4) final step
         xt_prev = ab_tprev_b.sqrt() * pred_x0 + direction + sigma * eps                           # [B, ...]
         return xt_prev
+
