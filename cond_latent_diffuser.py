@@ -47,7 +47,7 @@ class ContextSummarizer(nn.Module):
         self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, context_series: torch.Tensor, context_mask: torch.Tensor | None = None):
+    def forward(self, context_series: torch.Tensor, context_mask: torch.Tensor = None):
         """
         Args:
             context_series: [B, Lc, F]
@@ -172,8 +172,8 @@ class LapFormer(nn.Module):
         self.mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(), nn.Linear(mlp_dim, dim))
 
     def forward(self, x, cond=None,
-                tgt_mask: torch.Tensor | None = None,   # [B, T] (True = PAD)
-                cond_mask: torch.Tensor | None = None): # [B, Tcond] (True = PAD)
+                tgt_mask: torch.Tensor = None,   # [B, T] (True = PAD)
+                cond_mask: torch.Tensor = None): # [B, Tcond] (True = PAD)
         """
         Args:
             x:         [B, T, H]
@@ -254,10 +254,10 @@ class LapDiT(nn.Module):
     def forward(self,
                 x_latent: torch.Tensor,                             # [B, L, D]
                 t: torch.Tensor,                                    # [B]
-                series: torch.Tensor | None = None,                 # [B, Lc, F]
-                cond_summary: torch.Tensor | None = None,           # [B, L, H]
-                context_mask: torch.Tensor | None = None,           # [B, Lc] (True = PAD)
-                tgt_mask: torch.Tensor | None = None):              # [B, L]  (True = PAD)
+                series: torch.Tensor = None,                 # [B, Lc, F]
+                cond_summary: torch.Tensor = None,           # [B, L, H]
+                context_mask: torch.Tensor = None,           # [B, Lc] (True = PAD)
+                tgt_mask: torch.Tensor = None):              # [B, L]  (True = PAD)
         """
         Returns:
             eps_pred: [B, L, D]
@@ -313,7 +313,7 @@ class LapDiT(nn.Module):
                  num_inference_steps: int = 50,
                  guidance_strength: float = 3.0,
                  eta: float = 0.0,
-                 context_mask: torch.Tensor | None = None):          # [B, Lc] (True = PAD)
+                 context_mask: torch.Tensor = None):          # [B, Lc] (True = PAD)
         """
         DDIM sampling with classifier-free guidance.
 
@@ -356,3 +356,4 @@ class LapDiT(nn.Module):
             x_t = self.scheduler.ddim_sample(x_t, t_b, tprev_b, noise_pred, eta)                  # [B, L, D]
 
         return x_t
+
