@@ -28,8 +28,9 @@ class TransformerDecoderBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, skip=None):
+        x_norm = self.norm1(x)
         # 1. Self-Attention (with pre-norm and residual connection)
-        x = x + self.dropout(self.self_attn(self.norm1(x), self.norm1(x), self.norm1(x))[0])
+        x = x + self.dropout(self.self_attn(x_norm, x_norm, x_norm)[0])
 
         # 2. Conditionally perform Cross-Attention if a skip connection is provided
         if skip is not None:
@@ -46,7 +47,7 @@ class TransformerEncoder(nn.Module):
         self.pos_emb     = nn.Parameter(torch.randn(1, seq_len, latent_dim))
         self.input_proj  = nn.Linear(input_dim, latent_dim)
 
-        # stack of Transformer‐encoder layers (d_model=2*latent_dim after concat)
+        # stack of Transformer‐encoder layers (d_model=latent_dim)
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=latent_dim,
@@ -69,7 +70,7 @@ class TransformerEncoder(nn.Module):
             h = layer(h)
             skips.append(h)
 
-        return skips
+        return skips # return List of [B, T, latent_dim] skip tensors
 
 
 class TransformerDecoder(nn.Module):
@@ -91,7 +92,7 @@ class TransformerDecoder(nn.Module):
     def forward(self, z, encoder_skips=None):
         """
         z:             [B, T, D]   sampled latent
-        encoder_skips: list[L] of [B, T, 2*D] from encoder
+        encoder_skips: list of [B, T, D] from encoder (last to first)
         """
         h = z + self.pos_emb[:, :z.size(1), :]
         if encoder_skips is not None:
@@ -137,16 +138,16 @@ class LatentVAE(nn.Module):
 
     def forward(self, x):
         # encode
-        encoder_hidden_states = self.encoder(x)      # List of [B, T, 2*latent_dim]
-        z = encoder_hidden_states[-1]               # final encoder output
-
+        encoder_hidden_states = self.encoder(x)     # list of [B, T, D]
+        z_last = encoder_hidden_states[-1]          # [B, T, D]
+    
         # VAE bottleneck
-        mu     = self.mu_head(z)
-        logvar = self.logvar_head(z)
-        z_sample = self.reparameterize(mu, logvar)
-
-        # decode
-        x_hat = self.decoder(z_sample, None)
+        mu     = self.mu_head(z_last)               # [B, T, D]
+        logvar = self.logvar_head(z_last)           # [B, T, D]
+        z_sample = self.reparameterize(mu, logvar)  # [B, T, D]
+    
+        # decode with skips (use encoder_hidden_states)
+        x_hat = self.decoder(z_sample, encoder_skips=encoder_hidden_states)
         return x_hat, mu, logvar
 
 
