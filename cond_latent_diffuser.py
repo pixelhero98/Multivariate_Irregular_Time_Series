@@ -313,7 +313,8 @@ class LapDiT(nn.Module):
                  num_inference_steps: int = 50,
                  guidance_strength: float = 3.0,
                  eta: float = 0.0,
-                 context_mask: torch.Tensor = None):          # [B, Lc] (True = PAD)
+                 context_mask: torch.Tensor = None,
+                 seed: int = 42):          # [B, Lc] (True = PAD)
         """
         DDIM sampling with classifier-free guidance.
 
@@ -356,4 +357,5 @@ class LapDiT(nn.Module):
             x_t = self.scheduler.ddim_sample(x_t, t_b, tprev_b, noise_pred, eta)                  # [B, L, D]
 
         return x_t
+
 
