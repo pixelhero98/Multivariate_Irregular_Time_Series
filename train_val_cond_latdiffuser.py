@@ -192,31 +192,42 @@ for epoch in range(1, EPOCHS + 1):
             diff_model.load_state_dict(best_checkpoint['model_state'])
             diff_model.eval()
     
+            # fixed seeds for reproducible multi-sample eval
+            EVAL_SEEDS = [1000 + i for i in range(max(1, N_INF_SAMPLES))]
+    
             val_reg_loss = 0.0
             with torch.no_grad():
                 for x, y_true in tqdm(val_loader, desc="Validating"):
                     x = x.to(device)
                     y_true = y_true.to(device)
     
-                    # Multiple samples for robustness
-                    output_samples_latent = []
-                    for _ in range(N_INF_SAMPLES):
-                        z_pred_sample = diff_model.generate(
+                    mu_d_device  = best_checkpoint['mu_mean'].to(device)
+                    std_d_device = best_checkpoint['mu_std'].to(device)
+    
+                    # generate K samples with different seeds, decode each
+                    y_samples = []
+                    for s in EVAL_SEEDS:
+                        z_pred_norm = diff_model.generate(
                             context_series=x,
                             horizon=y_true.size(1),
                             num_inference_steps=100,
                             guidance_strength=0.1,
-                        )
-                        output_samples_latent.append(z_pred_sample)
+                            eta=0.0,          # deterministic DDIM given seed
+                            seed=s,           # different seed per sample
+                        )  # [B, L, D_latent]
     
-                    stacked = torch.stack(output_samples_latent)  # [N_INF_SAMPLES, B, L, D]
-                    z_pred_norm = stacked.median(dim=0).values    # [B, L, D]
-                    mu_d_device = best_checkpoint['mu_mean'].to(device)
-                    std_d_device = best_checkpoint['mu_std'].to(device)
-                    z_pred_raw = z_pred_norm * std_d_device + mu_d_device
-                    y_pred = vae.decoder(z_pred_raw)
+                        z_pred_raw = z_pred_norm * std_d_device + mu_d_device
+                        y_samples.append(vae.decoder(z_pred_raw))   # [B, L, D_out]
     
-                    val_reg_loss += torch.nn.functional.mse_loss(y_pred, y_true).item() * y_true.size(0)
+                    y_samples = torch.stack(y_samples, dim=0)       # [S, B, L, D_out]
+    
+                    # For MSE, aggregate with the MEAN in output space
+                    y_pred = y_samples.mean(dim=0)                  # [B, L, D_out]
+    
+                    # accumulate sum over batch to average later
+                    val_reg_loss += torch.nn.functional.mse_loss(
+                        y_pred, y_true, reduction='sum'
+                    ).item()
     
             avg_val_reg_loss = val_reg_loss / val_size
             print(f"\n--- Final Validation Results ---")
@@ -226,4 +237,5 @@ for epoch in range(1, EPOCHS + 1):
     
         print("Stopping training due to early stopping.")
         break
+
 
