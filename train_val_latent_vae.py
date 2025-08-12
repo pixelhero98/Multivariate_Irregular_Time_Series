@@ -61,15 +61,17 @@ patience_counter_recon = 0
 
 print("Starting training.")
 
-FREE_BITS_PER_ELEM = 0.20  # nats per (time, latent-dim)
+FREE_BITS_PER_ELEM = 0.3  # τ (nats per (time, latent-dim))
+SOFTNESS = 0.15            # 0.05–0.2 works well
+
 # -------------------- Train Loop --------------------
 for epoch in range(1, EPOCHS + 1):
     model.train()
     total_recon, total_kl = 0.0, 0.0
 
     # β-VAE annealing toward 0.5 over 500 epochs (fixed)
-    annealing_period = 500
-    beta = min(0.5, 0.5 * epoch / annealing_period)
+    annealing_period = 1000
+    beta = min(0.2, epoch / annealing_period)
 
     for _, y in train_loader:
         y = y.to(device)
@@ -82,13 +84,20 @@ for epoch in range(1, EPOCHS + 1):
 
             # KL (elementwise), then standard total KL for logging
             kl_elem = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
-            kl_div = kl_elem.sum()
+            kl_div = kl_elem.sum()  # raw KL (for logging/selection)
 
-            # ---- Free-bits (per time, latent-dim) ----
-            # Apply the floor after averaging over batch, then scale back.
-            kl_div_eff = torch.clamp(kl_elem.mean(dim=0) - FREE_BITS_PER_ELEM, min=0.0).sum() * y.size(0)
+            # ---- Soft free-bits (per time, latent-dim) ----
+            # Average over batch first, then apply smooth hinge around τ.
+            kl_per_elem_mean = kl_elem.mean(dim=0)  # shape: (PRED, Z) or (Z,)
+            excess_per_elem = F.softplus(
+                (kl_per_elem_mean - FREE_BITS_PER_ELEM) / SOFTNESS
+            ) * SOFTNESS
+            # (optional zero-centering at the knee):
+            # excess_per_elem = (F.softplus((kl_per_elem_mean - FREE_BITS_PER_ELEM)/SOFTNESS) - math.log(2)) * SOFTNESS
 
-            # Use free-bits-adjusted KL in the loss
+            kl_div_eff = excess_per_elem.sum() * y.size(0)
+
+            # Use soft free-bits–adjusted KL in the loss
             loss = (recon_loss + beta * kl_div_eff) / y.size(0)
 
         scaler.scale(loss).backward()
@@ -135,7 +144,7 @@ for epoch in range(1, EPOCHS + 1):
     )
 
     # -------------------- Checkpointing + Early Stop --------------------
-    if val_recon_avg < best_val_recon:
+    if val_recon_avg < best_val_recon and per_elem_val_kl >= 0.2:
         # delete previous best
         if current_best_recon_path and os.path.exists(current_best_recon_path):
             os.remove(current_best_recon_path)
@@ -154,5 +163,6 @@ for epoch in range(1, EPOCHS + 1):
         break
 
 print(f"\nTraining complete. Best Val Recon: {best_val_recon:.4f}")
+
 
 
