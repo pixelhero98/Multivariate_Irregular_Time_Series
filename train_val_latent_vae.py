@@ -60,14 +60,16 @@ best_val_recon = float('inf')
 patience_counter_recon = 0
 
 print("Starting training.")
+
+FREE_BITS_PER_ELEM = 0.20  # nats per (time, latent-dim)
 # -------------------- Train Loop --------------------
 for epoch in range(1, EPOCHS + 1):
     model.train()
     total_recon, total_kl = 0.0, 0.0
 
-    # β-VAE annealing toward 0.5 over 500 epochs
+    # β-VAE annealing toward 0.5 over 500 epochs (fixed)
     annealing_period = 500
-    beta = min(0.5, epoch / annealing_period)
+    beta = min(0.5, 0.5 * epoch / annealing_period)
 
     for _, y in train_loader:
         y = y.to(device)
@@ -77,18 +79,26 @@ for epoch in range(1, EPOCHS + 1):
             y_hat, mu, logvar = model(y)
             # losses (sum over all elements; divide by B for average per-sample)
             recon_loss = F.mse_loss(y_hat, y, reduction='sum')
-            kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-            loss = (recon_loss + beta * kl_div) / y.size(0)
+
+            # KL (elementwise), then standard total KL for logging
+            kl_elem = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+            kl_div = kl_elem.sum()
+
+            # ---- Free-bits (per time, latent-dim) ----
+            # Apply the floor after averaging over batch, then scale back.
+            kl_div_eff = torch.clamp(kl_elem.mean(dim=0) - FREE_BITS_PER_ELEM, min=0.0).sum() * y.size(0)
+
+            # Use free-bits-adjusted KL in the loss
+            loss = (recon_loss + beta * kl_div_eff) / y.size(0)
 
         scaler.scale(loss).backward()
-        # unscale before clipping
-        scaler.unscale_(optimizer)
+        scaler.unscale_(optimizer)  # unscale before clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
 
         total_recon += recon_loss.item()
-        total_kl += kl_div.item()
+        total_kl += kl_div.item()  # unadjusted KL for monitoring
 
     # -------------------- Validation --------------------
     model.eval()
@@ -144,4 +154,5 @@ for epoch in range(1, EPOCHS + 1):
         break
 
 print(f"\nTraining complete. Best Val Recon: {best_val_recon:.4f}")
+
 
