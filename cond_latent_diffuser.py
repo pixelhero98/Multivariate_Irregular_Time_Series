@@ -314,48 +314,57 @@ class LapDiT(nn.Module):
                  guidance_strength: float = 3.0,
                  eta: float = 0.0,
                  context_mask: torch.Tensor = None,
-                 seed: int = 42):          # [B, Lc] (True = PAD)
+                 seed: int | None = 42):          # [B, Lc] (True = PAD)
         """
         DDIM sampling with classifier-free guidance.
-
+    
         Returns:
             x_0: [B, L=horizon, D]
         """
         self.eval()
         device = self.time_embed[0].weight.device
         B = context_series.size(0)
-
+    
         # horizon must match the summarizer's output length
         assert horizon == self.horizon, \
             f"generate(horizon={horizon}) must equal model.horizon={self.horizon}"
-
+    
         # safe timesteps: [S] decreasing ints from T-1 to 0
         T = self.scheduler.timesteps
         assert 1 <= num_inference_steps <= T, "num_inference_steps must be within [1, total timesteps]"
         timesteps = torch.linspace(T - 1, 0, num_inference_steps, device=device).long()  # [S]
-
+    
         # precompute conditioning summary once: [B, L, H]
         cond_summary = self.conditioning_encoder(context_series, context_mask=context_mask)
-
-        # start from noise: [B, L, D]
-        x_t = torch.randn(B, horizon, self.latent_dim, device=device)
-
+    
+        # --- seeded initial noise x_T ---
+        if seed is not None:
+            if device.type == "cuda":
+                g = torch.Generator(device="cuda").manual_seed(int(seed))
+            else:
+                g = torch.Generator().manual_seed(int(seed))
+            x_t = torch.randn(B, horizon, self.latent_dim, device=device, generator=g)
+        else:
+            x_t = torch.randn(B, horizon, self.latent_dim, device=device)
+    
         for i, t in enumerate(timesteps):
             t_prev = timesteps[i + 1] if i < len(timesteps) - 1 else torch.tensor(-1, device=device)
             t_b = t.expand(B)        # [B]
             tprev_b = t_prev.expand(B)
-
+    
             # uncond path (no cond)
             noise_uncond = self.forward(x_t, t_b, series=None, cond_summary=None)                 # [B, L, D]
-            # cond path (reuse summary); we could pass tgt_mask if using padded targets
+            # cond path (reuse summary)
             noise_cond   = self.forward(x_t, t_b, series=None, cond_summary=cond_summary)         # [B, L, D]
-
-            # classifier-free guidance
+    
+            # classifier-free guidance in ε-space
             noise_pred = noise_uncond + guidance_strength * (noise_cond - noise_uncond)           # [B, L, D]
-
+    
             # DDIM step handled by scheduler
             x_t = self.scheduler.ddim_sample(x_t, t_b, tprev_b, noise_pred, eta)                  # [B, L, D]
+    
+        return x_t  # z_0
 
-        return x_t
+
 
 
