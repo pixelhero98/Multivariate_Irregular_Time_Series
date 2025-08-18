@@ -71,10 +71,8 @@ train_dl, val_dl, test_dl, sizes = load_dataloaders_with_ratio_split(
 )
 
 # --- Load pre-trained VAE ---
-IN_FEAT = train_dl[0].shape[-1]
-
 vae = LatentVAE(
-    input_dim=IN_FEAT, seq_len=PRED,
+    input_dim=1, seq_len=PRED, # Since our target field is only close, so input_dim is 1.
     latent_dim=64,
     enc_layers=3, enc_heads=4, enc_ff=256,
     dec_layers=3, dec_heads=4, dec_ff=256,
@@ -260,6 +258,7 @@ for epoch in range(1, EPOCHS + 1):
     
         print("Stopping training due to early stopping.")
         break
+
 
 
 
