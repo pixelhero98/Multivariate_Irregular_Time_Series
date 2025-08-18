@@ -122,7 +122,7 @@ noise_scheduler = diff_model.scheduler
 optimizer = torch.optim.AdamW(diff_model.parameters(), lr=LR)
 val_patience = 0
 best_val_loss = np.inf
-current_best_ckpt_path = "./ldt/checkpoints/best_model_epoch_107_val_0.0120.pt"
+current_best_ckpt_path = ""
 # --- Training loop ---
 scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 for epoch in range(1, EPOCHS + 1):
@@ -260,6 +260,7 @@ for epoch in range(1, EPOCHS + 1):
     
         print("Stopping training due to early stopping.")
         break
+
 
 
 
