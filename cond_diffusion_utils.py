@@ -66,6 +66,12 @@ class NoiseScheduler(nn.Module):
         x_t = sqrt_ab * x0 + sqrt_1_ab * noise
         return x_t, noise
 
+    def v_from_eps(self, x_t: torch.Tensor, t: torch.Tensor, eps: torch.Tensor):
+        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
+        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
+        # from ε = σ x_t + α v  ⇒  v = (ε − σ x_t) / α
+        return (eps - sigma * x_t) / (alpha + 1e-12)
+
     def pred_eps_from_v(self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor):
         """
         Convert v-pred to eps using:
@@ -110,3 +116,4 @@ class NoiseScheduler(nn.Module):
         dir_xt  = torch.sqrt((1.0 - ab_prev) - sigma**2).clamp(min=0) * eps_pred
         x_prev  = torch.sqrt(ab_prev) * x0_pred + dir_xt + sigma * noise
         return x_prev
+
