@@ -127,9 +127,15 @@ class GlobalContextSummarizer(nn.Module):
         return self.norm(self.dropout(summary) + queries)  # residual to stabilize
                     
 
+# -------------------------------
+# Laplace basis (time normalized)
+# -------------------------------
+
 class LearnableLaplacianBasis(nn.Module):
     """
-    Projects x:[B, T, D] to Laplace features:[B, T, 2k] using learnable complex poles.
+    Projects x:[B, T, D] -> Laplace features:[B, T, 2k] using learnable complex poles.
+    Uses normalized time index t_norm in [0,1] and a learnable time scale to avoid
+    over-/under-decay when T varies.
     """
     def __init__(self, k: int, feat_dim: int, alpha_min: float = 1e-6):
         super().__init__()
@@ -144,27 +150,26 @@ class LearnableLaplacianBasis(nn.Module):
         # D -> k (spectral norm for stability)
         self.proj = spectral_norm(nn.Linear(feat_dim, k, bias=True), n_power_iterations=1, eps=1e-6)
 
+        # learnable global time scale (positive via softplus)
+        self._tau = nn.Parameter(torch.tensor(0.0))  # softplus(0)=~0.693 -> scale ~1.0
+
     def reset_parameters(self):
-        nn.init.uniform_(self.s_real, a=0.0, b=0.1)
-        nn.init.uniform_(self.s_imag, a=-math.pi, b=math.pi)
+        nn.init.uniform_(self.s_real, 0.01, 0.2)  # α > 0 (decay)
+        nn.init.uniform_(self.s_imag, -math.pi, math.pi)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: [B, T, D]
         Returns:
-            lap_feats: [B, T, 2k]
+            laplace_feats: [B, T, 2k]
         """
-        B, T, _ = x.shape
+        B, T, D = x.shape
         device = x.device
-
-        # complex poles (-α + iβ), complex64
-        alpha = F.softplus(self.s_real) + self.alpha_min           # [k]
-        beta = self.s_imag                                         # [k]
-        s = torch.complex(-alpha, beta)                            # [k], complex
-
-        # time indices 0..T-1, cast to complex to match s
-        t_idx = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(1).to(s.dtype)  # [T,1] complex
+        # normalized time [0,1]
+        t_idx = torch.linspace(0, 1, T, device=device, dtype=torch.float32).unsqueeze(1)  # [T,1]
+        tau = F.softplus(self._tau) + 1e-3  # strictly positive
+        s = (-self.s_real.clamp_min(self.alpha_min) + 1j * self.s_imag) * tau  # [k] complex
 
         # basis over time: exp(t * s)
         expo = torch.exp(t_idx * s.unsqueeze(0))                   # [T, k] complex
@@ -421,6 +426,7 @@ class LapDiT(nn.Module):
             x_t = self.scheduler.ddim_sample(x_t, t_b, tprev_b, noise_pred, eta)                  # [B, L, D]
     
         return x_t  # z_0
+
 
 
 
