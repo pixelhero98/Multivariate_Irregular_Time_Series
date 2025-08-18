@@ -36,6 +36,39 @@ def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> to
     emb = torch.cat([torch.cos(args), torch.sin(args)], dim=1)
     return emb
 
+
+class RelativePositionBias(nn.Module):
+    """
+    T5-style bucketed relative bias (symmetric; non-causal).
+    Produces a float mask [L, L] that is ADDED to attention logits.
+    Shared across heads (simple and stable).
+    """
+    def __init__(self, n_buckets: int = 32, max_distance: int = 128):
+        super().__init__()
+        self.n_buckets = n_buckets
+        self.max_distance = max_distance
+        self.bias = nn.Parameter(torch.zeros(n_buckets))  # learnable scalar per bucket
+
+    def _bucket(self, rel: torch.Tensor) -> torch.Tensor:
+        # rel = |j - i|, shape [L, L]
+        n = self.n_buckets
+        max_d = self.max_distance
+        # first half: exact for small distances
+        small = rel < (n // 2)
+        # remaining buckets: log-scaled
+        log_rel = torch.log(rel.float() / (n // 2) + 1e-6)
+        log_max = math.log(max(max_d / (n // 2), 1.0))
+        scaled = (log_rel / (log_max + 1e-6)) * (n - n // 2 - 1)
+        large_bucket = (n // 2 + scaled.floor().clamp(min=0, max=n - n // 2 - 1)).long()
+        return torch.where(small, rel.long(), large_bucket)
+
+    def forward(self, L: int, device: torch.device) -> torch.Tensor:
+        i = torch.arange(L, device=device)[:, None]
+        j = torch.arange(L, device=device)[None, :]
+        rel = (j - i).abs()  # [L, L]
+        buckets = self._bucket(rel)  # [L, L] integers in [0, n_buckets)
+        return self.bias[buckets]    # [L, L] float mask to add to logits
+        
 # -------------------------------
 # Context summarizers
 # -------------------------------
@@ -126,7 +159,6 @@ class GlobalContextSummarizer(nn.Module):
         )
         return self.norm(self.dropout(summary) + queries)  # residual to stabilize
                     
-
 # -------------------------------
 # Laplace basis (time normalized)
 # -------------------------------
@@ -198,7 +230,6 @@ class LearnableInverseLaplacianBasis(nn.Module):
         """
         return self.inv_proj(lap_feats)
 
-
 # -------------------------------
 # Transformer blocks
 # -------------------------------
@@ -209,7 +240,6 @@ class TransformerBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True, dropout=attn_dropout)
         self.drop_path1 = nn.Dropout(dropout)
-
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
             nn.Linear(dim, int(dim * mlp_ratio)),
@@ -219,15 +249,30 @@ class TransformerBlock(nn.Module):
         )
         self.drop_path2 = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, key_padding_mask: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
+                key_padding_mask: Optional[torch.Tensor] = None, attn_bias: Optional[torch.Tensor] = None):
+        """
+        attn_mask: standard mask (e.g., causal). Shape [L, L] or [B, L, L].
+        attn_bias: additive bias to logits (same shapes as attn_mask). We sum them if both provided.
+        """
         h = self.norm1(x)
-        h, _ = self.attn(h, h, h, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+        # Combine mask + bias if both provided
+        combined_mask = None
+        if attn_mask is not None and attn_bias is not None:
+            combined_mask = attn_mask + attn_bias
+        elif attn_mask is not None:
+            combined_mask = attn_mask
+        else:
+            combined_mask = attn_bias
+
+        h, _ = self.attn(h, h, h, attn_mask=combined_mask, key_padding_mask=key_padding_mask)
         x = x + self.drop_path1(h)
 
         h = self.norm2(x)
         h = self.mlp(h)
         x = x + self.drop_path2(h)
         return x
+
 
 class CrossAttnBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, dropout: float = 0.0, attn_dropout: float = 0.0):
@@ -248,10 +293,8 @@ class CrossAttnBlock(nn.Module):
         h, _ = self.cross(q, k, k, key_padding_mask=kv_mask)
         return x + self.drop(h)
 
+
 class LapFormer(nn.Module):
-    """
-    A lightweight DiT-style stack operating on Laplace-augmented tokens.
-    """
     def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, num_heads: int,
                  laplace_k: int = 16, dropout: float = 0.0, attn_dropout: float = 0.0):
         super().__init__()
@@ -274,43 +317,36 @@ class LapFormer(nn.Module):
             CrossAttnBlock(hidden_dim, num_heads, dropout=dropout, attn_dropout=attn_dropout)
             for _ in range(num_layers)
         ])
+
+        # >>> NEW: shared relative position bias for self-attn <<<
+        self.rel_bias = RelativePositionBias(n_buckets=32, max_distance=128)
+
         self.norm_out = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, input_dim)
 
     def forward(self, x_tokens: torch.Tensor, t_emb: torch.Tensor,
                 cond_summary: Optional[torch.Tensor] = None,
                 cond_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            x_tokens:    [B, L, D] (e.g., noisy latent at step t)
-            t_emb:       [B, H] time embedding
-            cond_summary:[B, Lh, H] or None
-        Returns:
-            delta:       [B, L, D] (predicted component, later mapped to ε)
-        """
         B, L, D = x_tokens.shape
         device = x_tokens.device
 
-        # token embedding + Laplace features
-        h = self.input_proj(x_tokens) + self.lap_proj(self.lap(x_tokens))  # [B, L, H]
-
-        # add positional encoding for target tokens
+        h = self.input_proj(x_tokens) + self.lap_proj(self.lap(x_tokens))
         h = h + get_sinusoidal_pos_emb(L, h.size(-1), device)
 
-        # add broadcasted timestep embedding
-        t_add = self.time_mlp(t_emb).unsqueeze(1)  # [B,1,H]
+        t_add = self.time_mlp(t_emb).unsqueeze(1)
         h = h + t_add
 
-        # interleave self-attn and cross-attn to condition
+        # Precompute RPB once per forward; shape [L, L]
+        attn_bias = self.rel_bias(L, device)  # small float mask added to logits
+
         for blk, cblk in zip(self.blocks, self.cross_blocks):
-            h = blk(h, attn_mask=None, key_padding_mask=None)
+            h = blk(h, attn_mask=attn_bias, key_padding_mask=None, attn_bias=None)  # use bias as mask
             if cond_summary is not None:
                 h = cblk(h, cond_summary, kv_mask=cond_mask)
 
         h = self.norm_out(h)
-        out = self.out_proj(h)  # [B, L, D]
+        out = self.out_proj(h)
         return out
-
 
 # -------------------------------
 # Full model
@@ -484,3 +520,4 @@ class LapDiT(nn.Module):
                 x_t = obs_mask * x_t_obs + (1.0 - obs_mask) * x_t
 
         return x_t  # x_0 sample
+
