@@ -3,72 +3,129 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
+from typing import Optional, Tuple
 from cond_diffusion_utils import NoiseScheduler
 
 
+# -------------------------------
+# Positional / timestep embeddings
+# -------------------------------
+
 def get_sinusoidal_pos_emb(L: int, dim: int, device: torch.device) -> torch.Tensor:
     """
-    Returns:
-        pos_emb: [1, L, dim]
+    Standard 1D sinusoidal positional embeddings.
+    Returns: [1, L, dim]
     """
+    if dim % 2 != 0:
+        raise ValueError("pos_emb dim must be even")
     pos = torch.arange(L, device=device).unsqueeze(1).float()   # [L, 1]
-    i   = torch.arange(dim, device=device).unsqueeze(0).float() # [1, dim]
-    angle_rates = 1 / (10000 ** (2 * (i // 2) / dim))
-    angles = pos * angle_rates                                  # [L, dim]
+    i   = torch.arange(dim // 2, device=device).float()         # [dim/2]
+    angles = pos / (10000 ** (i / (dim // 2)))                  # [L, dim/2]
+    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)  # [L, dim]
+    return emb.unsqueeze(0)  # [1, L, dim]
 
-    pe = torch.zeros(L, dim, device=device)                     # [L, dim]
-    pe[:, 0::2] = torch.sin(angles[:, 0::2])
-    pe[:, 1::2] = torch.cos(angles[:, 1::2])
-    return pe.unsqueeze(0)                                      # [1, L, dim]
-
-
-class ContextSummarizer(nn.Module):
+def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
     """
-    Encodes a variable-length context series [B, Lc, F] to a fixed-length summary
-    [B, Lh, H] using learnable queries and cross-attention.
+    From DiT/ADM: create [B, dim] embedding for integer timesteps.
     """
+    if dim % 2 != 0:
+        raise ValueError("timestep embedding dim must be even")
+    half = dim // 2
+    freqs = torch.exp(-math.log(max_period) * torch.arange(0, half, device=t.device).float() / half)
+    args = t.float().unsqueeze(1) * freqs.unsqueeze(0)  # [B, half]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=1)
+    return emb
 
-    def __init__(self, input_dim, output_seq_len, hidden_dim, num_heads=4):
+# -------------------------------
+# Context summarizers
+# -------------------------------
+
+class GlobalContextSummarizer(nn.Module):
+    """
+    Flexible summarizer that can ingest either:
+      - per-entity context:     [B, Lc, F]
+      - global multi-entity:    [B, M, Lc, F] with optional entity_ids:[B, M]
+    Produces a fixed-length summary [B, Lh, H] via cross-attention from
+    learnable queries to temporally encoded context tokens.
+
+    Notes:
+      * Adds sinusoidal positional encodings along time (Lc).
+      * If entity_ids are provided and num_entities is set, adds an entity embedding.
+      * Concatenates entities along the sequence dimension (M * Lc) and uses a single cross-attn.
+    """
+    def __init__(self, input_dim: int, output_seq_len: int, hidden_dim: int,
+                 num_heads: int = 4, num_entities: Optional[int] = None, dropout: float = 0.0):
         super().__init__()
-        # MHA sanity check
-        assert hidden_dim % num_heads == 0, \
-            f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})"
-
+        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
         self.input_dim = input_dim
         self.output_seq_len = output_seq_len
         self.hidden_dim = hidden_dim
+        self.num_entities = num_entities
 
-        # F -> H
         self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.entity_emb = None
+        if num_entities is not None:
+            self.entity_emb = nn.Embedding(num_entities, hidden_dim)
 
-        # learnable queries determine output length Lh
-        self.summary_queries = nn.Parameter(torch.randn(1, output_seq_len, hidden_dim))  # [1, Lh, H]
-
-        self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        self.summary_queries = nn.Parameter(torch.randn(1, output_seq_len, hidden_dim))
+        self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True, dropout=dropout)
         self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, context_series: torch.Tensor, context_mask: torch.Tensor = None):
+    def forward(self,
+                context_series: torch.Tensor,
+                context_mask: Optional[torch.Tensor] = None,
+                entity_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            context_series: [B, Lc, F]
-            context_mask:   [B, Lc] bool (True = PAD/ignore)
+            context_series:
+                [B, Lc, F]  OR  [B, M, Lc, F]
+            context_mask:
+                [B, Lc]     OR  [B, M, Lc]  (True = PAD/ignore, like nn.MultiheadAttention expects)
+            entity_ids:
+                [B, M] or None (only used when context is [B,M,Lc,F] and num_entities provided)
         Returns:
             summary: [B, Lh, H]
         """
-        B, Lc, F = context_series.shape
-        assert F == self.input_dim, f"context_series last dim {F} != expected {self.input_dim}"
+        x = context_series
+        B = x.size(0)
+        device = x.device
 
-        context_embedding = self.input_proj(context_series)          # [B, Lc, H]
-        queries = self.summary_queries.expand(B, -1, -1)             # [B, Lh, H]
+        if x.dim() == 3:
+            # [B, Lc, F]
+            B, Lc, F = x.shape
+            x = self.input_proj(x)  # [B, Lc, H]
+            # add temporal pos enc
+            x = x + get_sinusoidal_pos_emb(Lc, self.hidden_dim, device)
+            key_padding_mask = context_mask  # [B, Lc] or None
+        elif x.dim() == 4:
+            # [B, M, Lc, F] -> flatten entities into time
+            B, M, Lc, F = x.shape
+            x = self.input_proj(x)  # [B, M, Lc, H]
+            # add temporal pos enc per entity
+            pos = get_sinusoidal_pos_emb(Lc, self.hidden_dim, device)  # [1, Lc, H]
+            x = x + pos.unsqueeze(1)  # [B, M, Lc, H]
+            if self.entity_emb is not None and entity_ids is not None:
+                ent = self.entity_emb(entity_ids)  # [B, M, H]
+                x = x + ent.unsqueeze(2)          # broadcast to [B, M, Lc, H]
+            x = x.reshape(B, M * Lc, self.hidden_dim)  # [B, M*Lc, H]
+            if context_mask is not None:
+                key_padding_mask = context_mask.reshape(B, M * Lc)  # [B, M*Lc]
+            else:
+                key_padding_mask = None
+        else:
+            raise ValueError("context_series must be [B,Lc,F] or [B,M,Lc,F]")
 
+        queries = self.summary_queries.expand(B, -1, -1)  # [B, Lh, H]
+        # Cross-attention
         summary, _ = self.cross_attn(
-            queries,                                                # Q: [B, Lh, H]
-            context_embedding,                                      # K: [B, Lc, H]
-            context_embedding,                                      # V: [B, Lc, H]
-            key_padding_mask=context_mask                           # mask over K/V (Lc)
+            queries,         # Q: [B, Lh, H]
+            x,               # K: [B, Lctx, H]
+            x,               # V: [B, Lctx, H]
+            key_padding_mask=key_padding_mask
         )
-        return self.norm(summary)                                    # [B, Lh, H]
-
+        return self.norm(self.dropout(summary) + queries)  # residual to stabilize
+                    
 
 class LearnableLaplacianBasis(nn.Module):
     """
@@ -364,6 +421,7 @@ class LapDiT(nn.Module):
             x_t = self.scheduler.ddim_sample(x_t, t_b, tprev_b, noise_pred, eta)                  # [B, L, D]
     
         return x_t  # z_0
+
 
 
 
