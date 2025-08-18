@@ -370,7 +370,7 @@ for epoch in range(1, EPOCHS + 1):
             t = torch.randint(0, noise_scheduler.timesteps, (mu_norm.size(0),), device=device).long()
             cond_series = x_ctx
             loss = diffusion_loss(diff_model, noise_scheduler, mu_norm, t, cond_series,
-                                  predict_type=PREDICT_TYPE, use_self_cond=False)
+                                  predict_type=PREDICT_TYPE, use_self_cond=SELF_COND)
             val_loss_sum += loss.item() * mu_norm.size(0)
 
     avg_val_loss = val_loss_sum / max(1, N_VAL)
@@ -439,7 +439,7 @@ if best_ckpt_path and os.path.exists(best_ckpt_path):
                     eta=DDIM_ETA_EVAL,
                     series=x_ctx,
                     x_T=x_T,
-                    self_cond=False
+                    self_cond=SELF_COND
                 )
                 z_pred = z_pred_norm * mu_std_eval + mu_mean_eval
                 y_hat = vae.decoder(z_pred)   # [B,L,1]
@@ -486,7 +486,7 @@ if best_ckpt_path and os.path.exists(best_ckpt_path):
                             eta=DDIM_ETA_EVAL,
                             series=x_ctx,
                             x_T=x_T,
-                            self_cond=False
+                            self_cond=SELF_COND
                         )
                         z_pred = z_pred_norm * mu_std_eval + mu_mean_eval
                         y_pair.append(z_pred)
@@ -510,4 +510,5 @@ if best_ckpt_path and os.path.exists(best_ckpt_path):
         print(f"\nValidation regression MSE after decoder FT: {val_reg_mse_ft:.6f}")
 else:
     print("No best checkpoint found; skipping regression eval and decoder fine-tune.")
+
 
