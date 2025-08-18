@@ -1,102 +1,111 @@
+import math
 import torch
 import torch.nn as nn
 
+def _cosine_alpha_bar(t, s=0.008):
+    """
+    Continuous-time alpha_bar(t) from Nichol & Dhariwal 'Improved Denoising Diffusion Models'.
+    t in [0,1]. Returns alpha_bar(t) in [0,1].
+    """
+    return torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
 
 class NoiseScheduler(nn.Module):
     """
-    Linear beta schedule + DDIM sampler.
-
-    Notation:
-      B = batch, T = total diffusion steps, D = feature dims (broadcasted)
+    Diffusion utilities with precomputed buffers and a DDIM sampler.
+    Supports 'linear' or 'cosine' schedules and epsilon- or v-parameterization.
     """
-    def __init__(self, timesteps: int = 1000, beta_start: float = 1e-4, beta_end: float = 2e-2):
+    def __init__(self, timesteps: int = 1000, schedule: str = "cosine",
+                 beta_start: float = 1e-4, beta_end: float = 2e-2):
         super().__init__()
         self.timesteps = int(timesteps)
+        if schedule not in {"linear", "cosine"}:
+            raise ValueError(f"Unknown schedule: {schedule}")
+        self.schedule = schedule
 
-        # Register as buffers so they move with .to(device) and save in state_dict
-        betas = torch.linspace(beta_start, beta_end, self.timesteps, dtype=torch.float32)      # [T]
-        alphas = 1.0 - betas                                                                    # [T]
-        alpha_bars = torch.cumprod(alphas, dim=0)                                               # [T]
+        # Build betas
+        if schedule == "linear":
+            betas = torch.linspace(beta_start, beta_end, self.timesteps, dtype=torch.float32)
+            alphas = 1.0 - betas
+            alpha_bars = torch.cumprod(alphas, dim=0)
+        else:
+            # cosine: derive betas from alpha_bar using finite differences
+            ts = torch.linspace(0, 1, self.timesteps + 1, dtype=torch.float32)
+            abar = _cosine_alpha_bar(ts)  # length T+1
+            abar = abar / abar[0]         # normalize so abar(0)=1
+            alpha_bars = abar[1:]         # t=1..T
+            alphas = alpha_bars / torch.cat([torch.tensor([1.0], dtype=alpha_bars.dtype), alpha_bars[:-1]], dim=0)
+            betas = (1.0 - alphas).clamp(min=1e-8, max=0.999)
 
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas", alphas)
-        self.register_buffer("alpha_bars", alpha_bars)
+        # Buffers
+        self.register_buffer("betas", betas)                    # [T]
+        self.register_buffer("alphas", 1.0 - betas)             # [T]
+        self.register_buffer("alpha_bars", torch.cumprod(1.0 - betas, dim=0))  # [T]
+        self.register_buffer("sqrt_alphas", torch.sqrt(1.0 - betas))           # [T]
+        self.register_buffer("sqrt_alpha_bars", torch.sqrt(self.alpha_bars))   # [T]
+        self.register_buffer("sqrt_one_minus_alpha_bars", torch.sqrt(1.0 - self.alpha_bars))  # [T]
 
     @torch.no_grad()
-    def q_sample(self, x0: torch.Tensor, t: torch.LongTensor, noise: torch.Tensor = None):
-        """
-        Forward (noising) process.
+    def timesteps_desc(self):
+        return torch.arange(self.timesteps - 1, -1, -1, dtype=torch.long, device=self.alpha_bars.device)
 
-        Args:
-            x0:    [B, ...]
-            t:     [B] integer timesteps in [0, T-1]
-            noise: [B, ...] (optional)
-        Returns:
-            x_t:   [B, ...]
-            eps:   [B, ...] (the actual noise added)
+    def _gather(self, buf: torch.Tensor, t: torch.Tensor):
+        # t: [B] long; buf: [T]
+        return buf.gather(0, t.clamp(min=0, max=self.timesteps - 1))
+
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None):
+        """
+        Sample x_t ~ q(x_t | x0).
+        Returns (x_t, eps_used).
         """
         if noise is None:
             noise = torch.randn_like(x0)
 
-        # gather ᾱ_t per batch element -> [B]
-        # (buffers already on the right device)
-        ab_t = self.alpha_bars[t]                                                                # [B]
-
-        # reshape for broadcasting to x0
-        view_shape = (-1, *([1] * (x0.dim() - 1)))                                              # [B, 1, ..., 1]
-        sqrt_ab   = ab_t.sqrt().view(view_shape)                                                 # [B, 1, ..., 1]
-        sqrt_1_ab = (1.0 - ab_t).sqrt().view(view_shape)                                         # [B, 1, ..., 1]
-
+        sqrt_ab   = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x0.dim()-1)))
+        sqrt_1_ab = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x0.dim()-1)))
         x_t = sqrt_ab * x0 + sqrt_1_ab * noise
         return x_t, noise
 
+    def pred_eps_from_v(self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor):
+        """
+        Convert v-pred to eps using:
+          x0 = α x_t - σ v
+          ε  = σ x_t + α v
+        where α = sqrt(alpha_bar_t), σ = sqrt(1 - alpha_bar_t).
+        """
+        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
+        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
+        return sigma * x_t + alpha * v
+
+    def pred_x0_from_eps(self, x_t: torch.Tensor, t: torch.Tensor, eps: torch.Tensor):
+        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
+        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
+        return (x_t - sigma * eps) / (alpha + 1e-12)
+
     @torch.no_grad()
-    def ddim_sample(
-        self,
-        xt: torch.Tensor,                 # [B, ...]
-        t: torch.LongTensor,              # [B]
-        t_prev: torch.LongTensor,         # [B] (can be -1 for "start")
-        noise_pred: torch.Tensor,         # [B, ...]
-        eta: float = 0.0
-    ):
+    def ddim_sigma(self, t: torch.Tensor, t_prev: torch.Tensor, eta: float):
         """
-        One DDIM step x_t -> x_{t-1}, elementwise-safe (handles mixed t/t_prev if needed).
-
-        Returns:
-            xt_prev: [B, ...]
+        DDIM sigma between t and t_prev (per batch).
         """
-        B = xt.size(0)
+        ab_t    = self._gather(self.alpha_bars, t)
+        ab_prev = self._gather(self.alpha_bars, t_prev)
+        sigma = eta * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t)) * torch.sqrt(1.0 - ab_t / (ab_prev + 1e-12))
+        return sigma.view(-1, *([1] * 1))
 
-        # ᾱ_t and ᾱ_{t-1}; handle t_prev == -1 per element by substituting 1.0
-        ab_t = self.alpha_bars[t]                                                                 # [B]
-        t_prev_clamped = torch.clamp(t_prev, min=0)                                               # [B]
-        ab_t_prev = self.alpha_bars[t_prev_clamped]                                               # [B]
-        prev_is_neg = (t_prev < 0)                                                                # [B]
-        ab_t_prev = torch.where(prev_is_neg, torch.ones_like(ab_t_prev), ab_t_prev)               # [B]
+    @torch.no_grad()
+    def ddim_sample(self, x_t: torch.Tensor, t: torch.Tensor, t_prev: torch.Tensor,
+                    eps_pred: torch.Tensor, eta: float = 0.0, noise: torch.Tensor = None):
+        """
+        One DDIM update given epsilon prediction.
+        """
+        if noise is None:
+            noise = torch.randn_like(x_t)
 
-        # reshape for broadcasting
-        view_shape = (-1, *([1] * (xt.dim() - 1)))                                                # [B, 1, ..., 1]
-        ab_t_b     = ab_t.view(view_shape)
-        ab_tprev_b = ab_t_prev.view(view_shape)
+        ab_t    = self._gather(self.alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
+        ab_prev = self._gather(self.alpha_bars, t_prev).view(-1, *([1] * (x_t.dim()-1)))
 
-        # 1) predict x0 from x_t and ε̂
-        pred_x0 = (xt - (1.0 - ab_t_b).sqrt() * noise_pred) / ab_t_b.clamp(min=1e-12).sqrt()      # [B, ...]
+        x0_pred = self.pred_x0_from_eps(x_t, t, eps_pred)
+        sigma   = self.ddim_sigma(t, t_prev, eta).view(-1, *([1] * (x_t.dim()-1)))
 
-        # 2) DDIM variance and direction
-        #    sigma = η * sqrt( (1-ᾱ_{t-1})/(1-ᾱ_t) * (1 - ᾱ_t/ᾱ_{t-1}) )
-        #    guard small negatives due to fp errors
-        num   = (1.0 - ab_tprev_b).clamp(min=0.0)
-        den   = (1.0 - ab_t_b).clamp(min=1e-12)
-        frac  = (1.0 - (ab_t_b / ab_tprev_b).clamp(min=0.0, max=1.0)).clamp(min=0.0)
-        sigma = eta * ( (num / den) * frac ).clamp(min=0.0).sqrt()                                 # [B, 1, ..., 1]
-
-        direction = ( (1.0 - ab_tprev_b - sigma**2).clamp(min=0.0).sqrt() * noise_pred )          # [B, ...]
-
-        # 3) noise (per-element: zero when t == 0)
-        t_gt0 = (t > 0).view(view_shape)                                                          # [B, 1, ..., 1]
-        eps = torch.randn_like(xt) * t_gt0                                                        # [B, ...] zeros where t==0
-
-        # 4) final step
-        xt_prev = ab_tprev_b.sqrt() * pred_x0 + direction + sigma * eps                           # [B, ...]
-        return xt_prev
-
+        dir_xt  = torch.sqrt((1.0 - ab_prev) - sigma**2).clamp(min=0) * eps_pred
+        x_prev  = torch.sqrt(ab_prev) * x0_pred + dir_xt + sigma * noise
+        return x_prev
