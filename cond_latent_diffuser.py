@@ -199,237 +199,288 @@ class LearnableInverseLaplacianBasis(nn.Module):
         return self.inv_proj(lap_feats)
 
 
-class LapFormer(nn.Module):
-    """
-    One transformer block operating partly in Laplace space.
+# -------------------------------
+# Transformer blocks
+# -------------------------------
 
-    Shapes through the block:
-      x (in):           [B, T, H]
-      cross-attn out:   [B, T, H]   (keys/values are 'cond')
-      Lap(x):           [B, T, 2k]
-      self-attn Lap:    [B, T, 2k]
-      InvLap:           [B, T, H]
-      MLP out:          [B, T, H]
-    """
-    def __init__(self, dim, num_heads, k, mlp_dim=None):
+class TransformerBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0, attn_dropout: float = 0.0):
         super().__init__()
-        # attention divisibility guards
-        assert dim % num_heads == 0, f"dim ({dim}) % num_heads ({num_heads}) != 0"
-        assert (2 * k) % num_heads == 0, f"2*k ({2*k}) % num_heads ({num_heads}) != 0"
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True, dropout=attn_dropout)
+        self.drop_path1 = nn.Dropout(dropout)
 
-        # Cross-attention to conditioning
-        self.norm_cross = nn.LayerNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, int(dim * mlp_ratio)),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(dim * mlp_ratio), dim),
+        )
+        self.drop_path2 = nn.Dropout(dropout)
 
-        # Laplace-domain self-attention
-        self.Lap = LearnableLaplacianBasis(k, dim)
-        self.norm_lap = nn.LayerNorm(2 * k)
-        self.self_attn = nn.MultiheadAttention(embed_dim=2 * k, num_heads=num_heads, batch_first=True)
-        self.norm_inv = nn.LayerNorm(2 * k)
-        self.InvLap = LearnableInverseLaplacianBasis(self.Lap)
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, key_padding_mask: Optional[torch.Tensor] = None):
+        h = self.norm1(x)
+        h, _ = self.attn(h, h, h, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+        x = x + self.drop_path1(h)
 
-        # MLP in time-domain
-        mlp_dim = mlp_dim or 4 * dim
-        self.norm_mlp = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(), nn.Linear(mlp_dim, dim))
-
-    def forward(self, x, cond=None,
-                tgt_mask: torch.Tensor = None,   # [B, T] (True = PAD)
-                cond_mask: torch.Tensor = None): # [B, Tcond] (True = PAD)
-        """
-        Args:
-            x:         [B, T, H]
-            cond:      [B, Tcond, H] or None
-            tgt_mask:  [B, T] bool for self-attn (over x)
-            cond_mask: [B, Tcond] bool for cross-attn (over cond)
-        """
-        if cond is not None:
-            x = x + self.cross_attn(self.norm_cross(x), cond, cond, key_padding_mask=cond_mask)[0]  # [B, T, H]
-
-        lap = self.Lap(x)                                                                              # [B, T, 2k]
-        lap = lap + self.self_attn(self.norm_lap(lap), lap, lap, key_padding_mask=tgt_mask)[0]         # [B, T, 2k]
-        x_rec = self.InvLap(self.norm_inv(lap))                                                        # [B, T, H]
-        x = x + x_rec                                                                                  # [B, T, H]
-        x = x + self.mlp(self.norm_mlp(x))                                                             # [B, T, H]
+        h = self.norm2(x)
+        h = self.mlp(h)
+        x = x + self.drop_path2(h)
         return x
 
+class CrossAttnBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0, attn_dropout: float = 0.0):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.cross = nn.MultiheadAttention(dim, num_heads, batch_first=True, dropout=attn_dropout)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, kv: torch.Tensor, kv_mask: Optional[torch.Tensor] = None):
+        """
+        x:  [B, L, H]
+        kv: [B, Lc, H]
+        kv_mask: [B, Lc] (True = ignore)
+        """
+        q = self.norm_q(x)
+        k = self.norm_kv(kv)
+        h, _ = self.cross(q, k, k, key_padding_mask=kv_mask)
+        return x + self.drop(h)
+
+class LapFormer(nn.Module):
+    """
+    A lightweight DiT-style stack operating on Laplace-augmented tokens.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, num_heads: int,
+                 laplace_k: int = 16, dropout: float = 0.0, attn_dropout: float = 0.0):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.lap = LearnableLaplacianBasis(k=laplace_k, feat_dim=input_dim)
+        self.lap_proj = nn.Linear(2 * laplace_k, hidden_dim)
+
+        self.time_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+
+        self.blocks = nn.ModuleList([
+            TransformerBlock(hidden_dim, num_heads, mlp_ratio=4.0, dropout=dropout, attn_dropout=attn_dropout)
+            for _ in range(num_layers)
+        ])
+        self.cross_blocks = nn.ModuleList([
+            CrossAttnBlock(hidden_dim, num_heads, dropout=dropout, attn_dropout=attn_dropout)
+            for _ in range(num_layers)
+        ])
+        self.norm_out = nn.LayerNorm(hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, input_dim)
+
+    def forward(self, x_tokens: torch.Tensor, t_emb: torch.Tensor,
+                cond_summary: Optional[torch.Tensor] = None,
+                cond_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x_tokens:    [B, L, D] (e.g., noisy latent at step t)
+            t_emb:       [B, H] time embedding
+            cond_summary:[B, Lh, H] or None
+        Returns:
+            delta:       [B, L, D] (predicted component, later mapped to ε)
+        """
+        B, L, D = x_tokens.shape
+        device = x_tokens.device
+
+        # token embedding + Laplace features
+        h = self.input_proj(x_tokens) + self.lap_proj(self.lap(x_tokens))  # [B, L, H]
+
+        # add positional encoding for target tokens
+        h = h + get_sinusoidal_pos_emb(L, h.size(-1), device)
+
+        # add broadcasted timestep embedding
+        t_add = self.time_mlp(t_emb).unsqueeze(1)  # [B,1,H]
+        h = h + t_add
+
+        # interleave self-attn and cross-attn to condition
+        for blk, cblk in zip(self.blocks, self.cross_blocks):
+            h = blk(h, attn_mask=None, key_padding_mask=None)
+            if cond_summary is not None:
+                h = cblk(h, cond_summary, kv_mask=cond_mask)
+
+        h = self.norm_out(h)
+        out = self.out_proj(h)  # [B, L, D]
+        return out
+
+
+# -------------------------------
+# Full model
+# -------------------------------
 
 class LapDiT(nn.Module):
     """
-    Conditional diffusion model.
-
-    Notation:
-      B = batch, L = target length (horizon), Lc = context length, F = his_dim,
-      D = latent_dim, H = hidden_dim = D + time_embed_dim, k = lap_kernel
+    Latent conditional diffusion model for multivariate time series.
+    - Supports global multi-entity conditioning.
+    - Positional encodings in both context and target paths.
+    - Optional v-parameterization internally (converted to ε for sampling if needed).
     """
-
     def __init__(self,
-                 latent_dim: int,
-                 time_embed_dim: int,
-                 horizon: int = 10,
-                 his_dim: int = 4,
-                 lap_kernel: int = 32,
-                 num_layers: int = 4,
+                 data_dim: int,                  # feature dimension of the target series (D)
+                 hidden_dim: int = 256,
+                 num_layers: int = 6,
                  num_heads: int = 8,
-                 mlp_dim: int = None,
-                 max_timesteps: int = 1000):
+                 laplace_k: int = 16,
+                 cond_len: int = 32,             # Lh: length of conditioning summary
+                 num_entities: Optional[int] = None,   # total entities for global context (optional)
+                 dropout: float = 0.1,
+                 attn_dropout: float = 0.0,
+                 predict_type: str = "eps",      # "eps" or "v"
+                 timesteps: int = 1000,
+                 schedule: str = "cosine"):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.his_dim = his_dim
-        self.horizon = horizon
+        assert predict_type in {"eps", "v"}
+        self.predict_type = predict_type
 
-        # t in [0, 1] -> [B, 1, time_embed_dim]
-        self.time_embed = nn.Sequential(nn.Linear(1, time_embed_dim), nn.GELU(), nn.Linear(time_embed_dim, time_embed_dim))
+        self.scheduler = NoiseScheduler(timesteps=timesteps, schedule=schedule)
 
-        max_L = 512
-        hidden_dim = latent_dim + time_embed_dim                   # H
-
-        # divisibility checks for top-level dims
-        assert hidden_dim % num_heads == 0, \
-            f"(latent_dim + time_embed_dim) ({hidden_dim}) % num_heads ({num_heads}) != 0"
-        assert (2 * lap_kernel) % num_heads == 0, \
-            f"2*lap_kernel ({2*lap_kernel}) % num_heads ({num_heads}) != 0"
-
-        # context encoder -> summary length == horizon
-        self.conditioning_encoder = ContextSummarizer(
-            input_dim=self.his_dim,
-            output_seq_len=horizon,                                 # Lh == horizon
+        # context summarizer (can handle global context)
+        self.context = GlobalContextSummarizer(
+            input_dim=data_dim,
+            output_seq_len=cond_len,
             hidden_dim=hidden_dim,
-            num_heads=num_heads
+            num_heads=num_heads,
+            num_entities=num_entities,
+            dropout=dropout
         )
 
-        self.k = lap_kernel
-        self.layers = nn.ModuleList([
-            LapFormer(dim=hidden_dim, num_heads=num_heads, k=lap_kernel, mlp_dim=mlp_dim)
-            for _ in range(num_layers)
-        ])
+        # main DiT stack
+        self.model = LapFormer(
+            input_dim=data_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            laplace_k=laplace_k,
+            dropout=dropout,
+            attn_dropout=attn_dropout
+        )
 
-        # position embeddings [1, max_L, H]
-        self.register_buffer('pos_table', get_sinusoidal_pos_emb(max_L, hidden_dim, torch.device('cpu')))
+        # time embedding dim = hidden_dim
+        self.time_dim = hidden_dim
 
-        # head back to latent space: [B, L, H] -> [B, L, D]
-        self.output_proj = nn.Linear(hidden_dim, latent_dim)
+    # ----- helpers -----
 
-        # diffusion scheduler
-        self.scheduler = NoiseScheduler(timesteps=max_timesteps)
+    def _time_embed(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        t: [B] integer timesteps
+        returns: [B, H]
+        """
+        te = timestep_embedding(t, self.time_dim)    # [B, H]
+        te = F.silu(te)
+        return te
+
+    def _maybe_build_cond(self,
+                          series: Optional[torch.Tensor],
+                          series_mask: Optional[torch.Tensor],
+                          cond_summary: Optional[torch.Tensor],
+                          entity_ids: Optional[torch.Tensor]):
+        """
+        Builds cond_summary if not provided.
+        """
+        if cond_summary is not None:
+            return cond_summary, None
+        if series is None:
+            return None, None
+        # series can be [B,Lc,F] or [B,M,Lc,F]
+        ctx = self.context(series, context_mask=series_mask, entity_ids=entity_ids)  # [B, Lh, H]
+        return ctx, None
+
+    # ----- main forward -----
 
     def forward(self,
-                x_latent: torch.Tensor,                             # [B, L, D]
-                t: torch.Tensor,                                    # [B]
-                series: torch.Tensor = None,                 # [B, Lc, F]
-                cond_summary: torch.Tensor = None,           # [B, L, H]
-                context_mask: torch.Tensor = None,           # [B, Lc] (True = PAD)
-                tgt_mask: torch.Tensor = None):              # [B, L]  (True = PAD)
+                x_t: torch.Tensor,                # [B, L, D] noisy input at time t
+                t: torch.Tensor,                  # [B] int timesteps
+                series: Optional[torch.Tensor] = None,          # context: [B,Lc,F] or [B,M,Lc,F]
+                series_mask: Optional[torch.Tensor] = None,     # [B, Lc] or [B,M,Lc]
+                cond_summary: Optional[torch.Tensor] = None,    # [B, Lh, H]
+                entity_ids: Optional[torch.Tensor] = None       # [B, M] if series is [B,M,Lc,F]
+                ) -> torch.Tensor:
         """
         Returns:
-            eps_pred: [B, L, D]
+            eps_pred: [B, L, D] (epsilon prediction)
         """
-        B, L, D = x_latent.shape
-        device = x_latent.device
+        cond_summary, cond_mask = self._maybe_build_cond(series, series_mask, cond_summary, entity_ids)
+        t_emb = self._time_embed(t)                       # [B, H]
+        raw = self.model(x_t, t_emb, cond_summary, cond_mask)  # [B, L, D]
 
-        # guard: positional table length
-        assert L <= self.pos_table.size(1), \
-            f"Sequence length L={L} exceeds pos_table size {self.pos_table.size(1)}"
+        if self.predict_type == "eps":
+            eps_pred = raw
+        else:
+            # raw is v-pred; convert to epsilon for external consistency
+            eps_pred = self.scheduler.pred_eps_from_v(x_t, t, raw)
+        return eps_pred
 
-        # t -> [B, 1] -> embed -> [B, 1, Te] -> repeat to [B, L, Te]
-        t_norm = t.float() / self.scheduler.timesteps
-        t_emb = self.time_embed(t_norm.view(-1, 1)).unsqueeze(1).repeat(1, L, 1)  # [B, L, Te]
-
-        # concat latent + time: [B, L, D] + [B, L, Te] -> [B, L, H]
-        h = torch.cat([x_latent, t_emb], dim=-1)                                    # [B, L, H]
-        h = h + self.pos_table[:, :L, :].to(device)                                 # [B, L, H]
-
-        # Only one of (series, cond_summary) should be provided
-        assert not (series is not None and cond_summary is not None), \
-            "Pass either 'series' or 'cond_summary', not both."
-
-        cond_tensor = None
-        cond_mask_for_layers = None  # mask aligned with 'cond_tensor' length
-
-        if cond_summary is None and series is not None:
-            # context -> summary: [B, Lc, F] -> [B, L, H]
-            assert series.size(-1) == self.his_dim, \
-                f"series last dim {series.size(-1)} != his_dim {self.his_dim}"
-            cond_summary = self.conditioning_encoder(series, context_mask=context_mask)  # [B, L, H]
-            cond_mask_for_layers = None  # summary already length L; no mask by default
-
-        if cond_summary is not None:
-            # Expect [B, L, H]
-            assert cond_summary.shape[0] == B and cond_summary.shape[1] == L, \
-                f"cond_summary shape {tuple(cond_summary.shape)} must be [B={B}, L={L}, H]"
-            h = h + cond_summary
-            cond_tensor = cond_summary
-            # if caller wishes to mask target steps, we can reuse tgt_mask for cond_summary as well
-            cond_mask_for_layers = tgt_mask
-
-        # transformer stack
-        for layer in self.layers:
-            h = layer(h, cond=cond_tensor, tgt_mask=tgt_mask, cond_mask=cond_mask_for_layers)  # [B, L, H]
-
-        return self.output_proj(h)                                                               # [B, L, D]
+    # ----- generation with CFG + imputation inpainting -----
 
     @torch.no_grad()
     def generate(self,
-                 context_series: torch.Tensor,                        # [B, Lc, F]
-                 horizon: int,
-                 num_inference_steps: int = 50,
-                 guidance_strength: float = 3.0,
+                 shape: Tuple[int, int, int],  # (B, L, D)
+                 steps: int = 50,
+                 guidance_strength: float = 1.5,
                  eta: float = 0.0,
-                 context_mask: torch.Tensor = None,
-                 seed: int = 42):          # [B, Lc] (True = PAD)
+                 series: Optional[torch.Tensor] = None,
+                 series_mask: Optional[torch.Tensor] = None,
+                 cond_summary: Optional[torch.Tensor] = None,
+                 entity_ids: Optional[torch.Tensor] = None,
+                 y_obs: Optional[torch.Tensor] = None,
+                 obs_mask: Optional[torch.Tensor] = None,
+                 x_T: Optional[torch.Tensor] = None
+                 ) -> torch.Tensor:
         """
-        DDIM sampling with classifier-free guidance.
-    
-        Returns:
-            x_0: [B, L=horizon, D]
+        DDIM sampling with classifier-free guidance and optional known-value replacement (imputation).
         """
-        self.eval()
-        device = self.time_embed[0].weight.device
-        B = context_series.size(0)
-    
-        # horizon must match the summarizer's output length
-        assert horizon == self.horizon, \
-            f"generate(horizon={horizon}) must equal model.horizon={self.horizon}"
-    
-        # safe timesteps: [S] decreasing ints from T-1 to 0
-        T = self.scheduler.timesteps
-        assert 1 <= num_inference_steps <= T, "num_inference_steps must be within [1, total timesteps]"
-        timesteps = torch.linspace(T - 1, 0, num_inference_steps, device=device).long()  # [S]
-    
-        # precompute conditioning summary once: [B, L, H]
-        cond_summary = self.conditioning_encoder(context_series, context_mask=context_mask)
-    
-        # --- seeded initial noise x_T ---
-        if seed is not None:
-            if device.type == "cuda":
-                g = torch.Generator(device="cuda").manual_seed(int(seed))
-            else:
-                g = torch.Generator().manual_seed(int(seed))
-            x_t = torch.randn(B, horizon, self.latent_dim, device=device, generator=g)
+        device = next(self.parameters()).device
+        B, L, D = shape
+
+        if x_T is None:
+            x_t = torch.randn(B, L, D, device=device)
         else:
-            x_t = torch.randn(B, horizon, self.latent_dim, device=device)
-    
-        for i, t in enumerate(timesteps):
-            t_prev = timesteps[i + 1] if i < len(timesteps) - 1 else torch.tensor(-1, device=device)
-            t_b = t.expand(B)        # [B]
-            tprev_b = t_prev.expand(B)
-    
-            # uncond path (no cond)
-            noise_uncond = self.forward(x_t, t_b, series=None, cond_summary=None)                 # [B, L, D]
-            # cond path (reuse summary)
-            noise_cond   = self.forward(x_t, t_b, series=None, cond_summary=cond_summary)         # [B, L, D]
-    
-            # classifier-free guidance in ε-space
-            noise_pred = noise_uncond + guidance_strength * (noise_cond - noise_uncond)           # [B, L, D]
-    
-            # DDIM step handled by scheduler
-            x_t = self.scheduler.ddim_sample(x_t, t_b, tprev_b, noise_pred, eta)                  # [B, L, D]
-    
-        return x_t  # z_0
+            x_t = x_T.to(device)
 
+        # build conditional summary once (static context)
+        built_cond, built_mask = self._maybe_build_cond(series, series_mask, cond_summary, entity_ids)
+        cond_summary = built_cond
+        cond_mask = built_mask
 
+        # prepare observed values diffusion for inpainting
+        if (y_obs is not None) and (obs_mask is not None):
+            y_obs = y_obs.to(device)
+            obs_mask = obs_mask.to(device)
 
+        # choose an evenly-spaced subset of timesteps for DDIM
+        total_T = self.scheduler.timesteps
+        steps = max(1, min(steps, total_T))
+        step_indices = torch.linspace(0, total_T - 1, steps, dtype=torch.long, device=device).flip(0)
+        ts_prev = torch.cat([step_indices[1:], step_indices[-1:].clone()])
 
+        for t_i, t_prev_i in zip(step_indices, ts_prev):
+            t_b = t_i.repeat(B)
+            tprev_b = t_prev_i.repeat(B)
 
+            # Unconditional path (drop cond)
+            eps_uncond = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None)
 
+            # Conditional path
+            eps_cond = self.forward(x_t, t_b, series=series, series_mask=series_mask,
+                                    cond_summary=cond_summary, entity_ids=entity_ids)
 
+            # CFG combine in epsilon-space
+            eps = eps_uncond + guidance_strength * (eps_cond - eps_uncond)
+
+            # DDIM step
+            x_t = self.scheduler.ddim_sample(x_t, t_b, tprev_b, eps, eta)
+
+            # Hard replace known observations (inpaint) at current noise level
+            if (y_obs is not None) and (obs_mask is not None):
+                x_t_obs, _ = self.scheduler.q_sample(y_obs, t_b)
+                x_t = obs_mask * x_t_obs + (1.0 - obs_mask) * x_t
+
+        return x_t  # x_0 sample
