@@ -415,16 +415,17 @@ class LapDiT(nn.Module):
                  predict_type: str = "eps",               # "eps" or "v"
                  timesteps: int = 1000,
                  schedule: str = "cosine",
-                 self_conditioning: bool = False):
+                 self_conditioning: bool = False,
+                 context_dim: int = None):
         super().__init__()
         assert predict_type in {"eps", "v"}
         self.predict_type = predict_type
         self.self_conditioning = self_conditioning
 
         self.scheduler = NoiseScheduler(timesteps=timesteps, schedule=schedule)
-
+        ctx_dim = context_dim if context_dim is not None else data_dim
         self.context = GlobalContextSummarizer(
-            input_dim=data_dim,
+            input_dim=ctx_dim,
             output_seq_len=cond_len,
             hidden_dim=hidden_dim,
             num_heads=num_heads,
