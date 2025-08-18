@@ -9,6 +9,7 @@ def _cosine_alpha_bar(t, s=0.008):
     """
     return torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
 
+
 class NoiseScheduler(nn.Module):
     """
     Diffusion utilities with precomputed buffers and a DDIM sampler.
