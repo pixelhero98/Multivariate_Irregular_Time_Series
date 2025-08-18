@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union, List
 from cond_diffusion_utils import NoiseScheduler
 
 
@@ -36,6 +36,9 @@ def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> to
     emb = torch.cat([torch.cos(args), torch.sin(args)], dim=1)
     return emb
 
+# -------------------------------
+# Relative Position Bias (kept)
+# -------------------------------
 
 class RelativePositionBias(nn.Module):
     """
@@ -53,9 +56,7 @@ class RelativePositionBias(nn.Module):
         # rel = |j - i|, shape [L, L]
         n = self.n_buckets
         max_d = self.max_distance
-        # first half: exact for small distances
         small = rel < (n // 2)
-        # remaining buckets: log-scaled
         log_rel = torch.log(rel.float() / (n // 2) + 1e-6)
         log_max = math.log(max(max_d / (n // 2), 1.0))
         scaled = (log_rel / (log_max + 1e-6)) * (n - n // 2 - 1)
@@ -68,23 +69,17 @@ class RelativePositionBias(nn.Module):
         rel = (j - i).abs()  # [L, L]
         buckets = self._bucket(rel)  # [L, L] integers in [0, n_buckets)
         return self.bias[buckets]    # [L, L] float mask to add to logits
-        
+
 # -------------------------------
-# Context summarizers
+# Context summarizer (kept)
 # -------------------------------
 
 class GlobalContextSummarizer(nn.Module):
     """
-    Flexible summarizer that can ingest either:
+    Supports:
       - per-entity context:     [B, Lc, F]
-      - global multi-entity:    [B, M, Lc, F] with optional entity_ids:[B, M]
-    Produces a fixed-length summary [B, Lh, H] via cross-attention from
-    learnable queries to temporally encoded context tokens.
-
-    Notes:
-      * Adds sinusoidal positional encodings along time (Lc).
-      * If entity_ids are provided and num_entities is set, adds an entity embedding.
-      * Concatenates entities along the sequence dimension (M * Lc) and uses a single cross-attn.
+      - global multi-entity:    [B, M, Lc, F] (+ optional entity_ids:[B, M])
+    Produces fixed-length summary [B, Lh, H] via cross-attention.
     """
     def __init__(self, input_dim: int, output_seq_len: int, hidden_dim: int,
                  num_heads: int = 4, num_entities: Optional[int] = None, dropout: float = 0.0):
@@ -109,108 +104,71 @@ class GlobalContextSummarizer(nn.Module):
                 context_series: torch.Tensor,
                 context_mask: Optional[torch.Tensor] = None,
                 entity_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            context_series:
-                [B, Lc, F]  OR  [B, M, Lc, F]
-            context_mask:
-                [B, Lc]     OR  [B, M, Lc]  (True = PAD/ignore, like nn.MultiheadAttention expects)
-            entity_ids:
-                [B, M] or None (only used when context is [B,M,Lc,F] and num_entities provided)
-        Returns:
-            summary: [B, Lh, H]
-        """
         x = context_series
         B = x.size(0)
         device = x.device
 
         if x.dim() == 3:
-            # [B, Lc, F]
             B, Lc, F = x.shape
             x = self.input_proj(x)  # [B, Lc, H]
-            # add temporal pos enc
             x = x + get_sinusoidal_pos_emb(Lc, self.hidden_dim, device)
             key_padding_mask = context_mask  # [B, Lc] or None
         elif x.dim() == 4:
-            # [B, M, Lc, F] -> flatten entities into time
             B, M, Lc, F = x.shape
             x = self.input_proj(x)  # [B, M, Lc, H]
-            # add temporal pos enc per entity
-            pos = get_sinusoidal_pos_emb(Lc, self.hidden_dim, device)  # [1, Lc, H]
+            pos = get_sinusoidal_pos_emb(Lc, self.hidden_dim, device)
             x = x + pos.unsqueeze(1)  # [B, M, Lc, H]
             if self.entity_emb is not None and entity_ids is not None:
                 ent = self.entity_emb(entity_ids)  # [B, M, H]
-                x = x + ent.unsqueeze(2)          # broadcast to [B, M, Lc, H]
-            x = x.reshape(B, M * Lc, self.hidden_dim)  # [B, M*Lc, H]
-            if context_mask is not None:
-                key_padding_mask = context_mask.reshape(B, M * Lc)  # [B, M*Lc]
-            else:
-                key_padding_mask = None
+                x = x + ent.unsqueeze(2)          # [B, M, Lc, H]
+            x = x.reshape(B, M * Lc, self.hidden_dim)
+            key_padding_mask = context_mask.reshape(B, M * Lc) if context_mask is not None else None
         else:
             raise ValueError("context_series must be [B,Lc,F] or [B,M,Lc,F]")
 
         queries = self.summary_queries.expand(B, -1, -1)  # [B, Lh, H]
-        # Cross-attention
-        summary, _ = self.cross_attn(
-            queries,         # Q: [B, Lh, H]
-            x,               # K: [B, Lctx, H]
-            x,               # V: [B, Lctx, H]
-            key_padding_mask=key_padding_mask
-        )
-        return self.norm(self.dropout(summary) + queries)  # residual to stabilize
+        summary, _ = self.cross_attn(queries, x, x, key_padding_mask=key_padding_mask)
+        return self.norm(self.dropout(summary) + queries)
                     
 # -------------------------------
-# Laplace basis (time normalized)
+# Laplace basis (normalized time)
 # -------------------------------
 
 class LearnableLaplacianBasis(nn.Module):
     """
-    Projects x:[B, T, D] -> Laplace features:[B, T, 2k] using learnable complex poles.
-    Uses normalized time index t_norm in [0,1] and a learnable time scale to avoid
-    over-/under-decay when T varies.
+    x:[B, T, D] -> Laplace features:[B, T, 2k] using learnable complex poles.
+    Normalized time t in [0,1], with learnable global timescale τ.
     """
     def __init__(self, k: int, feat_dim: int, alpha_min: float = 1e-6):
         super().__init__()
         self.k = k
         self.alpha_min = alpha_min
 
-        # trainable poles s = -α + iβ
         self.s_real = nn.Parameter(torch.empty(k))
         self.s_imag = nn.Parameter(torch.empty(k))
         self.reset_parameters()
 
-        # D -> k (spectral norm for stability)
         self.proj = spectral_norm(nn.Linear(feat_dim, k, bias=True), n_power_iterations=1, eps=1e-6)
-
-        # learnable global time scale (positive via softplus)
-        self._tau = nn.Parameter(torch.tensor(0.0))  # softplus(0)=~0.693 -> scale ~1.0
+        self._tau = nn.Parameter(torch.tensor(0.0))  # softplus -> positive scale
 
     def reset_parameters(self):
-        nn.init.uniform_(self.s_real, 0.01, 0.2)  # α > 0 (decay)
+        nn.init.uniform_(self.s_real, 0.01, 0.2)  # α > 0
         nn.init.uniform_(self.s_imag, -math.pi, math.pi)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, T, D]
-        Returns:
-            laplace_feats: [B, T, 2k]
-        """
         B, T, D = x.shape
         device = x.device
-        # normalized time [0,1]
         t_idx = torch.linspace(0, 1, T, device=device, dtype=torch.float32).unsqueeze(1)  # [T,1]
-        tau = F.softplus(self._tau) + 1e-3  # strictly positive
-        s = (-self.s_real.clamp_min(self.alpha_min) + 1j * self.s_imag) * tau  # [k] complex
+        tau = F.softplus(self._tau) + 1e-3
+        s = (-self.s_real.clamp_min(self.alpha_min) + 1j * self.s_imag) * tau  # [k]
 
-        # basis over time: exp(t * s)
-        expo = torch.exp(t_idx * s.unsqueeze(0))                   # [T, k] complex
-        re_basis, im_basis = expo.real, expo.imag                  # [T, k] each
+        expo = torch.exp(t_idx * s.unsqueeze(0))  # [T,k] complex
+        re_basis, im_basis = expo.real, expo.imag
 
-        proj_feats = self.proj(x)                                  # [B, T, k]
-        real_proj = proj_feats * re_basis.unsqueeze(0)             # [B, T, k]
-        imag_proj = proj_feats * im_basis.unsqueeze(0)             # [B, T, k]
-        return torch.cat([real_proj, imag_proj], dim=2)            # [B, T, 2k]
+        proj_feats = self.proj(x)                                  # [B,T,k]
+        real_proj = proj_feats * re_basis.unsqueeze(0)             # [B,T,k]
+        imag_proj = proj_feats * im_basis.unsqueeze(0)             # [B,T,k]
+        return torch.cat([real_proj, imag_proj], dim=2)            # [B,T,2k]
 
 
 class LearnableInverseLaplacianBasis(nn.Module):
@@ -249,14 +207,13 @@ class TransformerBlock(nn.Module):
         )
         self.drop_path2 = nn.Dropout(dropout)
 
+        # Residual scaling init for stability (helps regression calibration)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None,
                 key_padding_mask: Optional[torch.Tensor] = None, attn_bias: Optional[torch.Tensor] = None):
-        """
-        attn_mask: standard mask (e.g., causal). Shape [L, L] or [B, L, L].
-        attn_bias: additive bias to logits (same shapes as attn_mask). We sum them if both provided.
-        """
         h = self.norm1(x)
-        # Combine mask + bias if both provided
         combined_mask = None
         if attn_mask is not None and attn_bias is not None:
             combined_mask = attn_mask + attn_bias
@@ -273,7 +230,6 @@ class TransformerBlock(nn.Module):
         x = x + self.drop_path2(h)
         return x
 
-
 class CrossAttnBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, dropout: float = 0.0, attn_dropout: float = 0.0):
         super().__init__()
@@ -283,26 +239,63 @@ class CrossAttnBlock(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, kv: torch.Tensor, kv_mask: Optional[torch.Tensor] = None):
-        """
-        x:  [B, L, H]
-        kv: [B, Lc, H]
-        kv_mask: [B, Lc] (True = ignore)
-        """
         q = self.norm_q(x)
         k = self.norm_kv(kv)
         h, _ = self.cross(q, k, k, key_padding_mask=kv_mask)
         return x + self.drop(h)
 
 
+# -------------------------------
+# LapFormer (multi-resolution + self-conditioning)
+# -------------------------------
+
 class LapFormer(nn.Module):
+    """
+    DiT-style stack on Laplace-augmented tokens.
+    - Stem Laplace features (k0)
+    - Optional per-layer Laplace features (k[i]) for multi-resolution
+    - Optional self-conditioning injection (linear, no gates)
+    """
     def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, num_heads: int,
-                 laplace_k: int = 16, dropout: float = 0.0, attn_dropout: float = 0.0):
+                 laplace_k: Union[int, List[int]] = 16, dropout: float = 0.0, attn_dropout: float = 0.0,
+                 self_conditioning: bool = False):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-        self.lap = LearnableLaplacianBasis(k=laplace_k, feat_dim=input_dim)
-        self.lap_proj = nn.Linear(2 * laplace_k, hidden_dim)
+        self.self_conditioning = self_conditioning
 
+        # parse laplace_k: int or list
+        if isinstance(laplace_k, (list, tuple)):
+            k_list = list(laplace_k)
+            if len(k_list) == 0:
+                raise ValueError("laplace_k list must be non-empty")
+            stem_k = k_list[0]
+            per_layer_k = k_list[1:]
+            # pad to num_layers if shorter
+            if len(per_layer_k) < num_layers:
+                per_layer_k = per_layer_k + [per_layer_k[-1] if per_layer_k else stem_k] * (num_layers - len(per_layer_k))
+        else:
+            stem_k = int(laplace_k)
+            per_layer_k = []
+
+        # token projections
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+
+        # stem Laplace
+        self.stem_lap = LearnableLaplacianBasis(k=stem_k, feat_dim=input_dim)
+        self.stem_proj = nn.Linear(2 * stem_k, hidden_dim)
+
+        # per-layer Laplace (multi-res)
+        self.layer_laps = nn.ModuleList()
+        self.layer_lap_projs = nn.ModuleList()
+        for k in per_layer_k[:num_layers]:
+            self.layer_laps.append(LearnableLaplacianBasis(k=k, feat_dim=input_dim))
+            self.layer_lap_projs.append(nn.Linear(2 * k, hidden_dim))
+
+        # optional self-conditioning injection
+        if self.self_conditioning:
+            self.self_cond_proj = nn.Linear(input_dim, hidden_dim)
+
+        # time / blocks
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.SiLU(),
@@ -318,29 +311,44 @@ class LapFormer(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # Shared relative position bias for self-attn
+        # shared RPB
         self.rel_bias = RelativePositionBias(n_buckets=32, max_distance=128)
 
         self.norm_out = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, input_dim)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, x_tokens: torch.Tensor, t_emb: torch.Tensor,
                 cond_summary: Optional[torch.Tensor] = None,
-                cond_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                cond_mask: Optional[torch.Tensor] = None,
+                sc_feat: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x_tokens: [B, L, D]
+        sc_feat:  [B, L, D] optional self-conditioning signal (e.g., x0 estimate)
+        returns:   [B, L, D] in native parameterization (eps or v decided by caller)
+        """
         B, L, D = x_tokens.shape
         device = x_tokens.device
 
-        h = self.input_proj(x_tokens) + self.lap_proj(self.lap(x_tokens))
+        # base embedding
+        h = self.input_proj(x_tokens) + self.stem_proj(self.stem_lap(x_tokens))
+        if self.self_conditioning and (sc_feat is not None):
+            h = h + self.self_cond_proj(sc_feat)
+
         h = h + get_sinusoidal_pos_emb(L, h.size(-1), device)
+        h = h + self.time_mlp(t_emb).unsqueeze(1)  # [B,1,H]
 
-        t_add = self.time_mlp(t_emb).unsqueeze(1)
-        h = h + t_add
+        # precompute per-layer Laplace features from input tokens (multi-res)
+        lap_layer_feats = []
+        for lap, proj in zip(self.layer_laps, self.layer_lap_projs):
+            lap_layer_feats.append(proj(lap(x_tokens)))  # each [B,L,H]
 
-        # Precompute RPB once per forward; shape [L, L]
-        attn_bias = self.rel_bias(L, device)  # small float mask added to logits
-
-        for blk, cblk in zip(self.blocks, self.cross_blocks):
-            # pass bias via attn_bias argument (clearer than overloading attn_mask)
+        # attention with RPB + per-layer Laplace addition
+        attn_bias = self.rel_bias(L, device)
+        for i, (blk, cblk) in enumerate(zip(self.blocks, self.cross_blocks)):
+            if i < len(lap_layer_feats):
+                h = h + lap_layer_feats[i]
             h = blk(h, attn_mask=None, key_padding_mask=None, attn_bias=attn_bias)
             if cond_summary is not None:
                 h = cblk(h, cond_summary, kv_mask=cond_mask)
@@ -356,30 +364,33 @@ class LapFormer(nn.Module):
 class LapDiT(nn.Module):
     """
     Latent conditional diffusion model for multivariate time series.
-    - Supports global multi-entity conditioning.
-    - Positional encodings in both context and target paths.
-    - Parameterization-consistent: training and sampling both in 'eps' or 'v'.
+    - Global multi-entity conditioning
+    - Positional encodings in context & target
+    - Native parameterization throughout ('eps' or 'v')
+    - Self-conditioning (optional)
+    - Multi-resolution Laplace (optional via list)
     """
     def __init__(self,
-                 data_dim: int,                  # feature dimension of the target series (D)
+                 data_dim: int,
                  hidden_dim: int = 256,
                  num_layers: int = 6,
                  num_heads: int = 8,
-                 laplace_k: int = 16,
-                 cond_len: int = 32,             # Lh: length of conditioning summary
-                 num_entities: Optional[int] = None,   # total entities for global context (optional)
+                 laplace_k: Union[int, List[int]] = 16,   # int or list: [k_stem, k1, k2, ...]
+                 cond_len: int = 32,
+                 num_entities: Optional[int] = None,
                  dropout: float = 0.1,
                  attn_dropout: float = 0.0,
-                 predict_type: str = "eps",      # "eps" or "v"
+                 predict_type: str = "eps",               # "eps" or "v"
                  timesteps: int = 1000,
-                 schedule: str = "cosine"):
+                 schedule: str = "cosine",
+                 self_conditioning: bool = False):
         super().__init__()
         assert predict_type in {"eps", "v"}
         self.predict_type = predict_type
+        self.self_conditioning = self_conditioning
 
         self.scheduler = NoiseScheduler(timesteps=timesteps, schedule=schedule)
 
-        # context summarizer (can handle global context)
         self.context = GlobalContextSummarizer(
             input_dim=data_dim,
             output_seq_len=cond_len,
@@ -389,7 +400,6 @@ class LapDiT(nn.Module):
             dropout=dropout
         )
 
-        # main DiT stack
         self.model = LapFormer(
             input_dim=data_dim,
             hidden_dim=hidden_dim,
@@ -397,20 +407,14 @@ class LapDiT(nn.Module):
             num_heads=num_heads,
             laplace_k=laplace_k,
             dropout=dropout,
-            attn_dropout=attn_dropout
+            attn_dropout=attn_dropout,
+            self_conditioning=self_conditioning
         )
 
-        # time embedding dim = hidden_dim
         self.time_dim = hidden_dim
 
-    # ----- helpers -----
-
     def _time_embed(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        t: [B] integer timesteps
-        returns: [B, H]
-        """
-        te = timestep_embedding(t, self.time_dim)    # [B, H]
+        te = timestep_embedding(t, self.time_dim)
         te = F.silu(te)
         return te
 
@@ -419,43 +423,35 @@ class LapDiT(nn.Module):
                           series_mask: Optional[torch.Tensor],
                           cond_summary: Optional[torch.Tensor],
                           entity_ids: Optional[torch.Tensor]):
-        """
-        Builds cond_summary if not provided.
-        """
         if cond_summary is not None:
             return cond_summary, None
         if series is None:
             return None, None
-        # series can be [B,Lc,F] or [B,M,Lc,F]
-        ctx = self.context(series, context_mask=series_mask, entity_ids=entity_ids)  # [B, Lh, H]
+        ctx = self.context(series, context_mask=series_mask, entity_ids=entity_ids)
         return ctx, None
 
-    # ----- main forward -----
-
     def forward(self,
-                x_t: torch.Tensor,                # [B, L, D] noisy input at time t
-                t: torch.Tensor,                  # [B] int timesteps
-                series: Optional[torch.Tensor] = None,          # context: [B,Lc,F] or [B,M,Lc,F]
-                series_mask: Optional[torch.Tensor] = None,     # [B, Lc] or [B,M,Lc]
-                cond_summary: Optional[torch.Tensor] = None,    # [B, Lh, H]
-                entity_ids: Optional[torch.Tensor] = None       # [B, M] if series is [B,M,Lc,F]
-                ) -> torch.Tensor:
+                x_t: torch.Tensor,
+                t: torch.Tensor,
+                series: Optional[torch.Tensor] = None,
+                series_mask: Optional[torch.Tensor] = None,
+                cond_summary: Optional[torch.Tensor] = None,
+                entity_ids: Optional[torch.Tensor] = None,
+                sc_feat: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Returns:
-            param_pred: [B, L, D] in the model's native parameterization (eps or v).
+        Returns native-param prediction: [B, L, D] in 'eps' or 'v'
         """
         cond_summary, cond_mask = self._maybe_build_cond(series, series_mask, cond_summary, entity_ids)
-        t_emb = self._time_embed(t)                       # [B, H]
-        raw = self.model(x_t, t_emb, cond_summary, cond_mask)  # [B, L, D]
-        return raw  # native param: 'eps' or 'v' depending on self.predict_type
-
-    # ----- generation with CFG + imputation inpainting -----
+        t_emb = self._time_embed(t)
+        raw = self.model(x_t, t_emb, cond_summary, cond_mask, sc_feat=sc_feat)
+        return raw
 
     @torch.no_grad()
     def generate(self,
-                 shape: Tuple[int, int, int],  # (B, L, D)
+                 shape: Tuple[int, int, int],
                  steps: int = 50,
-                 guidance_strength: float = 1.5,
+                 guidance_strength: Union[float, Tuple[float, float]] = 1.5,
+                 guidance_power: float = 0.3,
                  eta: float = 0.0,
                  series: Optional[torch.Tensor] = None,
                  series_mask: Optional[torch.Tensor] = None,
@@ -463,31 +459,27 @@ class LapDiT(nn.Module):
                  entity_ids: Optional[torch.Tensor] = None,
                  y_obs: Optional[torch.Tensor] = None,
                  obs_mask: Optional[torch.Tensor] = None,
-                 x_T: Optional[torch.Tensor] = None
-                 ) -> torch.Tensor:
+                 x_T: Optional[torch.Tensor] = None,
+                 self_cond: bool = False) -> torch.Tensor:
         """
-        DDIM sampling with classifier-free guidance and optional known-value replacement (imputation).
-        Sampling uses the model's native parameterization consistently ('eps' or 'v').
+        DDIM sampling with classifier-free guidance (scheduled) and optional inpainting.
+        Guidance scheduling:
+          - if guidance_strength is float G: g_t = 1 + (G-1) * (1 - alpha_bar_t)^{guidance_power}
+          - if (g_min,g_max): g_t = g_min + (g_max-g_min) * (1 - alpha_bar_t)^{guidance_power}
         """
         device = next(self.parameters()).device
         B, L, D = shape
 
-        if x_T is None:
-            x_t = torch.randn(B, L, D, device=device)
-        else:
-            x_t = x_T.to(device)
+        x_t = torch.randn(B, L, D, device=device) if x_T is None else x_T.to(device)
 
-        # build conditional summary once (static context)
         built_cond, built_mask = self._maybe_build_cond(series, series_mask, cond_summary, entity_ids)
         cond_summary = built_cond
         cond_mask = built_mask
 
-        # prepare observed values diffusion for inpainting
         if (y_obs is not None) and (obs_mask is not None):
             y_obs = y_obs.to(device)
             obs_mask = obs_mask.to(device)
 
-        # choose an evenly-spaced subset of timesteps for DDIM
         total_T = self.scheduler.timesteps
         steps = max(1, min(steps, total_T))
         step_indices = torch.linspace(0, total_T - 1, steps, dtype=torch.long, device=device).flip(0)
@@ -497,20 +489,36 @@ class LapDiT(nn.Module):
             t_b = t_i.repeat(B)
             tprev_b = t_prev_i.repeat(B)
 
-            # Native-param predictions (uncond & cond)
-            pred_uncond = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None)
+            # optional self-conditioning (teacher is previous prediction of x0)
+            sc_feat = None
+            if self.self_conditioning and self_cond:
+                with torch.no_grad():
+                    pred_sc = self.forward(x_t, t_b, series=series, series_mask=series_mask,
+                                           cond_summary=cond_summary, entity_ids=entity_ids)
+                    x0_sc = self.scheduler.to_x0(x_t, t_b, pred_sc, param_type=self.predict_type)
+                    sc_feat = x0_sc  # feed estimated x0 back in
+
+            # unconditional / conditional predictions (native param)
+            pred_uncond = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None, sc_feat=sc_feat)
             pred_cond   = self.forward(x_t, t_b, series=series, series_mask=series_mask,
-                                       cond_summary=cond_summary, entity_ids=entity_ids)
+                                       cond_summary=cond_summary, entity_ids=entity_ids, sc_feat=sc_feat)
 
-            # CFG in native param space
-            pred = pred_uncond + guidance_strength * (pred_cond - pred_uncond)
+            # scheduled classifier-free guidance
+            ab_t = self.scheduler._gather(self.scheduler.alpha_bars, t_b)  # [B]
+            if isinstance(guidance_strength, (tuple, list)):
+                g_min, g_max = guidance_strength
+            else:
+                g_min, g_max = 1.0, float(guidance_strength)
+            w = torch.pow(1.0 - ab_t, guidance_power).view(-1, 1, 1)
+            g_t = g_min + (g_max - g_min) * w  # [B,1,1]
 
-            # DDIM step that understands the param_type
+            pred = pred_uncond + g_t * (pred_cond - pred_uncond)
+
+            # DDIM step with native param
             x_t = self.scheduler.ddim_step_from(x_t, t_b, tprev_b, pred, param_type=self.predict_type, eta=eta)
 
-            # Hard replace known observations (inpaint) at current noise level
             if (y_obs is not None) and (obs_mask is not None):
                 x_t_obs, _ = self.scheduler.q_sample(y_obs, t_b)
                 x_t = obs_mask * x_t_obs + (1.0 - obs_mask) * x_t
 
-        return x_t  # x_0 sample
+        return x_t  # x_0
