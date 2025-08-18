@@ -437,7 +437,8 @@ class LapDiT(nn.Module):
                 series: Optional[torch.Tensor] = None,          # context: [B,Lc,F] or [B,M,Lc,F]
                 series_mask: Optional[torch.Tensor] = None,     # [B, Lc] or [B,M,Lc]
                 cond_summary: Optional[torch.Tensor] = None,    # [B, Lh, H]
-                entity_ids: Optional[torch.Tensor] = None       # [B, M] if series is [B,M,Lc,F]
+                entity_ids: Optional[torch.Tensor] = None,       # [B, M] if series is [B,M,Lc,F]
+                out_type: str = "eps"                            # NEW: "eps" | "v" | "param"
                 ) -> torch.Tensor:
         """
         Returns:
@@ -445,14 +446,22 @@ class LapDiT(nn.Module):
         """
         cond_summary, cond_mask = self._maybe_build_cond(series, series_mask, cond_summary, entity_ids)
         t_emb = self._time_embed(t)                       # [B, H]
-        raw = self.model(x_t, t_emb, cond_summary, cond_mask)  # [B, L, D]
+        raw = self.model(x_t, t_emb, cond_summary, cond_mask)  # model’s native param (= predict_type)  [B, L, D]
 
-        if self.predict_type == "eps":
-            eps_pred = raw
+        if out_type == "param":
+            return raw
+        elif out_type == "eps":
+            if self.predict_type == "eps":
+                return raw
+            else:
+                return self.scheduler.pred_eps_from_v(x_t, t, raw)
+        elif out_type == "v":
+            if self.predict_type == "v":
+                return raw
+            else:
+                return self.scheduler.v_from_eps(x_t, t, raw)
         else:
-            # raw is v-pred; convert to epsilon for external consistency
-            eps_pred = self.scheduler.pred_eps_from_v(x_t, t, raw)
-        return eps_pred
+            raise ValueError("out_type must be 'eps', 'v', or 'param'")
 
     # ----- generation with CFG + imputation inpainting -----
 
@@ -502,11 +511,12 @@ class LapDiT(nn.Module):
             tprev_b = t_prev_i.repeat(B)
 
             # Unconditional path (drop cond)
-            eps_uncond = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None)
+            eps_uncond = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None, out_type="eps")
 
             # Conditional path
             eps_cond = self.forward(x_t, t_b, series=series, series_mask=series_mask,
-                                    cond_summary=cond_summary, entity_ids=entity_ids)
+                                    cond_summary=cond_summary, entity_ids=entity_ids,
+                                    out_type="eps")
 
             # CFG combine in epsilon-space
             eps = eps_uncond + guidance_strength * (eps_cond - eps_uncond)
@@ -520,4 +530,3 @@ class LapDiT(nn.Module):
                 x_t = obs_mask * x_t_obs + (1.0 - obs_mask) * x_t
 
         return x_t  # x_0 sample
-
