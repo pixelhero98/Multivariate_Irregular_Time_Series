@@ -248,13 +248,60 @@ class CrossAttnBlock(nn.Module):
 # -------------------------------
 # LapFormer (multi-resolution + self-conditioning)
 # -------------------------------
+class LaplaceSandwichBlock(nn.Module):
+    """
+    time x:[B,L,D] --(LearnableLaplacianBasis k)-> z:[B,L,2k]
+      -> Linear(2k->H) + pos + time (+ optional sc add in H)
+      -> TransformerBlock(H)
+      -> CrossAttn(H <- summary2lap->H)
+      -> Linear(H->2k) residual in Laplace domain
+      -> LearnableInverseLaplacianBasis -> y:[B,L,D]
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, num_heads: int, k: int,
+                 dropout: float = 0.0, attn_dropout: float = 0.0):
+        super().__init__()
+        # analysis / synthesis
+        self.analysis  = LearnableLaplacianBasis(k=k, feat_dim=input_dim)
+        self.synthesis = LearnableInverseLaplacianBasis(self.analysis)
+        # Laplace <-> hidden
+        self.lap2hid = nn.Linear(2 * k, hidden_dim)
+        self.hid2lap = nn.Linear(hidden_dim, 2 * k)
+        # core attention blocks
+        self.self_blk  = TransformerBlock(hidden_dim, num_heads, mlp_ratio=4.0,
+                                          dropout=dropout, attn_dropout=attn_dropout)
+        self.cross_blk = CrossAttnBlock(hidden_dim, num_heads, dropout=dropout,
+                                        attn_dropout=attn_dropout)
+        # start near-identity in Laplace update
+        nn.init.zeros_(self.hid2lap.weight); nn.init.zeros_(self.hid2lap.bias)
+
+    def forward(self, x_time: torch.Tensor,
+                pos_emb: torch.Tensor,
+                t_vec: torch.Tensor,
+                attn_bias: torch.Tensor,
+                summary_kv_H: Optional[torch.Tensor] = None,
+                kv_mask: Optional[torch.Tensor] = None,
+                sc_add_H: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # time -> Laplace
+        z = self.analysis(x_time)                                 # [B,L,2k]
+        # Laplace -> hidden
+        h = self.lap2hid(z) + pos_emb + t_vec.unsqueeze(1)        # [B,L,H]
+        if sc_add_H is not None:
+            h = h + sc_add_H
+        # self-attn over time with RPB
+        h = self.self_blk(h, attn_mask=None, key_padding_mask=None, attn_bias=attn_bias)
+        # cross-attn with summary mapped to H
+        if summary_kv_H is not None:
+            h = self.cross_blk(h, summary_kv_H, kv_mask=kv_mask)
+        # hidden -> Laplace (residual), Laplace -> time
+        z_upd = z + self.hid2lap(h)                               # [B,L,2k]
+        y_time = self.synthesis(z_upd)                            # [B,L,D]
+        return y_time
+
 
 class LapFormer(nn.Module):
     """
-    DiT-style stack on Laplace-augmented tokens.
-    - Stem Laplace features (k0)
-    - Optional per-layer Laplace features (k[i]) for multi-resolution
-    - Optional self-conditioning injection (linear, no gates)
+    Stack of Laplace-sandwich blocks (per-block k) with summary2lap conditioning.
+    Self-conditioning is supported (no gates).
     """
     def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, num_heads: int,
                  laplace_k: Union[int, List[int]] = 16, dropout: float = 0.0, attn_dropout: float = 0.0,
@@ -263,98 +310,91 @@ class LapFormer(nn.Module):
         self.hidden_dim = hidden_dim
         self.self_conditioning = self_conditioning
 
-        # parse laplace_k: int or list
+        # -------- per-block k parsing (keeps your old config compatible) --------
+        # supports:
+        #   - int -> broadcast to all blocks
+        #   - list of length == num_layers -> use as-is
+        #   - list of length >= 1+num_layers (old: [k_stem, k1, ...]) -> drop first
         if isinstance(laplace_k, (list, tuple)):
             k_list = list(laplace_k)
             if len(k_list) == 0:
                 raise ValueError("laplace_k list must be non-empty")
-            stem_k = k_list[0]
-            per_layer_k = k_list[1:]
-            # pad to num_layers if shorter
-            if len(per_layer_k) < num_layers:
-                per_layer_k = per_layer_k + [per_layer_k[-1] if per_layer_k else stem_k] * (num_layers - len(per_layer_k))
+            if len(k_list) >= num_layers + 1:
+                per_layer_k = k_list[1:1+num_layers]
+            elif len(k_list) >= num_layers:
+                per_layer_k = k_list[:num_layers]
+            else:
+                per_layer_k = k_list + [k_list[-1]] * (num_layers - len(k_list))
         else:
-            stem_k = int(laplace_k)
-            per_layer_k = []
+            per_layer_k = [int(laplace_k)] * num_layers
 
-        # token projections
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-
-        # stem Laplace
-        self.stem_lap = LearnableLaplacianBasis(k=stem_k, feat_dim=input_dim)
-        self.stem_proj = nn.Linear(2 * stem_k, hidden_dim)
-
-        # per-layer Laplace (multi-res)
-        self.layer_laps = nn.ModuleList()
-        self.layer_lap_projs = nn.ModuleList()
-        for k in per_layer_k[:num_layers]:
-            self.layer_laps.append(LearnableLaplacianBasis(k=k, feat_dim=input_dim))
-            self.layer_lap_projs.append(nn.Linear(2 * k, hidden_dim))
-
-        # optional self-conditioning injection
+        # optional self-conditioning: project time-domain sc_feat to H (kept)
         if self.self_conditioning:
             self.self_cond_proj = nn.Linear(input_dim, hidden_dim)
 
-        # time / blocks
+        # timestep embedding -> H (kept)
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.SiLU(),
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
 
-        self.blocks = nn.ModuleList([
-            TransformerBlock(hidden_dim, num_heads, mlp_ratio=4.0, dropout=dropout, attn_dropout=attn_dropout)
-            for _ in range(num_layers)
+        # per-block summary2lap: [B,Lh,H] -> Laplace(2k_i) -> H
+        self.summary2lap = nn.ModuleList([
+            LearnableLaplacianBasis(k=k_i, feat_dim=hidden_dim) for k_i in per_layer_k
         ])
-        self.cross_blocks = nn.ModuleList([
-            CrossAttnBlock(hidden_dim, num_heads, dropout=dropout, attn_dropout=attn_dropout)
-            for _ in range(num_layers)
+        self.summary2hid = nn.ModuleList([
+            nn.Linear(2 * k_i, hidden_dim) for k_i in per_layer_k
         ])
 
-        # shared RPB
+        # Laplace sandwich blocks (time axis attention)
+        self.blocks = nn.ModuleList([
+            LaplaceSandwichBlock(input_dim=input_dim, hidden_dim=hidden_dim, num_heads=num_heads,
+                                 k=per_layer_k[i], dropout=dropout, attn_dropout=attn_dropout)
+            for i in range(num_layers)
+        ])
+
+        # shared relative position bias (kept)
         self.rel_bias = RelativePositionBias(n_buckets=32, max_distance=128)
 
-        self.norm_out = nn.LayerNorm(hidden_dim)
-        self.out_proj = nn.Linear(hidden_dim, input_dim)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
+        # tiny D->D head in TIME domain, zero-init (kept behavior)
+        self.head_norm = nn.LayerNorm(input_dim)
+        self.head_proj = nn.Linear(input_dim, input_dim)
+        nn.init.zeros_(self.head_proj.weight); nn.init.zeros_(self.head_proj.bias)
 
     def forward(self, x_tokens: torch.Tensor, t_emb: torch.Tensor,
                 cond_summary: Optional[torch.Tensor] = None,
                 cond_mask: Optional[torch.Tensor] = None,
                 sc_feat: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        x_tokens: [B, L, D]
-        sc_feat:  [B, L, D] optional self-conditioning signal (e.g., x0 estimate)
-        returns:   [B, L, D] in native parameterization (eps or v decided by caller)
+        x_tokens: [B, L, D] time-domain latents
+        returns:  [B, L, D] native-param prediction in time domain
         """
         B, L, D = x_tokens.shape
         device = x_tokens.device
 
-        # base embedding
-        h = self.input_proj(x_tokens) + self.stem_proj(self.stem_lap(x_tokens))
-        if self.self_conditioning and (sc_feat is not None):
-            h = h + self.self_cond_proj(sc_feat)
+        # positional & time embeddings (shared across blocks)
+        pos = get_sinusoidal_pos_emb(L, self.hidden_dim, device)       # [1,L,H]
+        t_vec = self.time_mlp(t_emb)                                   # [B,H]
+        attn_bias = self.rel_bias(L, device)                           # [L,L]
 
-        h = h + get_sinusoidal_pos_emb(L, h.size(-1), device)
-        h = h + self.time_mlp(t_emb).unsqueeze(1)  # [B,1,H]
+        # self-conditioning add in H (optional)
+        sc_add_H = self.self_cond_proj(sc_feat) if (self.self_conditioning and sc_feat is not None) else None
 
-        # precompute per-layer Laplace features from input tokens (multi-res)
-        lap_layer_feats = []
-        for lap, proj in zip(self.layer_laps, self.layer_lap_projs):
-            lap_layer_feats.append(proj(lap(x_tokens)))  # each [B,L,H]
+        # precompute per-block summary2lap -> H
+        kvs = [None] * len(self.blocks)
+        if cond_summary is not None:
+            for i in range(len(self.blocks)):
+                s_lap = self.summary2lap[i](cond_summary)              # [B,Lh,2k_i]
+                kvs[i] = self.summary2hid[i](s_lap)                    # [B,Lh,H]
 
-        # attention with RPB + per-layer Laplace addition
-        attn_bias = self.rel_bias(L, device)
-        for i, (blk, cblk) in enumerate(zip(self.blocks, self.cross_blocks)):
-            if i < len(lap_layer_feats):
-                h = h + lap_layer_feats[i]
-            h = blk(h, attn_mask=None, key_padding_mask=None, attn_bias=attn_bias)
-            if cond_summary is not None:
-                h = cblk(h, cond_summary, kv_mask=cond_mask)
+        # run the sandwich stack; each block returns TIME-domain [B,L,D]
+        h_time = x_tokens
+        for i, blk in enumerate(self.blocks):
+            h_time = blk(h_time, pos, t_vec, attn_bias, kvs[i], cond_mask, sc_add_H)
 
-        h = self.norm_out(h)
-        out = self.out_proj(h)
+        # tiny head in time domain (identity at init)
+        out = self.head_proj(self.head_norm(h_time))
         return out
 
 # -------------------------------
@@ -523,4 +563,5 @@ class LapDiT(nn.Module):
                 x_t = obs_mask * x_t_obs + (1.0 - obs_mask) * x_t
 
         return x_t  # x_0
+
 
