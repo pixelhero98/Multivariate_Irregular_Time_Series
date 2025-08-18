@@ -133,6 +133,8 @@ def _get_sizes(s):
     return len(train_dl.dataset), len(val_dl.dataset), len(test_dl.dataset)
 
 N_TRAIN, N_VAL, N_TEST = _get_sizes(sizes)
+x_ctx_sample, _ = next(iter(train_dl))
+ctx_dim = x_ctx_sample.shape[-1]  # works for [B,Lc,F] or [B,M,Lc,F]
 
 # =====================================================================================
 # VAE (encoder for μ; decoder for final regression)
@@ -168,7 +170,12 @@ def compute_latent_stats(dataloader):
     return mu_mean.to(device), mu_std.to(device)
 
 mu_mean, mu_std = compute_latent_stats(train_dl)
-latent_dim = mu_mean.numel() // HORIZON  # infer D
+latent_dim = getattr(vae, "latent_dim", None)
+if latent_dim is None:
+    with torch.no_grad():
+        dummy = torch.zeros(1, HORIZON, 1, device=device)
+        _, mu_sample, _ = vae(dummy)
+    latent_dim = mu_sample.shape[-1] # infer D
 
 # =====================================================================================
 # Helpers: normalization / antithetic / EMA / sched
@@ -254,7 +261,8 @@ diff_model = LapDiT(
     predict_type=PREDICT_TYPE,        # native param
     timesteps=TOTAL_T,
     schedule=SCHEDULE,
-    self_conditioning=SELF_COND
+    self_conditioning=SELF_COND,
+    context_dim=ctx_dim
 ).to(device)
 
 noise_scheduler = diff_model.scheduler
@@ -502,3 +510,4 @@ if best_ckpt_path and os.path.exists(best_ckpt_path):
         print(f"\nValidation regression MSE after decoder FT: {val_reg_mse_ft:.6f}")
 else:
     print("No best checkpoint found; skipping regression eval and decoder fine-tune.")
+
