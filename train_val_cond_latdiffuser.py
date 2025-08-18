@@ -12,52 +12,69 @@ import numpy as np
 from tqdm import tqdm
 
 
-TICKERS = [
-    'AAPL', 'MSFT', 'AMZN', 'NVDA', 'META', 'GOOGL', 'GOOG', 'TSLA', 'AVGO', 'ADBE',
-    'ADSK', 'ADP', 'ALGN', 'AMD', 'AMGN', 'AMAT', 'ANSS', 'ASML',
-    'AZN', 'BKNG', 'BKR', 'CDNS', 'CEG', 'CHTR', 'CMCSA', 'COST', 'CPRT',
-    'CRWD', 'CSCO', 'CSX', 'CTAS', 'CTSH', 'DASH', 'DDOG', 'DLTR', 'DXCM', 'EA',
-    'EBAY', 'ENPH', 'EXC', 'FANG', 'FAST', 'FTNT', 'GEHC', 'GFS', 'GILD',
-    'HON', 'IDXX', 'ILMN', 'INTC', 'INTU', 'ISRG', 'KDP', 'KHC', 'KLAC', 'LRCX',
-    'LULU', 'MAR', 'MCHP', 'MDLZ', 'MELI', 'MNST', 'MRNA', 'MRVL', 'MU', 'NFLX',
-    'ODFL', 'ON', 'ORLY', 'PANW', 'PAYX', 'PCAR', 'PDD', 'PEP', 'PYPL', 'QCOM',
-    'REGN', 'ROP', 'ROST', 'SBUX', 'SIRI', 'SNPS', 'TEAM', 'TMUS', 'TXN', 'VRSK',
-    'VRTX', 'WBA', 'WBD', 'WDAY', 'XEL', 'ZM', 'ZS'
-]
-START, END = "2020-01-01", "2024-12-31"
-WINDOW = 60
-PRED = 10
-FEATURES = ['Open', 'High', 'Low', 'Close']
-PRED_FEAT = ['Close']
+# Datasets & Training Preparation
 BATCH_SIZE = 64
 EPOCHS = 500
 LR = 5e-4
-VAL_FRAC = 0.1
-TEST_FRAC = 0.4
-DATA_DIR = './ldt/data'
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CHECKPOINT_DIR = './ldt/checkpoints'
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+TRAIN_FRAC, VAL_FRAC, TEST_FRAC = 0.55, 0.05, 0.4
+DEV, DATA_DIR, TCK_PATH = torch.device("cuda" if torch.cuda.is_available() else "cpu"), './ldt/data', './CRYPTO_top.txt'
+CHECKPOINT_DIR = './ldt/checkpoints'; os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+TCKS, WINDOW, PRED = [], 150, 40
 
-# --- Data Preparation ---
-prepare_data_and_cache(
-  TICKERS, START, END, FEATURES, WINDOW,
-  data_dir=DATA_DIR,
-  close_feature='Close',
-  val_ratio=VAL_FRAC,
-  test_ratio=TEST_FRAC,
-  horizon=PRED
+with open(TCK_PATH, 'r') as file:
+  TCKS = [line.strip() for line in file]
+cfg = FeatureConfig(
+    price_fields=["Open", "High", "Low", "Close"],      # returns computed for each listed field
+    returns_mode="log",          # 'log' or 'pct'
+    include_rvol=True,           # realized vol over returns
+    rvol_span=20,
+    rvol_on="Close",
+    include_dlv=True,            # Δ log volume
+    market_proxy="SPY",          # extra MKT factor from SPY
+    include_oc=False,
+    include_gap=False,
+    include_hl_range=False,
+    target_field="Close",        # predict future return on this field
+    calendar=CalendarConfig(     # calendar features on/off
+        include_dow=True,
+        include_dom=True,
+        include_moy=True,
+    ),
+)
+prepare_stock_windows_and_cache_v2(
+    tickers=TCKS,
+    start="2017-01-01", # equities "2015-01-01"
+    val_start="2023-01-01", # equities "2021-01-01"
+    test_start="2024-01-01", # equities "2022-01-01"
+    end="2025-06-30",
+    window=WINDOW,
+    horizon=PRED,
+    data_dir="./ldt/crypto_data", # equities "./ldt/data"
+    feature_cfg=cfg,
+    normalize_per_ticker=True,
+    min_train_coverage=0.85, # equities 0.9
+    liquidity_rank_window=None,
+    top_n_by_dollar_vol=None,  # optional extra filter inside the prep step
+    regression=True
+)
+train_dl, val_dl, test_dl, sizes = load_dataloaders_with_ratio_split(
+    data_dir="./ldt/crypto_data", # equities "./ldt/data"
+    train_ratio=0.55,
+    val_ratio=0.05,
+    test_ratio=0.4,
+    batch_size=64,
+    regression=True,
+    per_asset=True,        # keep time order per asset
+    shuffle_train=True,
+    num_workers=0,
+    seed=42,
 )
 
-train_loader, val_loader, test_loader, (train_size, val_size, test_size) = \
-  load_dataloaders_from_cache(
-    batch_size=BATCH_SIZE,
-    data_dir=DATA_DIR,
-  )
-
 # --- Load pre-trained VAE ---
+IN_FEAT = train_dl[0].shape[-1]
+
 vae = LatentVAE(
-    input_dim=len(PRED_FEAT), seq_len=PRED,
+    input_dim=IN_FEAT, seq_len=PRED,
     latent_dim=64,
     enc_layers=3, enc_heads=4, enc_ff=256,
     dec_layers=3, dec_heads=4, dec_ff=256,
@@ -84,7 +101,7 @@ mu_d, std_d = mu_d.to(device), std_d.to(device)
 # -------------------------------------------
 latent_dim = all_mu.size(-1)
 time_embed_dim = 256  # embedding dimension for timesteps
-lap_kernel = 128
+lap_kernel = 32
 num_layers = 4
 num_heads = 4
 TOTAL_T = 1500 
@@ -243,6 +260,7 @@ for epoch in range(1, EPOCHS + 1):
     
         print("Stopping training due to early stopping.")
         break
+
 
 
 
