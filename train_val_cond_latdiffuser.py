@@ -53,7 +53,7 @@ GUIDANCE_MINMAX_EVAL = (1.0, 3.0)  # schedule from 1.0 -> 3.0
 GUIDANCE_POWER       = 0.3
 DDIM_STEPS_EVAL      = 100
 DDIM_ETA_EVAL        = 0.0
-N_SAMPLES_EVAL       = 50  # MC samples (antithetic inside, so actual draws are ceil/paired)
+N_SAMPLES_EVAL       = 16  # MC samples (antithetic inside, so actual draws are ceil/paired)
 
 # Model
 MODEL_WIDTH  = 256
@@ -510,5 +510,6 @@ if best_ckpt_path and os.path.exists(best_ckpt_path):
         print(f"\nValidation regression MSE after decoder FT: {val_reg_mse_ft:.6f}")
 else:
     print("No best checkpoint found; skipping regression eval and decoder fine-tune.")
+
 
 
