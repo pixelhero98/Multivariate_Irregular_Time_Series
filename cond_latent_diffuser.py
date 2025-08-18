@@ -37,40 +37,6 @@ def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> to
     return emb
 
 # -------------------------------
-# Relative Position Bias (kept)
-# -------------------------------
-
-class RelativePositionBias(nn.Module):
-    """
-    T5-style bucketed relative bias (symmetric; non-causal).
-    Produces a float mask [L, L] that is ADDED to attention logits.
-    Shared across heads (simple and stable).
-    """
-    def __init__(self, n_buckets: int = 32, max_distance: int = 128):
-        super().__init__()
-        self.n_buckets = n_buckets
-        self.max_distance = max_distance
-        self.bias = nn.Parameter(torch.zeros(n_buckets))  # learnable scalar per bucket
-
-    def _bucket(self, rel: torch.Tensor) -> torch.Tensor:
-        # rel = |j - i|, shape [L, L]
-        n = self.n_buckets
-        max_d = self.max_distance
-        small = rel < (n // 2)
-        log_rel = torch.log(rel.float() / (n // 2) + 1e-6)
-        log_max = math.log(max(max_d / (n // 2), 1.0))
-        scaled = (log_rel / (log_max + 1e-6)) * (n - n // 2 - 1)
-        large_bucket = (n // 2 + scaled.floor().clamp(min=0, max=n - n // 2 - 1)).long()
-        return torch.where(small, rel.long(), large_bucket)
-
-    def forward(self, L: int, device: torch.device) -> torch.Tensor:
-        i = torch.arange(L, device=device)[:, None]
-        j = torch.arange(L, device=device)[None, :]
-        rel = (j - i).abs()  # [L, L]
-        buckets = self._bucket(rel)  # [L, L] integers in [0, n_buckets)
-        return self.bias[buckets]    # [L, L] float mask to add to logits
-
-# -------------------------------
 # Context summarizer (kept)
 # -------------------------------
 
@@ -249,7 +215,6 @@ class CrossAttnBlock(nn.Module):
 # LapFormer (multi-resolution + self-conditioning)
 # -------------------------------
 
-
 class LaplaceSandwichBlock(nn.Module):
     """
     time x:[B,L,D] --(LearnableLaplacianBasis k)-> z:[B,L,2k]
@@ -354,7 +319,6 @@ class LapFormer(nn.Module):
         ])
 
         # shared RPB and small head in TIME domain, zero-init
-        self.rel_bias = RelativePositionBias(n_buckets=32, max_distance=128)
         self.head_norm = nn.LayerNorm(input_dim)
         self.head_proj = nn.Linear(input_dim, input_dim)
         nn.init.zeros_(self.head_proj.weight); nn.init.zeros_(self.head_proj.bias)
@@ -373,7 +337,6 @@ class LapFormer(nn.Module):
         # positional & time embeddings (shared across blocks)
         pos = get_sinusoidal_pos_emb(L, self.hidden_dim, device)        # [1,L,H]
         t_vec = self.time_mlp(t_emb)                                    # [B,H]
-        attn_bias = self.rel_bias(L, device)                            # [L,L]
 
         # self-conditioning add in H (optional)
         sc_add_H = self.self_cond_proj(sc_feat) if (self.self_conditioning and sc_feat is not None) else None
@@ -388,11 +351,13 @@ class LapFormer(nn.Module):
         # run the sandwich stack; each block returns TIME-domain [B,L,D]
         h_time = x_tokens
         for i, blk in enumerate(self.blocks):
-            h_time = blk(h_time, pos, t_vec, attn_bias, kvs[i], cond_mask, sc_add_H)
+            h_time = blk(h_time, pos, t_vec, None, kvs[i], cond_mask, sc_add_H)
 
         # tiny head in time domain (identity at init)
         out = self.head_proj(self.head_norm(h_time))
         return out
+
+
 class LapDiT(nn.Module):
     """
     Latent conditional diffusion model for multivariate time series.
