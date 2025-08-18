@@ -318,7 +318,7 @@ class LapFormer(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # >>> NEW: shared relative position bias for self-attn <<<
+        # Shared relative position bias for self-attn
         self.rel_bias = RelativePositionBias(n_buckets=32, max_distance=128)
 
         self.norm_out = nn.LayerNorm(hidden_dim)
@@ -340,7 +340,8 @@ class LapFormer(nn.Module):
         attn_bias = self.rel_bias(L, device)  # small float mask added to logits
 
         for blk, cblk in zip(self.blocks, self.cross_blocks):
-            h = blk(h, attn_mask=attn_bias, key_padding_mask=None, attn_bias=None)  # use bias as mask
+            # pass bias via attn_bias argument (clearer than overloading attn_mask)
+            h = blk(h, attn_mask=None, key_padding_mask=None, attn_bias=attn_bias)
             if cond_summary is not None:
                 h = cblk(h, cond_summary, kv_mask=cond_mask)
 
@@ -357,7 +358,7 @@ class LapDiT(nn.Module):
     Latent conditional diffusion model for multivariate time series.
     - Supports global multi-entity conditioning.
     - Positional encodings in both context and target paths.
-    - Optional v-parameterization internally (converted to ε for sampling if needed).
+    - Parameterization-consistent: training and sampling both in 'eps' or 'v'.
     """
     def __init__(self,
                  data_dim: int,                  # feature dimension of the target series (D)
@@ -437,31 +438,16 @@ class LapDiT(nn.Module):
                 series: Optional[torch.Tensor] = None,          # context: [B,Lc,F] or [B,M,Lc,F]
                 series_mask: Optional[torch.Tensor] = None,     # [B, Lc] or [B,M,Lc]
                 cond_summary: Optional[torch.Tensor] = None,    # [B, Lh, H]
-                entity_ids: Optional[torch.Tensor] = None,       # [B, M] if series is [B,M,Lc,F]
-                out_type: str = "eps"                            # NEW: "eps" | "v" | "param"
+                entity_ids: Optional[torch.Tensor] = None       # [B, M] if series is [B,M,Lc,F]
                 ) -> torch.Tensor:
         """
         Returns:
-            eps_pred: [B, L, D] (epsilon prediction)
+            param_pred: [B, L, D] in the model's native parameterization (eps or v).
         """
         cond_summary, cond_mask = self._maybe_build_cond(series, series_mask, cond_summary, entity_ids)
         t_emb = self._time_embed(t)                       # [B, H]
-        raw = self.model(x_t, t_emb, cond_summary, cond_mask)  # model’s native param (= predict_type)  [B, L, D]
-
-        if out_type == "param":
-            return raw
-        elif out_type == "eps":
-            if self.predict_type == "eps":
-                return raw
-            else:
-                return self.scheduler.pred_eps_from_v(x_t, t, raw)
-        elif out_type == "v":
-            if self.predict_type == "v":
-                return raw
-            else:
-                return self.scheduler.v_from_eps(x_t, t, raw)
-        else:
-            raise ValueError("out_type must be 'eps', 'v', or 'param'")
+        raw = self.model(x_t, t_emb, cond_summary, cond_mask)  # [B, L, D]
+        return raw  # native param: 'eps' or 'v' depending on self.predict_type
 
     # ----- generation with CFG + imputation inpainting -----
 
@@ -481,6 +467,7 @@ class LapDiT(nn.Module):
                  ) -> torch.Tensor:
         """
         DDIM sampling with classifier-free guidance and optional known-value replacement (imputation).
+        Sampling uses the model's native parameterization consistently ('eps' or 'v').
         """
         device = next(self.parameters()).device
         B, L, D = shape
@@ -510,19 +497,16 @@ class LapDiT(nn.Module):
             t_b = t_i.repeat(B)
             tprev_b = t_prev_i.repeat(B)
 
-            # Unconditional path (drop cond)
-            eps_uncond = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None, out_type="eps")
+            # Native-param predictions (uncond & cond)
+            pred_uncond = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None)
+            pred_cond   = self.forward(x_t, t_b, series=series, series_mask=series_mask,
+                                       cond_summary=cond_summary, entity_ids=entity_ids)
 
-            # Conditional path
-            eps_cond = self.forward(x_t, t_b, series=series, series_mask=series_mask,
-                                    cond_summary=cond_summary, entity_ids=entity_ids,
-                                    out_type="eps")
+            # CFG in native param space
+            pred = pred_uncond + guidance_strength * (pred_cond - pred_uncond)
 
-            # CFG combine in epsilon-space
-            eps = eps_uncond + guidance_strength * (eps_cond - eps_uncond)
-
-            # DDIM step
-            x_t = self.scheduler.ddim_sample(x_t, t_b, tprev_b, eps, eta)
+            # DDIM step that understands the param_type
+            x_t = self.scheduler.ddim_step_from(x_t, t_b, tprev_b, pred, param_type=self.predict_type, eta=eta)
 
             # Hard replace known observations (inpaint) at current noise level
             if (y_obs is not None) and (obs_mask is not None):
