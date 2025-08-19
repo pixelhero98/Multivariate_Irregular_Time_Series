@@ -151,3 +151,4 @@ class NoiseScheduler(nn.Module):
         x_prev  = torch.sqrt(ab_prev) * x0_pred + dir_xt + sigma * noise
                            
         return x_prev
+
