@@ -481,8 +481,8 @@ class LapDiT(nn.Module):
 
         total_T = self.scheduler.timesteps
         steps = max(1, min(steps, total_T))
-        step_indices = torch.linspace(0, total_T - 1, steps, dtype=torch.long, device=device).flip(0)
-        ts_prev = torch.cat([step_indices[1:], step_indices[-1:].clone()])
+        step_indices = torch.linspace(0, total_T - 1, steps, device=device).round().long().flip(0)
+        ts_prev = torch.cat([step_indices[1:], step_indices[-1:]])
 
         for t_i, t_prev_i in zip(step_indices, ts_prev):
             t_b = t_i.repeat(B)
