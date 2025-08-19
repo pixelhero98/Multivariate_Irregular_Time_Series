@@ -146,6 +146,8 @@ class NoiseScheduler(nn.Module):
         x0_pred = self.to_x0(x_t, t, pred, param_type)
         eps_pred= self.to_eps(x_t, t, pred, param_type)
 
-        dir_xt  = torch.sqrt((1.0 - ab_prev) - sigma**2).clamp(min=0) * eps_pred
+        dir_coeff = torch.clamp((1.0 - ab_prev) - sigma**2, min=0.0)
+        dir_xt = torch.sqrt(dir_coeff) * eps_pred
         x_prev  = torch.sqrt(ab_prev) * x0_pred + dir_xt + sigma * noise
+                           
         return x_prev
