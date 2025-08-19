@@ -18,11 +18,12 @@ def get_sinusoidal_pos_emb(L: int, dim: int, device: torch.device) -> torch.Tens
     """
     if dim % 2 != 0:
         raise ValueError("pos_emb dim must be even")
-    pos = torch.arange(L, device=device).unsqueeze(1).float()   # [L, 1]
-    i   = torch.arange(dim // 2, device=device).float()         # [dim/2]
-    angles = pos / (10000 ** (i / (dim // 2)))                  # [L, dim/2]
-    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)  # [L, dim]
-    return emb.unsqueeze(0)  # [1, L, dim]
+    pos = torch.arange(L, device=device).unsqueeze(1).float()            # [L, 1]
+    i   = torch.arange(dim // 2, device=device).float()                  # [dim/2]
+    denom = torch.exp((i / (dim // 2)) * math.log(10000.0))              # [dim/2]
+    angles = pos / denom                                                 # [L, dim/2]
+    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)       # [L, dim]
+    return emb.unsqueeze(0)                                              # [1, L, dim]
 
 def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
     """
