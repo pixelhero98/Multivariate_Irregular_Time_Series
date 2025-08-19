@@ -459,7 +459,7 @@ class LapDiT(nn.Module):
                  y_obs: Optional[torch.Tensor] = None,
                  obs_mask: Optional[torch.Tensor] = None,
                  x_T: Optional[torch.Tensor] = None,
-                 self_cond: bool = False) -> torch.Tensor:
+                 self_cond: Optional[bool] = None) -> torch.Tensor:
         """
         DDIM sampling with classifier-free guidance (scheduled) and optional inpainting.
         Guidance scheduling:
@@ -468,7 +468,8 @@ class LapDiT(nn.Module):
         """
         device = next(self.parameters()).device
         B, L, D = shape
-
+        if self_cond is None:
+            self_cond = self.self_conditioning # Default to whatever the model was trained with
         x_t = torch.randn(B, L, D, device=device) if x_T is None else x_T.to(device)
 
         built_cond, built_mask = self._maybe_build_cond(series, series_mask, cond_summary, entity_ids)
