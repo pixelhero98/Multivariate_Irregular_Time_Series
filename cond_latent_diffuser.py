@@ -489,18 +489,25 @@ class LapDiT(nn.Module):
             tprev_b = t_prev_i.repeat(B)
 
             # optional self-conditioning (teacher is previous prediction of x0)
-            sc_feat = None
+            sc_feat_uncond = sc_feat_cond = None
             if self.self_conditioning and self_cond:
                 with torch.no_grad():
-                    pred_sc = self.forward(x_t, t_b, series=series, series_mask=series_mask,
-                                           cond_summary=cond_summary, entity_ids=entity_ids)
-                    x0_sc = self.scheduler.to_x0(x_t, t_b, pred_sc, param_type=self.predict_type)
-                    sc_feat = x0_sc  # feed estimated x0 back in
-
-            # unconditional / conditional predictions (native param)
-            pred_uncond = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None, sc_feat=sc_feat)
+                    # self-cond for UNCONDITIONAL
+                    pred_sc_u = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None)
+                    x0_sc_u = self.scheduler.to_x0(x_t, t_b, pred_sc_u, param_type=self.predict_type)
+                    sc_feat_uncond = x0_sc_u
+            
+                    # self-cond for CONDITIONAL
+                    pred_sc_c = self.forward(x_t, t_b, series=series, series_mask=series_mask,
+                                             cond_summary=cond_summary, entity_ids=entity_ids)
+                    x0_sc_c = self.scheduler.to_x0(x_t, t_b, pred_sc_c, param_type=self.predict_type)
+                    sc_feat_cond = x0_sc_c
+            
+            pred_uncond = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None,
+                                       sc_feat=sc_feat_uncond)
             pred_cond   = self.forward(x_t, t_b, series=series, series_mask=series_mask,
-                                       cond_summary=cond_summary, entity_ids=entity_ids, sc_feat=sc_feat)
+                                       cond_summary=cond_summary, entity_ids=entity_ids,
+                                       sc_feat=sc_feat_cond)
 
             # scheduled classifier-free guidance
             ab_t = self.scheduler._gather(self.scheduler.alpha_bars, t_b)  # [B]
