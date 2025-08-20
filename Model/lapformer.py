@@ -105,7 +105,6 @@ class LaplaceSandwichBlock(nn.Module):
         h = self.lap2hid(z) + pos_emb + t_vec.unsqueeze(1)        # [B,L,H]
         if sc_add_H is not None:
             h = h + sc_add_H
-        # self-attn (time axis) with shared RPB
         h = self.self_blk(h, attn_mask=None, key_padding_mask=None, attn_bias=attn_bias)
         # cross-attn to context summary (already width H after summary2lap proj)
         if summary_kv_H is not None:
@@ -205,4 +204,5 @@ class LapFormer(nn.Module):
 
         # tiny head in time domain (identity at init)
         out = self.head_proj(self.head_norm(h_time))
+
         return out
