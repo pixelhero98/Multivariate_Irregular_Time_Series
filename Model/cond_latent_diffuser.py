@@ -170,6 +170,7 @@ class LLapDiT(nn.Module):
             g_t = g_min + (g_max - g_min) * w  # [B,1,1]
 
             pred = pred_uncond + g_t * (pred_cond - pred_uncond)
+            last_x0 = self.scheduler.to_x0(x_t, t_b, pred, param_type=self.predict_type)
             
             # DDIM step with native param
             x_t = self.scheduler.ddim_step_from(x_t, t_b, tprev_b, pred, param_type=self.predict_type, eta=eta)
@@ -178,4 +179,4 @@ class LLapDiT(nn.Module):
                 x_t_obs, _ = self.scheduler.q_sample(y_obs, t_b)
                 x_t = obs_mask * x_t_obs + (1.0 - obs_mask) * x_t
 
-        return x_t  # x_0
+        return last_x0  # x_0
