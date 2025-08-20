@@ -19,12 +19,13 @@ class LLapDiT(nn.Module):
     """
     def __init__(self,
                  data_dim: int,
+                 horizon: int,
                  hidden_dim: int = 256,
                  num_layers: int = 6,
                  num_heads: int = 8,
                  laplace_k: Union[int, List[int]] = 16,   # int or list: [k_stem, k1, k2, ...]
                  global_k: int = 32,
-                 num_entities: Optional[int] = None,
+                 num_entities: int,
                  dropout: float = 0.1,
                  attn_dropout: float = 0.0,
                  predict_type: str = "eps",               # "eps" or "v"
@@ -42,6 +43,7 @@ class LLapDiT(nn.Module):
         self.context = PDELaplaceGuidedSummarizer(
             lap_k=global_k,
             feat_dim=ctx_dim,
+            out_len=horizon,
             hidden_dim=hidden_dim,
             num_heads=num_heads,
             num_entities=num_entities,
@@ -74,8 +76,8 @@ class LLapDiT(nn.Module):
             return cond_summary, None
         if series is None:
             return None, None
-        ctx = self.context(series, context_mask=series_mask)
-        return ctx, None
+        summary = self.context(series, context_mask=series_mask)
+        return summary, None
 
     def forward(self,
                 x_t: torch.Tensor,
@@ -168,7 +170,7 @@ class LLapDiT(nn.Module):
             g_t = g_min + (g_max - g_min) * w  # [B,1,1]
 
             pred = pred_uncond + g_t * (pred_cond - pred_uncond)
-
+            
             # DDIM step with native param
             x_t = self.scheduler.ddim_step_from(x_t, t_b, tprev_b, pred, param_type=self.predict_type, eta=eta)
 
