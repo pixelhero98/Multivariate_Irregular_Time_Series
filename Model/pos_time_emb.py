@@ -1,0 +1,31 @@
+import torch, math
+
+# -------------------------------
+# Positional / timestep embeddings
+# -------------------------------
+
+def get_sinusoidal_pos_emb(L: int, dim: int, device: torch.device) -> torch.Tensor:
+    """
+    Standard 1D sinusoidal positional embeddings.
+    Returns: [1, L, dim]
+    """
+    if dim % 2 != 0:
+        raise ValueError("pos_emb dim must be even")
+    pos = torch.arange(L, device=device).unsqueeze(1).float()            # [L, 1]
+    i   = torch.arange(dim // 2, device=device).float()                  # [dim/2]
+    denom = torch.exp((i / (dim // 2)) * math.log(10000.0))              # [dim/2]
+    angles = pos / denom                                                 # [L, dim/2]
+    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)       # [L, dim]
+    return emb.unsqueeze(0)                                              # [1, L, dim]
+
+def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+    """
+    From DiT/ADM: create [B, dim] embedding for integer timesteps.
+    """
+    if dim % 2 != 0:
+        raise ValueError("timestep embedding dim must be even")
+    half = dim // 2
+    freqs = torch.exp(-math.log(max_period) * torch.arange(0, half, device=t.device).float() / half)
+    args = t.float().unsqueeze(1) * freqs.unsqueeze(0)  # [B, half]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=1)
+    return emb
