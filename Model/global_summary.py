@@ -183,7 +183,6 @@ class PDELaplaceGuidedSummarizer(nn.Module):
 
     Inputs:
       x:    [B, T, N, F]
-      mask: optional [B, T]  (True/1 = ignore these time steps)
     Outputs:
       summary: [B, Lq, H]
       aux:     dict of intermediates for diagnostics
@@ -248,10 +247,9 @@ class PDELaplaceGuidedSummarizer(nn.Module):
         """
         return self.pde_lap.diff.bind_from_basis(self.pde_lap.lap)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(self, x: torch.Tensor):
         """
         x:    [B,T,N,F]
-        mask: [B,T] (True/1 = ignore) or None
         """
         B, T, N, F = x.shape
         device = x.device
@@ -276,7 +274,6 @@ class PDELaplaceGuidedSummarizer(nn.Module):
         Vv = (1.0 + gamma) * Vv + beta
 
         # Per-head additive time bias for attention logits.
-        # attn_mask expects float; shape can be (B*heads, Lq, S) for per-batch biases.
         bias_ht = self.lap_to_bias(L)                       # [B,T,heads]
         Lq = self.queries.shape[0]
         attn_bias = bias_ht.permute(0, 2, 1).unsqueeze(2).expand(B, self.num_heads, Lq, T)
@@ -325,6 +322,6 @@ class PDELaplaceGuidedSummarizer(nn.Module):
 # model.tie_derivative_to_basis()
 #
 # x = torch.randn(8, T, N, F)
-# mask = torch.zeros(8, T, dtype=torch.bool)  # or None
-# summary, aux = model(x, mask)
+# summary, aux = model(x)
+
 # print(summary.shape)  # -> [8, Lq, H]
