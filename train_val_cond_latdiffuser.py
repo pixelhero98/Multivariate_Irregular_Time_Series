@@ -14,7 +14,7 @@ from fin_data_prep_f16_ultramem import (
     FeatureConfig, CalendarConfig
 )
 from latent_vae import LatentVAE
-from cond_latent_diffuser import LapDiT  # updated model (multi-res + self-cond)
+from lladit import LLapDiT  # updated model (multi-res + self-cond)
 
 # =====================================================================================
 # Config
@@ -510,6 +510,7 @@ if best_ckpt_path and os.path.exists(best_ckpt_path):
         print(f"\nValidation regression MSE after decoder FT: {val_reg_mse_ft:.6f}")
 else:
     print("No best checkpoint found; skipping regression eval and decoder fine-tune.")
+
 
 
 
