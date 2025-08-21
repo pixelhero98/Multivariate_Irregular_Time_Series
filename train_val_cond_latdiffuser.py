@@ -248,21 +248,22 @@ def build_antithetic_noises(batch_size, L, D, n_samples, device):
 # Diffusion model, optimizer, scheduler, EMA
 # =====================================================================================
 
-diff_model = LapDiT(
+diff_model = LLapDiT(
     data_dim=latent_dim,
     hidden_dim=MODEL_WIDTH,
     num_layers=NUM_LAYERS,
     num_heads=NUM_HEADS,
+    predict_type=PREDICT_TYPE,
     laplace_k=LAPLACE_K,              # multi-resolution
-    cond_len=COND_LEN,
-    num_entities=None,
-    dropout=DROPOUT,
-    attn_dropout=ATTN_DROPOUT,
-    predict_type=PREDICT_TYPE,        # native param
+    global_k=GLOBAL_K,
     timesteps=TOTAL_T,
     schedule=SCHEDULE,
+    dropout=DROPOUT,
+    attn_dropout=ATTN_DROPOUT,
     self_conditioning=SELF_COND,
-    context_dim=ctx_dim
+    context_dim=ctx_dim,
+    num_entities=len(TICKS),
+    tgt_len=HORIZON
 ).to(device)
 
 noise_scheduler = diff_model.scheduler
@@ -510,6 +511,7 @@ if best_ckpt_path and os.path.exists(best_ckpt_path):
         print(f"\nValidation regression MSE after decoder FT: {val_reg_mse_ft:.6f}")
 else:
     print("No best checkpoint found; skipping regression eval and decoder fine-tune.")
+
 
 
 
