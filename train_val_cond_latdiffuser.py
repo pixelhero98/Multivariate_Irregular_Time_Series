@@ -60,9 +60,8 @@ MODEL_WIDTH  = 256
 NUM_LAYERS   = 4
 NUM_HEADS    = 4
 # Multi-resolution Laplace: stem k0, then per-layer k
-LAPLACE_K    = [32, 24, 16, 16, 16]   # len >= 1+NUM_LAYERS; last value is reused if shorter
-COND_LEN     = 32
-DROPOUT      = 0.1
+LAPLACE_K    = [24, 20, 16, 16]  
+DROPOUT      = 0.0
 ATTN_DROPOUT = 0.0
 SELF_COND    = True  # enable self-conditioning path in the model
 
@@ -511,6 +510,7 @@ if best_ckpt_path and os.path.exists(best_ckpt_path):
         print(f"\nValidation regression MSE after decoder FT: {val_reg_mse_ft:.6f}")
 else:
     print("No best checkpoint found; skipping regression eval and decoder fine-tune.")
+
 
 
 
