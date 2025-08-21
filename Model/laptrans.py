@@ -19,7 +19,8 @@ class LearnableLaplacianBasis(nn.Module):
         self.k = k
         self.alpha_min = alpha_min
 
-        self.s_real = nn.Parameter(torch.empty(k))
+        # Reparameterized real part: raw (unconstrained) -> positive via softplus + alpha_min
+        self._s_real_raw = nn.Parameter(torch.empty(k))
         self.s_imag = nn.Parameter(torch.empty(k))
         self.reset_parameters()
 
@@ -29,9 +30,20 @@ class LearnableLaplacianBasis(nn.Module):
         )
         self._tau = nn.Parameter(torch.tensor(0.0))  # softplus -> positive scale, no exploding patterns
 
+    # Expose positive alpha via property (backward flows to _s_real_raw)
+    @property
+    def s_real(self) -> torch.Tensor:
+        return F.softplus(self._s_real_raw) + self.alpha_min  # strictly > alpha_min
+
     def reset_parameters(self):
-        nn.init.uniform_(self.s_real, 0.01, 0.2)    # α > 0
+        # Initialize s_imag as before
         nn.init.uniform_(self.s_imag, -math.pi, math.pi)  # ω init
+
+        # Initialize raw real-part so that s_real ≈ U[0.01, 0.2]
+        with torch.no_grad():
+            target_alpha = torch.empty_like(self._s_real_raw).uniform_(0.01, 0.2)
+            y = (target_alpha - self.alpha_min).clamp_min(1e-8)  # softplus(raw) = y > 0
+            self._s_real_raw.copy_(torch.log(torch.expm1(y)))    # raw = softplus^{-1}(y)
 
     def forward(self, x: torch.Tensor,
                 dt: torch.Tensor | None = None,
@@ -42,22 +54,15 @@ class LearnableLaplacianBasis(nn.Module):
         Stable, driven damped-sinusoid bank (linear time-*varying* in complex-domain):
           z_t = [c_t, s_t],   z_t = rho_t * R(theta_t) * z_{t-1} + [u_t, 0]
         Returns [B, T, 2k] = concat([c_t, s_t]) per pole k.
-
-        Args:
-            x:          [B,T,D] input drive
-            dt:         optional [B,T] or [T] step sizes. If None, uses 1/(T-1).
-            alpha_mod:  optional [B,T,1] multiplier in log-space (exp applied)
-            omega_mod:  optional [B,T,1] multiplier in log-space (exp applied)
-            tau_mod:    optional [B,T,1] shared scale mod (exp applied)
         """
         B, T, D = x.shape
         device = x.device
         k = self.k
 
         # Base pole params with learnable time scale
-        tau = F.softplus(self._tau) + 1e-3             # scalar > 0
-        alpha0 = self.s_real.clamp_min(self.alpha_min) * tau   # [k]
-        omega0 = self.s_imag * tau                              # [k]
+        tau = F.softplus(self._tau) + 1e-3              # scalar > 0
+        alpha0 = self.s_real * tau                       # [k], strictly > alpha_min * tau
+        omega0 = self.s_imag * tau                       # [k] (unconstrained sign)
 
         # Prepare dt to shape [B,T,1]
         if dt is None:
@@ -179,3 +184,14 @@ class LearnableInverseLaplacianBasis(nn.Module):
 #     loss = x_hat.pow(2).mean()
 #     loss.backward()
 #     print("Backward OK (no errors)")
+#
+# if __name__ == "__main__":
+#     B, T, D, k = 2, 5, 16, 8
+#     lap = LearnableLaplacianBasis(k=k, feat_dim=D)
+#     x = torch.randn(B, T, D)
+#     z = lap(x)                  # [B,T,2k]
+#     print(z.shape)
+#     (z.mean()).backward()       # gradients flow to _s_real_raw and s_imag
+#     print("OK")
+#     print(x)
+#     print(z)
