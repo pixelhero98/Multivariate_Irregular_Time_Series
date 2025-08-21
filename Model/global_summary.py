@@ -11,16 +11,14 @@ from laptrans import LearnableLaplacianBasis
 # -------------------------------
 
 # ---------- Tiny heads: [B,T,N,F] -> [B,T,N] ----------
-class TinyScalarHead(nn.Module):
+class TVHead(nn.Module):
     """Per-entity scalar readout from features at each time."""
     def __init__(self, feat_dim: int, hidden: int = 32):
         super().__init__()
-        h = min(hidden, max(8, feat_dim))
         self.net = nn.Sequential(
             nn.LayerNorm(feat_dim),
-            nn.Linear(feat_dim, h),
-            nn.GELU(),
-            nn.Linear(h, 1),
+            nn.Linear(feat_dim, hidden), nn.GELU(),
+            nn.Linear(hidden, 1)
         )
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: [B,T,N,F]
         return self.net(x).squeeze(-1)                   #    [B,T,N]
@@ -41,6 +39,7 @@ class PolewiseDiff(nn.Module):
         super().__init__()
         self.k = k
         self.physics_tied = physics_tied
+        self.lap_ref = None
 
         if physics_tied:
             # Buffers hold the analytic part; residual is learnable.
@@ -51,75 +50,58 @@ class PolewiseDiff(nn.Module):
             nn.init.normal_(self.residual, std=residual_scale)
         else:
             self.blocks = nn.Parameter(torch.zeros(k, 2, 2))
-            nn.init.normal_(self.blocks, std=0.02)
+            nn.init.normal_(self.blocks, std=residual_scale)
 
-    @torch.no_grad()
-    def set_poles(self, alpha: torch.Tensor, omega: torch.Tensor, tau: torch.Tensor | float = 1.0):
-        """
-        Manually set poles for physics-tied mode. Shapes:
-          alpha: [K], omega: [K], tau: scalar or [K] (will be broadcast).
-        """
-        assert self.physics_tied, "set_poles is only for physics-tied mode."
-        self.alpha0.copy_(alpha.reshape(-1))
-        self.omega0.copy_(omega.reshape(-1))
-        self.tau0.copy_(torch.as_tensor(tau).reshape(1))
-
-    @torch.no_grad()
-    def bind_from_basis(self, basis) -> bool:
-        """
-        Try to read poles from LearnableLaplacianBasis.
-        Expects either .get_poles() -> (alpha[K], omega[K], tau[1 or K])
-        or attributes with reasonable names. Returns True if success.
-        """
+    def bind_from_basis(self, lap: "LearnableLaplacianBasis"):
         if not self.physics_tied:
-            return False
+            return self
+        self.lap_ref = lap
+        with torch.no_grad():
+            self.alpha0.copy_(lap.s_real.clamp_min(lap.alpha_min))
+            self.omega0.copy_(lap.s_imag)
+            self.tau0.copy_(F.softplus(lap._tau) + 1e-3)
 
-        if hasattr(basis, "get_poles"):
-            alpha, omega, tau = basis.get_poles()
-            self.set_poles(alpha, omega, tau)
-            return True
+        return self
 
-        # Heuristic attribute names (edit if needed to match your laptrans.py)
-        got = False
-        for a_name in ("alpha", "alphas", "a", "real"):
-            if hasattr(basis, a_name):
-                self.alpha0.copy_(getattr(basis, a_name).detach().abs().reshape(-1))
-                got = True
-                break
-        for w_name in ("omega", "omegas", "w", "imag"):
-            if hasattr(basis, w_name):
-                self.omega0.copy_(getattr(basis, w_name).detach().reshape(-1))
-        for t_name in ("tau", "time_scale", "scale", "dt"):
-            if hasattr(basis, t_name):
-                self.tau0.copy_(torch.as_tensor(getattr(basis, t_name)).reshape(1))
-        return got
+    def forward(self, L: torch.Tensor) -> torch.Tensor:  # [B,T,2K]
+        B, T, twoK = L.shape
+        K = twoK // 2
+        L = L.view(B, T, K, 2)
 
-    def _physics_blocks(self) -> torch.Tensor:
-        # Build τ * [[-α, -ω], [ω, -α]]  per pole
-        a = self.alpha0 * self.tau0
-        w = self.omega0 * self.tau0
-        M = torch.zeros(self.k, 2, 2, device=a.device, dtype=a.dtype)
-        M[:, 0, 0] = -a; M[:, 0, 1] = -w
-        M[:, 1, 0] =  w; M[:, 1, 1] = -a
-        return M
-
-    def forward(self, lap_feats: torch.Tensor) -> torch.Tensor:
-        """
-        lap_feats: [B,T,2K]  (pairs [cos, sin] per pole)
-        returns:   [B,T,2K]  (approx. derivative features)
-        """
-        B, T, C = lap_feats.shape
-        K = C // 2
-        x = lap_feats.view(B, T, K, 2)   # [B,T,K,2]
         if self.physics_tied:
-            M = self._physics_blocks() + self.residual  # [K,2,2]
+            # τ * [[-α, -ω],[ω, -α]] + residual (live-tied to basis if available)
+            if hasattr(self, "lap_ref") and (self.lap_ref is not None):
+                alpha0 = self.lap_ref.s_real.clamp_min(self.lap_ref.alpha_min)  # [K] or scalar
+                omega0 = self.lap_ref.s_imag  # [K] or scalar
+                tau0 = F.softplus(self.lap_ref._tau) + 1e-3  # [K] or scalar
+
+                # Build A from α, ω, then scale by τ and add residual
+                A = torch.zeros(K, 2, 2, device=L.device, dtype=L.dtype)
+                A[:, 0, 0] = -alpha0
+                A[:, 0, 1] = -omega0
+                A[:, 1, 0] = omega0
+                A[:, 1, 1] = -alpha0
+                A = A * tau0.view(-1, 1, 1) + self.residual  # [K,2,2]
+            else:
+            # Fallback: build A from tied buffers (alpha0, omega0, tau0)
+                alpha0 = self.alpha0.to(L.device, L.dtype)
+                omega0 = self.omega0.to(L.device, L.dtype)
+                tau0 = self.tau0.to(L.device, L.dtype)
+                A = torch.zeros(K, 2, 2, device=L.device, dtype=L.dtype)
+                A[:, 0, 0] = -alpha0
+                A[:, 0, 1] = -omega0
+                A[:, 1, 0] = omega0
+                A[:, 1, 1] = -alpha0
+                A = A * tau0.view(-1, 1, 1) + self.residual  # [K,2,2]
         else:
-            M = self.blocks                              # [K,2,2]
-        y = torch.einsum('btkc,kcd->btkd', x, M)         # [B,T,K,2]
-        return y.view(B, T, 2*K)
+            # Untied (free) case: use learnable per-pole 2×2 blocks
+            A = self.blocks.to(device=L.device, dtype=L.dtype)
+
+        out = torch.einsum('kij,btkj->btki', A, L)  # [B,T,K,2]
+        return out.reshape(B, T, 2 * K)
 
 
-# ---------- Second-order numerator combiner (pole-wise) ----------
+# ---------- 2nd-order PDE + Laplace combiner ----------
 class SecondOrderLaplaceCombinerPolewise(nn.Module):
     """
     Implements the 2nd-order (damped) premise in Laplace space:
@@ -151,7 +133,7 @@ class SecondOrderLaplaceCombinerPolewise(nn.Module):
         # Only used to make the coefficient conditioner aware of trend changes; not for the derivative path.
         return torch.diff(x, dim=1, prepend=x[:, :1])
 
-    def forward(self, T_sig: torch.Tensor, V_sig: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(self, T_sig: torch.Tensor, V_sig: torch.Tensor, dt: torch.Tensor | None = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         # Stats for a tiny time-varying numerator conditioner (shared across entities)
         stats = torch.stack([
             T_sig.mean(-1),                           # [B,T]
@@ -163,27 +145,28 @@ class SecondOrderLaplaceCombinerPolewise(nn.Module):
         a0, a1, b0, b1 = torch.unbind(coeff, dim=-1)  # each [B,T]
 
         # Laplace features + pole-wise time-derivatives (no raw differencing)
-        LT  = self.lap(T_sig)                         # [B,T,2K]
-        LV  = self.lap(V_sig)                         # [B,T,2K]
+        LT  = self.lap(T_sig, dt=dt)                         # [B,T,2K]
+        LV  = self.lap(V_sig, dt=dt)                         # [B,T,2K]
         LdT = self.diff(LT)                           # [B,T,2K]
         LdV = self.diff(LV)                           # [B,T,2K]
 
         # Combine per numerator (broadcast over 2K)
-        L = (a0.unsqueeze(-1) * LT) + (a1.unsqueeze(-1) * LdT) + \
-            (b0.unsqueeze(-1) * LV) + (b1.unsqueeze(-1) * LdV)   # [B,T,2K]
+        L = (a0.unsqueeze(-1) * LT
+           + a1.unsqueeze(-1) * LdT
+           + b0.unsqueeze(-1) * LV
+           + b1.unsqueeze(-1) * LdV)                  # [B,T,2K]
 
-        aux = {"coeff": coeff, "LT": LT, "LdT": LdT, "LV": LV, "LdV": LdV}
+        aux = {"LT": LT, "LV": LV, "LdT": LdT, "LdV": LdV, "coeff": coeff}
         return L, aux
 
 
-# ---------- Full global summarizer with FiLM + (optional) tokens ----------
-class PDELaplaceGuidedSummarizer(nn.Module):
+class ODELaplaceGuidedSummarizer(nn.Module):
     """
-    Global summary via cross-attention guided by PDE+Laplace features.
+    Global summary via cross-attention guided by ODE+Laplace features.
 
     Inputs:
-      x:    [B, T, N, F]
-      mask: optional [B, T]  (True/1 = ignore these time steps)
+      x:        [B, T, N, F]
+      pad_mask: optional [B, T]  (True/1 = ignore these padded time steps)
     Outputs:
       summary: [B, Lq, H]
       aux:     dict of intermediates for diagnostics
@@ -211,8 +194,8 @@ class PDELaplaceGuidedSummarizer(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
 
         # Tiny scalar heads for V (level) and T (from feature difference)
-        self.v_head = TinyScalarHead(feat_dim)
-        self.t_head = TinyScalarHead(feat_dim)
+        self.v_head = TVHead(feat_dim)
+        self.t_head = TVHead(feat_dim)
 
         # PDE + Laplace combiner (pole-wise derivative)
         self.pde_lap = SecondOrderLaplaceCombinerPolewise(
@@ -220,7 +203,7 @@ class PDELaplaceGuidedSummarizer(nn.Module):
             physics_tied=physics_tied_derivative, residual_scale=residual_scale
         )
 
-        # Map guidance L ∈ [B,T,2K] to FiLM params and per-head time bias
+        # FiLM + per-head bias
         self.lap_to_film = nn.Linear(2 * lap_k, 2 * hidden_dim)  # -> gamma, beta
         self.lap_to_bias = nn.Linear(2 * lap_k, num_heads)       # -> per-head bias over time
 
@@ -235,23 +218,13 @@ class PDELaplaceGuidedSummarizer(nn.Module):
 
     @staticmethod
     def _time_diff_feats(x: torch.Tensor) -> torch.Tensor:
-        # Forward diff on feature tensor for T-head input (leading zero frame)
-        dx = x[:, 1:] - x[:, :-1]                           # [B,T-1,N,F]
-        zero = torch.zeros_like(x[:, :1])                   # [B,1,N,F]
-        return torch.cat([zero, dx], dim=1)                 # [B,T,N,F]
+        # Forward diff on feature tensor for T-head input (leading copy)
+        return torch.diff(x, dim=1, prepend=x[:, :1])
 
-    @torch.no_grad()
-    def tie_derivative_to_basis(self) -> bool:
+    def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None, dt: torch.Tensor | None = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        (Optional) Bind the derivative blocks to the current Laplace poles
-        from the internal LearnableLaplacianBasis. Returns True if successful.
-        """
-        return self.pde_lap.diff.bind_from_basis(self.pde_lap.lap)
-
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        x:    [B,T,N,F]
-        mask: [B,T] (True/1 = ignore) or None
+        x:        [B,T,N,F]
+        pad_mask: [B,T] (True/1 = ignore padded steps) or None
         """
         B, T, N, F = x.shape
         device = x.device
@@ -267,7 +240,7 @@ class PDELaplaceGuidedSummarizer(nn.Module):
         T_sig = self.t_head(self._time_diff_feats(x))       # [B,T,N]   (from feature diff)
 
         # 3) PDE + Laplace guidance in [B,T,2K]
-        L, lap_aux = self.pde_lap(T_sig, V_sig)             # [B,T,2K]
+        L, lap_aux = self.pde_lap(T_sig, V_sig, dt=dt)             # [B,T,2K]
 
         # 4) FiLM on keys/values + per-head time bias
         film = self.lap_to_film(L)                          # [B,T,2H]
@@ -289,12 +262,12 @@ class PDELaplaceGuidedSummarizer(nn.Module):
             values = torch.cat([Vv, lap_tokens], dim=1)     # [B, 2T, H]
             zeros_bias = torch.zeros(B * self.num_heads, Lq, T, device=device, dtype=attn_bias.dtype)
             attn_bias = torch.cat([attn_bias, zeros_bias], dim=-1)  # [(B*heads), Lq, 2T]
-            key_padding_mask = None if mask is None else torch.cat(
-                [mask.to(torch.bool), torch.zeros(B, T, device=device, dtype=torch.bool)], dim=1
+            key_padding_mask = None if pad_mask is None else torch.cat(
+                [pad_mask.to(torch.bool), torch.zeros(B, T, device=device, dtype=torch.bool)], dim=1
             )
         else:
             memory, values = K, Vv
-            key_padding_mask = None if mask is None else mask.to(torch.bool)
+            key_padding_mask = None if pad_mask is None else pad_mask.to(torch.bool)
 
         # 5) Cross-attention from learned queries
         Q = self.queries.unsqueeze(0).expand(B, -1, -1)     # [B,Lq,H]
@@ -316,7 +289,7 @@ class PDELaplaceGuidedSummarizer(nn.Module):
 # ---------------------------
 # N, F, T = 20, 6, 64
 # H, Lq, K, heads = 256, 16, 8, 4
-# model = PDELaplaceGuidedSummarizer(
+# model = ODELaplaceGuidedSummarizer(
 #     num_entities=N, feat_dim=F, hidden_dim=H, out_len=Lq,
 #     num_heads=heads, lap_k=K, dropout=0.1,
 #     add_guidance_tokens=True, physics_tied_derivative=True
@@ -325,6 +298,6 @@ class PDELaplaceGuidedSummarizer(nn.Module):
 # model.tie_derivative_to_basis()
 #
 # x = torch.randn(8, T, N, F)
-# mask = torch.zeros(8, T, dtype=torch.bool)  # or None
-# summary, aux = model(x, mask)
+# pad_mask = torch.zeros(8, T, dtype=torch.bool)  # or None
+# summary, aux = model(x, pad_mask)
 # print(summary.shape)  # -> [8, Lq, H]

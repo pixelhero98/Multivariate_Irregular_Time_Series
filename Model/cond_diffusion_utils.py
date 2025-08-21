@@ -29,11 +29,13 @@ class NoiseScheduler(nn.Module):
             # cosine: derive betas from alpha_bar using finite differences
             ts = torch.linspace(0, 1, self.timesteps + 1, dtype=torch.float32)
             abar = _cosine_alpha_bar(ts)
-            abar = abar / abar[0]                 # normalize so abar(0)=1
-            alpha_bars = abar[1:]                 # length T
-            alphas = alpha_bars / torch.cat([torch.tensor([1.0], dtype=alpha_bars.dtype), alpha_bars[:-1]], dim=0)
-            betas = (1.0 - alphas).clamp(min=1e-8, max=0.999)
-
+            abar = abar / abar[0]  # ensure abar(0)=1
+            # define alphas so that cumprod(alphas) = abar[:-1], i.e., ᾱ[0] = 1
+            alphas = torch.ones(self.timesteps, dtype=torch.float32)
+            alphas[1:] = abar[1:self.timesteps] / abar[0:self.timesteps - 1]
+            betas = (1.0 - alphas).clone()
+            betas[1:] = betas[1:].clamp(min=1e-8, max=0.999)
+            betas[0] = 0.0  # exact no-noise at t=0
         # Buffers
         self.register_buffer("betas", betas)                         # [T]
         self.register_buffer("alphas", 1.0 - betas)                  # [T]
@@ -47,8 +49,10 @@ class NoiseScheduler(nn.Module):
         return torch.arange(self.timesteps - 1, -1, -1, dtype=torch.long, device=self.alpha_bars.device)
 
     def _gather(self, buf: torch.Tensor, t: torch.Tensor):
-        # t: [B] long; buf: [T]
-        return buf.gather(0, t.clamp(min=0, max=self.timesteps - 1))
+        # t: [B] (any dtype/device) ; buf: [T]
+        t = t.clamp(min=0, max=self.timesteps - 1).to(device=buf.device, dtype=torch.long)
+
+        return buf.gather(0, t)
 
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None):
         """
@@ -139,7 +143,6 @@ class NoiseScheduler(nn.Module):
         if noise is None:
             noise = torch.randn_like(x_t)
 
-        ab_t    = self._gather(self.alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
         ab_prev = self._gather(self.alpha_bars, t_prev).view(-1, *([1] * (x_t.dim()-1)))
         sigma   = self.ddim_sigma(t, t_prev, eta).view(-1, *([1] * (x_t.dim()-1)))
 
