@@ -31,8 +31,8 @@ class LLapDiT(nn.Module):
         attn_dropout: float = 0.0,
         self_conditioning: bool = False,
         context_dim: Optional[int] = None,
-        num_entities: int = None,                   # REQUIRED
-        context_len: int = 16,                      # number of learned query tokens in summary
+        num_entities: int = None,               # REQUIRED
+        tgt_len: int = 16,                      # number of learned query tokens in summary
     ):
         super().__init__()
         assert predict_type in ('eps', 'v'), "predict_type must be 'eps' or 'v'"
@@ -50,7 +50,7 @@ class LLapDiT(nn.Module):
             num_entities=num_entities,
             feat_dim=ctx_dim,
             hidden_dim=hidden_dim,
-            out_len=context_len,
+            out_len=tgt_len,
             num_heads=num_heads,
             lap_k=global_k,
         )
