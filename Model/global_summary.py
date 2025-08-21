@@ -101,7 +101,7 @@ class PolewiseDiff(nn.Module):
         return out.reshape(B, T, 2 * K)
 
 
-# ---------- 2nd-order PDE + Laplace combiner ----------
+# ---------- 2nd-order ODE + Laplace combiner ----------
 class SecondOrderLaplaceCombinerPolewise(nn.Module):
     """
     Implements the 2nd-order (damped) premise in Laplace space:
@@ -197,8 +197,8 @@ class ODELaplaceGuidedSummarizer(nn.Module):
         self.v_head = TVHead(feat_dim)
         self.t_head = TVHead(feat_dim)
 
-        # PDE + Laplace combiner (pole-wise derivative)
-        self.pde_lap = SecondOrderLaplaceCombinerPolewise(
+        # ODE + Laplace combiner (pole-wise derivative)
+        self.ode_lap = SecondOrderLaplaceCombinerPolewise(
             num_entities=num_entities, k=lap_k,
             physics_tied=physics_tied_derivative, residual_scale=residual_scale
         )
@@ -239,8 +239,8 @@ class ODELaplaceGuidedSummarizer(nn.Module):
         V_sig = self.v_head(x)                              # [B,T,N]   (level)
         T_sig = self.t_head(self._time_diff_feats(x))       # [B,T,N]   (from feature diff)
 
-        # 3) PDE + Laplace guidance in [B,T,2K]
-        L, lap_aux = self.pde_lap(T_sig, V_sig, dt=dt)             # [B,T,2K]
+        # 3) ODE + Laplace guidance in [B,T,2K]
+        L, lap_aux = self.ode_lap(T_sig, V_sig, dt=dt)             # [B,T,2K]
 
         # 4) FiLM on keys/values + per-head time bias
         film = self.lap_to_film(L)                          # [B,T,2H]
@@ -300,4 +300,5 @@ class ODELaplaceGuidedSummarizer(nn.Module):
 # x = torch.randn(8, T, N, F)
 # pad_mask = torch.zeros(8, T, dtype=torch.bool)  # or None
 # summary, aux = model(x, pad_mask)
+
 # print(summary.shape)  # -> [8, Lq, H]
