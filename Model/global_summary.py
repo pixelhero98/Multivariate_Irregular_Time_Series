@@ -101,7 +101,7 @@ class PolewiseDiff(nn.Module):
         return out.reshape(B, T, 2 * K)
 
 
-# ---------- 2nd-order ODE + Laplace combiner ----------
+# ---------- 2nd-order PDE + Laplace combiner ----------
 class SecondOrderLaplaceCombinerPolewise(nn.Module):
     """
     Implements the 2nd-order (damped) premise in Laplace space:
@@ -197,8 +197,8 @@ class ODELaplaceGuidedSummarizer(nn.Module):
         self.v_head = TVHead(feat_dim)
         self.t_head = TVHead(feat_dim)
 
-        # ODE + Laplace combiner (pole-wise derivative)
-        self.ode_lap = SecondOrderLaplaceCombinerPolewise(
+        # PDE + Laplace combiner (pole-wise derivative)
+        self.pde_lap = SecondOrderLaplaceCombinerPolewise(
             num_entities=num_entities, k=lap_k,
             physics_tied=physics_tied_derivative, residual_scale=residual_scale
         )
@@ -221,7 +221,11 @@ class ODELaplaceGuidedSummarizer(nn.Module):
         # Forward diff on feature tensor for T-head input (leading copy)
         return torch.diff(x, dim=1, prepend=x[:, :1])
 
-    def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None, dt: torch.Tensor | None = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(self,
+                x: torch.Tensor,
+                pad_mask: Optional[torch.Tensor] = None,
+                dt: torch.Tensor | None = None,
+                ctx_diff: torch.Tensor | None = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         x:        [B,T,N,F]
         pad_mask: [B,T] (True/1 = ignore padded steps) or None
@@ -236,11 +240,12 @@ class ODELaplaceGuidedSummarizer(nn.Module):
         K = Vv = ctx_h + pos                                # [B,T,H]
 
         # 2) Per-entity scalars
-        V_sig = self.v_head(x)                              # [B,T,N]   (level)
-        T_sig = self.t_head(self._time_diff_feats(x))       # [B,T,N]   (from feature diff)
+        V_sig = self.v_head(x)           # [B,T,N]   (level)
+        Tfeat = ctx_diff if ctx_diff is not None else self._time_diff_feats(x)   # Use dataside pre-compute to avoid artifacts
+        T_sig = self.t_head(Tfeat)       # [B,T,N]   (from feature diff)
 
-        # 3) ODE + Laplace guidance in [B,T,2K]
-        L, lap_aux = self.ode_lap(T_sig, V_sig, dt=dt)             # [B,T,2K]
+        # 3) PDE + Laplace guidance in [B,T,2K]
+        L, lap_aux = self.pde_lap(T_sig, V_sig, dt=dt)             # [B,T,2K]
 
         # 4) FiLM on keys/values + per-head time bias
         film = self.lap_to_film(L)                          # [B,T,2H]
@@ -282,23 +287,3 @@ class ODELaplaceGuidedSummarizer(nn.Module):
             **lap_aux
         }
         return summary, aux
-
-
-# ---------------------------
-# Minimal usage (example)
-# ---------------------------
-# N, F, T = 20, 6, 64
-# H, Lq, K, heads = 256, 16, 8, 4
-# model = ODELaplaceGuidedSummarizer(
-#     num_entities=N, feat_dim=F, hidden_dim=H, out_len=Lq,
-#     num_heads=heads, lap_k=K, dropout=0.1,
-#     add_guidance_tokens=True, physics_tied_derivative=True
-# )
-# # (Optional) tie derivative blocks to basis poles currently in laptrans:
-# model.tie_derivative_to_basis()
-#
-# x = torch.randn(8, T, N, F)
-# pad_mask = torch.zeros(8, T, dtype=torch.bool)  # or None
-# summary, aux = model(x, pad_mask)
-
-# print(summary.shape)  # -> [8, Lq, H]

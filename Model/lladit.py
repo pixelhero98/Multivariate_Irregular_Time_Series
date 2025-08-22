@@ -31,8 +31,8 @@ class LLapDiT(nn.Module):
         attn_dropout: float = 0.0,
         self_conditioning: bool = False,
         context_dim: Optional[int] = None,
-        num_entities: int = None,               # REQUIRED
-        tgt_len: int = 16,                      # number of learned query tokens in summary
+        num_entities: int = None,                   # REQUIRED
+        context_len: int = 16,                      # number of learned query tokens in summary
     ):
         super().__init__()
         assert predict_type in ('eps', 'v'), "predict_type must be 'eps' or 'v'"
@@ -50,7 +50,7 @@ class LLapDiT(nn.Module):
             num_entities=num_entities,
             feat_dim=ctx_dim,
             hidden_dim=hidden_dim,
-            out_len=tgt_len,
+            out_len=context_len,
             num_heads=num_heads,
             lap_k=global_k,
         )
@@ -83,7 +83,8 @@ class LLapDiT(nn.Module):
         series: Optional[torch.Tensor],
         cond_summary: Optional[torch.Tensor] = None,
         entity_ids: Optional[torch.Tensor] = None,
-        series_dt: Optional[torch.Tensor] = None,
+        ctx_dt: Optional[torch.Tensor] = None,
+        ctx_diff: Optional[torch.Tensor] = None
     ) -> Optional[torch.Tensor]:
         """
         Build or reuse the global context summary.
@@ -94,7 +95,7 @@ class LLapDiT(nn.Module):
         if series is None:
             return None
         # Build summary from historical context only (no imputation mask)
-        summary, _ = self.context(series, dt=series_dt)     # [B, Lq, H]
+        summary, _ = self.context(series, dt=ctx_dt, ctx_diff=ctx_diff)     # [B, Lq, H]
         return summary
 
     # -------------------------------
