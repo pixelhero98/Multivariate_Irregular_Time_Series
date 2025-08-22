@@ -44,6 +44,125 @@ def collate_keep_meta(batch):
 
 
 # --------------------- Dataset with optional meta (asset IDs / times) ---------------------
+
+def make_collate_level_and_firstdiff(
+    n_entities: int = 1,
+    group_by_end_time: bool = False,
+    pad_incomplete: str = "zeros",
+    target_mode: str = "all",
+    target_index: int = 0,
+    return_entity_mask: bool = True,
+):
+    """
+    Group rows by end-of-context timestamp, pack up to N entities, and return:
+      x = [V, T] with shapes [B, N, K, F]
+      y stacked across entities (or anchor if target_mode=="first")
+      meta['entity_mask'] marking real entities (True) vs padded (False)
+    """
+    import numpy as _np
+    import torch as _torch
+
+    def _diff_along_time(v: _torch.Tensor) -> _torch.Tensor:
+        t = _torch.zeros_like(v)
+        t[..., 1:, :] = v[..., 1:, :] - v[..., :-1, :]
+        return t
+
+    def _end_time_from_meta(m):
+        ct = m.get('ctx_times', None)
+        if ct is None: return None
+        if isinstance(ct, _np.ndarray): val = ct[-1]
+        else: val = ct
+        return int(_np.datetime64(val, 'ns').astype(_np.int64))
+
+    def _stack_meta(ms):
+        keys = set().union(*(m.keys() for m in ms)) if ms else set()
+        return {k: [m.get(k, None) for m in ms] for k in keys}
+
+    def _normalize_y(y):
+        return y if isinstance(y, _torch.Tensor) else _torch.as_tensor(y)
+
+    def _pack_group(samples):
+        xs = [_torch.as_tensor(s[0]) for s in samples]     # list of [K,F]
+        ys = [_normalize_y(s[1]) for s in samples]
+        ms = [s[2] for s in samples]
+        xN = _torch.stack(xs, dim=0).unsqueeze(0)          # [1,N,K,F]
+        def _squeeze_y(y):
+            if y.ndim == 2 and y.shape[-1] == 1: return y.squeeze(-1)
+            return y
+        ys_s = [_squeeze_y(y) for y in ys]
+        yN = _torch.stack(ys_s, dim=0)                     # [N,...]
+        mN = _stack_meta(ms)
+        return xN, yN, mN
+
+    def collate(batch):
+        if not group_by_end_time or n_entities == 1:
+            xs = [_torch.as_tensor(b[0]) for b in batch]
+            ys = [_normalize_y(b[1]) for b in batch]
+            ms = [b[2] for b in batch]
+            V = _torch.stack(xs, dim=0).unsqueeze(1)          # [B,1,K,F]
+            T = _diff_along_time(V)
+            def _sq(y):
+                return y if not (y.ndim == 2 and y.shape[-1] == 1) else y.squeeze(-1)
+            y = _torch.stack([_sq(y) for y in ys], dim=0)     # [B,H] or [B]
+            meta = _stack_meta(ms)
+            if return_entity_mask:
+                meta['entity_mask'] = _torch.ones(V.shape[0], 1, dtype=_torch.bool)
+            return [V, T], y, meta
+
+        buckets = {}
+        for x, y, m in batch:
+            k = _end_time_from_meta(m)
+            if k is None: return make_collate_level_and_firstdiff(1, False)(batch)
+            buckets.setdefault(k, []).append((x, y, m))
+
+        V_panels, T_panels, Y_panels, meta_panels, masks = [], [], [], [], []
+        for k in sorted(buckets.keys()):
+            g = buckets[k][:n_entities]
+            real_n = len(g)
+            if real_n < n_entities and pad_incomplete == "drop": continue
+            if real_n == 0: continue
+            V1, Y1, M1 = _pack_group(g)                      # V1:[1,real_n,K,F], Y1:[real_n,...]
+            if real_n < n_entities:
+                K = V1.shape[2]; F = V1.shape[3]; pad_n = n_entities - real_n
+                Vpad = _torch.zeros((1, pad_n, K, F), dtype=V1.dtype, device=V1.device)
+                V1 = _torch.cat([V1, Vpad], dim=1)           # [1,N,K,F]
+                y_tail = Y1.shape[1:]
+                Ypad = _torch.zeros((pad_n, *y_tail), dtype=Y1.dtype, device=Y1.device)
+                Y1 = _torch.cat([Y1, Ypad], dim=0)           # [N,...]
+                for kmeta in list(M1.keys()):
+                    vals = M1[kmeta]
+                    if isinstance(vals, list): M1[kmeta] = vals + [None]*pad_n
+                mask = _torch.zeros(n_entities, dtype=_torch.bool); mask[:real_n] = True
+            else:
+                mask = _torch.ones(n_entities, dtype=_torch.bool)
+            T1 = _diff_along_time(V1)
+            V_panels.append(V1); T_panels.append(T1); Y_panels.append(Y1); meta_panels.append(M1); masks.append(mask)
+
+        if not V_panels: return make_collate_level_and_firstdiff(1, False)(batch)
+
+        Vb = _torch.cat(V_panels, dim=0)                      # [B,N,K,F]
+        Tb = _torch.cat(T_panels, dim=0)                      # [B,N,K,F]
+        yb_all = _torch.stack(Y_panels, dim=0)                # [B,N,...]
+        yb = yb_all if target_mode == "all" else yb_all[:, target_index, ...]
+
+        def _merge_meta_list(Ms, key):
+            out = []
+            for M in Ms:
+                vals = M.get(key, None)
+                out.append(vals if isinstance(vals, list) else [vals])
+            return out
+        meta_out = {
+            'grouped_by': 'end_ctx_time',
+            'asset_id': _merge_meta_list(meta_panels, 'asset_id'),
+            'asset':    _merge_meta_list(meta_panels, 'asset'),
+            'ctx_times': _merge_meta_list(meta_panels, 'ctx_times'),
+        }
+        if return_entity_mask:
+            meta_out['entity_mask'] = _torch.stack(masks, dim=0)  # [B,N] bool
+        return [Vb, Tb], yb, meta_out
+
+    return collate
+
 @dataclass
 class CalendarConfig:
     include_dow: bool = True
@@ -138,9 +257,11 @@ class LabeledWindowWithMetaDataset(Dataset):
     def __len__(self): return self.X.shape[0]
 
     def __getitem__(self, idx: int):
-        x = torch.as_tensor(self.X[idx], dtype=torch.float32)      # [K,F]
+        #x = torch.as_tensor(self.X[idx], dtype=torch.float32)      # [K,F]
+        x = torch.tensor(self.X[idx], dtype=torch.float32)
         y_np = self.Y[idx]
-        y = torch.as_tensor(y_np, dtype=torch.float32) if self.regression else torch.tensor(int(y_np), dtype=torch.int64)
+        #y = torch.as_tensor(y_np, dtype=torch.float32) if self.regression else torch.tensor(int(y_np), dtype=torch.int64)
+        y = torch.tensor(y_np, dtype=torch.float32) if self.regression else torch.tensor(int(y_np), dtype=torch.int64)
         meta = {}
         if self.asset_ids is not None:
             aid = int(self.asset_ids[idx])
@@ -172,19 +293,41 @@ def _open_memmap(path: str, shape: Tuple[int, ...], dtype, mode='w+'):
 
 
 # --------------------- Stock prep (memmap-backed) ---------------------
+_EPS = 1e-6  # small positive, float32-friendly
+
+def _mask_nonpos(s: 'pd.Series') -> 'pd.Series':
+    # turn <=0 or non-finite into NaN to avoid log warnings
+    return s.where((s > 0) & np.isfinite(s))
+
+def _safe_log_series(s: 'pd.Series') -> 'pd.Series':
+    # compute log on a masked series; NaNs propagate but no warnings
+    return np.log(_mask_nonpos(s))
+
+def _safe_log1p_series(s: 'pd.Series') -> 'pd.Series':
+    # for counts (e.g., volume). allows zeros; guards extremely negative junk
+    return np.log1p(s.clip(lower=-1 + _EPS))
 
 def _safe_pct_change(s: 'pd.Series') -> 'pd.Series':
+    # unchanged behavior, but sanitize infinities that can appear when prev price is 0/NaN
     return s.pct_change().replace([np.inf, -np.inf], np.nan)
 
 def _log_return(s: 'pd.Series') -> 'pd.Series':
-    return np.log(s).diff()
+    # OLD: return np.log(s).diff()
+    # NEW: mask non-positive/invalid before log to avoid warnings & -inf
+    return _safe_log_series(s).diff()
 
 def _ewma_vol(ret: 'pd.Series', span: int = 20) -> 'pd.Series':
+    # unchanged
     return ret.pow(2).ewm(span=span, adjust=False).mean().pow(0.5)
 
 def _delta_log_volume(vol: 'pd.Series') -> 'pd.Series':
-    return np.log(vol.replace(0, np.nan)).diff()
-
+    # OLD: return np.log(vol.replace(0, np.nan)).diff()
+    # NEW: allow zero volume safely; avoid warnings from log(0)
+    # If you truly want Δlog(volume), zeros are undefined; return NaN there.
+    v = vol.replace([0, np.inf, -np.inf], np.nan)
+    return _safe_log_series(v).diff()
+    # If you’d rather a safer count-transform, you can alternatively use:
+    # return _safe_log1p_series(vol).diff()
 
 def prepare_stock_windows_and_cache_v2(
     tickers: List[str],
@@ -310,14 +453,24 @@ def prepare_stock_windows_and_cache_v2(
                     else:
                         feat[f'RET_{field.upper()}'] = _safe_pct_change(df[field])
             if feature_cfg.include_oc and 'Open' in df and 'Close' in df:
-                oc = (np.log(df['Close']) - np.log(df['Open'])) if feature_cfg.returns_mode == 'log' else (df['Close'] / df['Open'] - 1.0)
+                oc = (_safe_log_series(df['Close']) - _safe_log_series(df['Open'])
+                      if feature_cfg.returns_mode == 'log'
+                      else (df['Close'] / df['Open'] - 1.0))
                 feat['OC_RET'] = oc
+
+            # GAP (open vs prior close)
             if feature_cfg.include_gap and 'Open' in df and 'Close' in df:
-                gap = (np.log(df['Open']) - np.log(df['Close'].shift(1))) if feature_cfg.returns_mode == 'log' else (df['Open'] / df['Close'].shift(1) - 1.0)
+                gap = (_safe_log_series(df['Open']) - _safe_log_series(df['Close'].shift(1))
+                       if feature_cfg.returns_mode == 'log'
+                       else (df['Open'] / df['Close'].shift(1) - 1.0))
                 feat['GAP_RET'] = gap
+
             if feature_cfg.include_hl_range and 'High' in df and 'Low' in df:
-                hlr = (np.log(df['High']) - np.log(df['Low'])) if feature_cfg.returns_mode == 'log' else (df['High'] / df['Low'] - 1.0)
+                hlr = (_safe_log_series(df['High']) - _safe_log_series(df['Low'])
+                       if feature_cfg.returns_mode == 'log'
+                       else (df['High'] / df['Low'] - 1.0))
                 feat['HL_RANGE'] = hlr
+
             if feature_cfg.include_dlv and 'Volume' in df:
                 feat['DLV'] = _delta_log_volume(df['Volume'])
             if feature_cfg.include_rvol:
@@ -639,17 +792,31 @@ def load_dataloaders_with_meta_v2(
     pin_memory: Optional[bool] = None,
     return_meta_arrays: bool = False,
     seed: int = 1337,
+    n_entities: int = 8,
+    pad_incomplete: str = "zeros",
+    collate_fn=None,
+
 ):
+    
+    # Default to grouped-all collate if none provided
+    if collate_fn is None:
+        collate_fn = make_collate_level_and_firstdiff(
+            n_entities=n_entities,
+            group_by_end_time=True,
+            pad_incomplete=pad_incomplete,
+            target_mode="all",
+            return_entity_mask=True,
+        )
     meta_path = _meta_path(data_dir)
     if not os.path.exists(meta_path):
         raise FileNotFoundError(f"Missing {meta_path}. Run prepare_stock_windows_and_cache_v2(...) first.")
     with open(meta_path, 'r') as f:
         meta = json.load(f)
     assets = meta['assets']
-
+    
     if _memmap_exists(data_dir):
         mem_dir = _memmap_dir(data_dir)
-
+    
         def mk_ds(prefix: str):
             X, Y, I, CT, YT = _open_split_memmaps(mem_dir, prefix)
             # Ensure Y is [N,H] or [N,H,1]
@@ -658,49 +825,49 @@ def load_dataloaders_with_meta_v2(
             elif Y.ndim == 2 and not regression:
                 pass
             return LabeledWindowWithMetaDataset(X, Y, I, assets, CT, YT, regression=regression)
-
+    
         ds_tr = mk_ds('train'); ds_va = mk_ds('val'); ds_te = mk_ds('test')
         pin = torch.cuda.is_available() if pin_memory is None else pin_memory
         gen = torch.Generator(); gen.manual_seed(seed)
-
+    
         def mk_loader(ds, split):
             return DataLoader(
                 ds, batch_size=batch_size, shuffle=(split=='train' and shuffle_train),
                 pin_memory=pin, num_workers=num_workers, persistent_workers=False,
-                generator=gen, collate_fn=collate_keep_meta,
+                generator=gen, collate_fn=(collate_fn or collate_keep_meta),
             )
         train_dl = mk_loader(ds_tr, 'train'); val_dl = mk_loader(ds_va, 'val'); test_dl = mk_loader(ds_te, 'test')
         lengths = (len(ds_tr), len(ds_va), len(ds_te))
         if return_meta_arrays:
             return train_dl, val_dl, test_dl, lengths, (None, meta)
         return train_dl, val_dl, test_dl, lengths
-
+    
     # Fallback to legacy NPZ (RAM heavy, not recommended).
     z = _load_legacy_npz(data_dir)
-
+    
     def mk_ds(prefix: str):
         X = z[f'{prefix}_X']; Y = z[f'{prefix}_Y']; ids = z.get(f'{prefix}_asset_id')
         ctx_t = z.get(f'{prefix}_ctx_times'); y_t = z.get(f'{prefix}_y_times')
         return LabeledWindowWithMetaDataset(X, Y, ids, assets, ctx_t, y_t, regression=regression)
-
+    
     ds_tr = mk_ds('train'); ds_va = mk_ds('val'); ds_te = mk_ds('test')
     pin = torch.cuda.is_available() if pin_memory is None else pin_memory
     gen = torch.Generator(); gen.manual_seed(seed)
-
+    
     def mk_loader(ds, split):
         return DataLoader(
             ds, batch_size=batch_size, shuffle=(split=='train' and shuffle_train),
             pin_memory=pin, num_workers=num_workers, persistent_workers=False,
-            generator=gen, collate_fn=collate_keep_meta,
+            generator=gen, collate_fn=(collate_fn or collate_keep_meta),
         )
     train_dl = mk_loader(ds_tr, 'train'); val_dl = mk_loader(ds_va, 'val'); test_dl = mk_loader(ds_te, 'test')
     lengths = (len(ds_tr), len(ds_va), len(ds_te))
     if return_meta_arrays:
         return train_dl, val_dl, test_dl, lengths, (z, meta)
     return train_dl, val_dl, test_dl, lengths
-
-
-# --------------------- Chronological ratio split loader (memmap-backed) ------------------
+    
+    
+    # --------------------- Chronological ratio split loader (memmap-backed) ------------------
 
 class _ConcatIndexDataset(Dataset):
     """Read-only view over multiple underlying splits by index tuples (split_id, idx)."""
@@ -722,9 +889,11 @@ class _ConcatIndexDataset(Dataset):
     def __getitem__(self, i: int):
         sid, local_idx = self.order[i]
         X, Y, IDs, CT, YT = self.splits[sid]
-        x = torch.as_tensor(X[local_idx], dtype=torch.float32)
+        #x = torch.as_tensor(X[local_idx], dtype=torch.float32)
+        x = torch.tensor(X[local_idx], dtype=torch.float32)
         y_np = Y[local_idx]
-        y = torch.as_tensor(y_np, dtype=torch.float32) if self.regression else torch.tensor(int(y_np), dtype=torch.int64)
+        # y = torch.as_tensor(y_np, dtype=torch.float32) if self.regression else torch.tensor(int(y_np), dtype=torch.int64)
+        y = torch.tensor(y_np, dtype=torch.float32) if self.regression else torch.tensor(int(y_np), dtype=torch.int64)
         meta = {}
         aid = int(IDs[local_idx])
         meta['asset_id'] = aid; meta['asset'] = self.assets[aid]
@@ -745,14 +914,28 @@ def load_dataloaders_with_ratio_split(
     num_workers=0,
     pin_memory=None,
     seed=1337,
+    n_entities: int = 8,
+    pad_incomplete: str = "zeros",
+    collate_fn=None,
+
 ):
+    
+    # Default to grouped-all collate if none provided
+    if collate_fn is None:
+        collate_fn = make_collate_level_and_firstdiff(
+            n_entities=n_entities,
+            group_by_end_time=True,
+            pad_incomplete=pad_incomplete,
+            target_mode="all",
+            return_entity_mask=True,
+        )
     meta_path = _meta_path(data_dir)
     if not os.path.exists(meta_path):
         raise FileNotFoundError(f"Missing {meta_path}. Build cache first.")
     with open(meta_path, 'r') as f:
         meta = json.load(f)
     assets = meta.get('assets', None)
-
+    
     # Prefer memmap cache
     if _memmap_exists(data_dir):
         mem_dir = _memmap_dir(data_dir)
@@ -767,16 +950,16 @@ def load_dataloaders_with_ratio_split(
             else:
                 end_ctx = None
             end_parts.append(end_ctx)
-
+    
         if not parts:
             raise RuntimeError("No memmap data found")
-
+    
         # Build flattened (split_id, local_idx) list without concatenating arrays
         # and compute ordering by (asset_id, end_ctx_time)
         global_list = []  # will hold tuples (split_id, local_idx)
         asset_ids   = []  # parallel list of asset ids
         end_times   = []  # parallel list of end-of-context times
-
+    
         for sid, (X, Y, IDs, CT, YT) in enumerate(parts):
             N = X.shape[0]
             idxs = np.arange(N, dtype=np.int64)
@@ -786,15 +969,15 @@ def load_dataloaders_with_ratio_split(
             if end_ctx is None:
                 raise RuntimeError("End-of-context times missing; rebuild cache with keep_time_meta != 'none'.")
             end_times.append(end_ctx)
-
+    
         global_idx = np.concatenate(global_list, axis=0)      # [M,2]
         all_ids    = np.concatenate(asset_ids, axis=0)        # [M]
         all_ends   = np.concatenate(end_times, axis=0)        # [M]
-
+    
         order = np.lexsort((all_ends, all_ids))               # chronological within asset
         global_idx = global_idx[order]
         all_ids = all_ids[order]
-
+    
         # Compute assignments (vectorized) without materializing data
         def _split_counts(n, tr, vr, te):
             s = float(tr + vr + te)
@@ -806,7 +989,7 @@ def load_dataloaders_with_ratio_split(
                 if van == 0 and n - trn >= 2: van, ten = 1, ten - 1
                 if ten == 0: ten = 1
             return trn, van, ten
-
+    
         assign = np.empty(global_idx.shape[0], dtype=np.uint8)
         if per_asset:
             for aid in np.unique(all_ids):
@@ -820,34 +1003,34 @@ def load_dataloaders_with_ratio_split(
             n = global_idx.shape[0]
             trn, van, ten = _split_counts(n, train_ratio, val_ratio, test_ratio)
             assign[:trn] = 0; assign[trn:trn+van] = 1; assign[trn+van:] = 2
-
+    
         # Build datasets as index views
         tr_order = global_idx[assign==0]
         va_order = global_idx[assign==1]
         te_order = global_idx[assign==2]
-
+    
         ds_tr = _ConcatIndexDataset(parts, (0,1,2), tr_order, assets, regression=regression)
         ds_va = _ConcatIndexDataset(parts, (0,1,2), va_order, assets, regression=regression)
         ds_te = _ConcatIndexDataset(parts, (0,1,2), te_order, assets, regression=regression)
-
+    
         if pin_memory is None: pin_memory = torch.cuda.is_available()
         gen = torch.Generator(); gen.manual_seed(seed)
-
+    
         def _mk(ds, split):
             return DataLoader(
                 ds, batch_size=batch_size, shuffle=(split=='train' and shuffle_train),
                 pin_memory=pin_memory, num_workers=num_workers, persistent_workers=False,
-                generator=gen, collate_fn=collate_keep_meta,
+                generator=gen, collate_fn=(collate_fn or collate_keep_meta),
             )
-
+    
         train_dl = _mk(ds_tr, 'train')
         val_dl   = _mk(ds_va, 'val')
         test_dl  = _mk(ds_te, 'test')
         return train_dl, val_dl, test_dl, (len(ds_tr), len(ds_va), len(ds_te))
-
+    
     # Fallback to legacy NPZ (RAM heavy). We keep the prior logic for compatibility.
     z = _load_legacy_npz(data_dir)
-
+    
     parts = []
     end_parts = []
     for p in ('train', 'val', 'test'):
@@ -858,9 +1041,9 @@ def load_dataloaders_with_ratio_split(
         parts.append((X, Y, ids, ctx_t, y_t))
         end_ctx = ctx_t[:, -1] if (ctx_t is not None and ctx_t.ndim == 2) else ctx_t
         end_parts.append(end_ctx)
-
+    
     if not parts: raise RuntimeError("No data found in cache_v2.npz")
-
+    
     X_all   = np.concatenate([p[0] for p in parts], axis=0)
     Y_all   = np.concatenate([p[1] for p in parts], axis=0)
     IDS_all = np.concatenate([p[2] for p in parts], axis=0).astype(np.int32)
@@ -869,15 +1052,15 @@ def load_dataloaders_with_ratio_split(
     end_ctx_all = np.concatenate(end_parts, axis=0) if (end_parts and end_parts[0] is not None) else None
     if end_ctx_all is None: raise RuntimeError("End-of-context times missing; rebuild cache with keep_time_meta != 'none'.")
     order = np.lexsort((end_ctx_all, IDS_all))
-
+    
     X_all, Y_all, IDS_all = X_all[order], Y_all[order], IDS_all[order]
     if CT_all is not None: CT_all = CT_all[order]
     if YT_all is not None: YT_all = YT_all[order]
     end_ctx_all = end_ctx_all[order]
-
+    
     n = X_all.shape[0]
     assign = np.empty(n, dtype=np.uint8)
-
+    
     def _split_counts(n, tr, vr, te):
         s = float(tr + vr + te)
         trn = int(np.floor(n * (tr / s)))
@@ -888,7 +1071,7 @@ def load_dataloaders_with_ratio_split(
             if van == 0 and n - trn >= 2: van, ten = 1, ten - 1
             if ten == 0: ten = 1
         return trn, van, ten
-
+    
     if per_asset:
         for aid in np.unique(IDS_all):
             idx = np.nonzero(IDS_all == aid)[0]
@@ -901,9 +1084,9 @@ def load_dataloaders_with_ratio_split(
     else:
         trn, van, ten = _split_counts(n, train_ratio, val_ratio, test_ratio)
         assign[:trn] = 0; assign[trn:trn+van] = 1; assign[trn+van:] = 2
-
+    
     m_tr = (assign == 0); m_va = (assign == 1); m_te = (assign == 2)
-
+    
     ds_tr = LabeledWindowWithMetaDataset(X_all[m_tr], Y_all[m_tr], IDS_all[m_tr], assets,
                                          CT_all[m_tr] if CT_all is not None else None,
                                          YT_all[m_tr] if YT_all is not None else None,
@@ -916,17 +1099,17 @@ def load_dataloaders_with_ratio_split(
                                          CT_all[m_te] if CT_all is not None else None,
                                          YT_all[m_te] if YT_all is not None else None,
                                          regression=regression)
-
+    
     if pin_memory is None: pin_memory = torch.cuda.is_available()
     gen = torch.Generator(); gen.manual_seed(seed)
-
+    
     def _mk(ds, split):
         return DataLoader(
             ds, batch_size=batch_size, shuffle=(split == 'train' and shuffle_train),
             pin_memory=pin_memory, num_workers=num_workers, persistent_workers=False,
-            generator=gen, collate_fn=collate_keep_meta,
+            generator=gen, collate_fn=(collate_fn or collate_keep_meta),
         )
-
+    
     train_dl = _mk(ds_tr, 'train')
     val_dl   = _mk(ds_va, 'val')
     test_dl  = _mk(ds_te, 'test')
