@@ -78,28 +78,16 @@ class LLapDiT(nn.Module):
         te = F.silu(te)
         return te
 
-    def _maybe_build_cond(
-        self,
-        series: Optional[torch.Tensor],
-        cond_summary: Optional[torch.Tensor] = None,
-        entity_ids: Optional[torch.Tensor] = None,
-        ctx_dt: Optional[torch.Tensor] = None,
-        ctx_diff: Optional[torch.Tensor] = None
-    ) -> Optional[torch.Tensor]:
-        """
-        Build or reuse the global context summary.
-        Do NOT use observation/imputation masks here. Padding masks only (if ever needed).
-        """
-        if cond_summary is not None:
+    def _maybe_build_cond(self, series, cond_summary=None, entity_ids=None,
+                          ctx_dt=None, ctx_diff=None, entity_mask=None):
+        if cond_summary is not None or series is None:
             return cond_summary
-        if series is None:
-            return None
-        # Build summary from historical context only (no imputation mask)
-        summary, _ = self.context(series, dt=ctx_dt, ctx_diff=ctx_diff)     # [B, Lq, H]
+        summary, _ = self.context(series, dt=ctx_dt, ctx_diff=ctx_diff,
+                                  entity_mask=entity_mask)  # <- pass it down
         return summary
 
     # -------------------------------
-    # U-Net call
+    # Forward call
     # -------------------------------
     def forward(
         self,
@@ -117,7 +105,14 @@ class LLapDiT(nn.Module):
         """
         Predict native param ('eps' or 'v') at timestep t for x_t.
         """
-        cond_summary = self._maybe_build_cond(series, cond_summary, entity_ids, series_dt=series_dt)
+        cond_summary = self._maybe_build_cond(
+            series,
+            cond_summary=cond_summary,
+            entity_ids=entity_ids,
+            ctx_dt=series_dt,  # was misnamed earlier
+            ctx_diff=None,  # if you precompute diff, pass it here
+            entity_mask=series_mask  # <- use it
+        )
         t_emb = self._time_embed(t).to(x_t.dtype)
         raw = self.model(x_t, t_emb, cond_summary=cond_summary, sc_feat=sc_feat, dt=dt)
         return raw
@@ -195,7 +190,13 @@ class LLapDiT(nn.Module):
 
         # ----- prepare -----
         x_t = torch.randn(B, L, D, device=device) if x_T is None else x_T.to(device)
-        summary = self._maybe_build_cond(series, cond_summary, entity_ids, series_dt=series_dt)
+        summary = self._maybe_build_cond(
+            series,
+            cond_summary=cond_summary,
+            entity_ids=entity_ids,
+            ctx_dt=series_dt,
+            entity_mask=series_mask,
+        )
 
         T = int(self.scheduler.timesteps)
         step_indices = _karras_step_indices(T, int(steps))

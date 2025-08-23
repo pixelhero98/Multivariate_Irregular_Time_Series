@@ -101,7 +101,7 @@ class PolewiseDiff(nn.Module):
         return out.reshape(B, T, 2 * K)
 
 
-# ---------- 2nd-order PDE + Laplace combiner ----------
+# ---------- 2nd-order ODE + Laplace combiner ----------
 class SecondOrderLaplaceCombinerPolewise(nn.Module):
     """
     Implements the 2nd-order (damped) premise in Laplace space:
@@ -112,10 +112,14 @@ class SecondOrderLaplaceCombinerPolewise(nn.Module):
     Inputs:  T_sig, V_sig ∈ [B,T,N]
     Output:  L ∈ [B,T,2K]  (guidance features)
     """
-    def __init__(self, num_entities: int, k: int, physics_tied: bool = True, residual_scale: float = 0.05):
+    def __init__(self, num_entities: int, k: int,
+                 physics_tied: bool = True, residual_scale: float = 0.05,
+                 renorm_by_fill: bool = False):  # <- NEW arg (default off)
         super().__init__()
-        self.lap = LearnableLaplacianBasis(k=k, feat_dim=num_entities)  # [B,T,N] -> [B,T,2K]
+        self.lap = LearnableLaplacianBasis(k=k, feat_dim=num_entities)
         self.diff = PolewiseDiff(k, physics_tied=physics_tied, residual_scale=residual_scale)
+        self.num_entities = num_entities  # <- for renorm
+        self.renorm_by_fill = renorm_by_fill
 
         # Optionally bind derivative blocks to poles from the basis (no hard dep).
         if physics_tied:
@@ -129,32 +133,83 @@ class SecondOrderLaplaceCombinerPolewise(nn.Module):
         )
 
     @staticmethod
+    def _masked_mean(x: torch.Tensor, m: torch.Tensor, dim: int = -1, eps: float = 1e-6):
+        """Mean over `dim` with mask m∈{0,1} broadcastable to x."""
+        num = (x * m).sum(dim=dim)
+        den = m.sum(dim=dim).clamp_min(eps)
+        return num / den
+
+    @staticmethod
     def _forward_diff(x: torch.Tensor) -> torch.Tensor:
         # Only used to make the coefficient conditioner aware of trend changes; not for the derivative path.
         return torch.diff(x, dim=1, prepend=x[:, :1])
 
-    def forward(self, T_sig: torch.Tensor, V_sig: torch.Tensor, dt: torch.Tensor | None = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        # Stats for a tiny time-varying numerator conditioner (shared across entities)
-        stats = torch.stack([
-            T_sig.mean(-1),                           # [B,T]
-            V_sig.mean(-1),                           # [B,T]
-            self._forward_diff(T_sig).mean(-1),       # [B,T]
-            self._forward_diff(V_sig).mean(-1),       # [B,T]
-        ], dim=-1)                                    # [B,T,4]
-        coeff = self.num_head(stats)                  # [B,T,4]
+    def forward(self,
+                T_sig: torch.Tensor,  # [B,T,N]
+                V_sig: torch.Tensor,  # [B,T,N]
+                dt: torch.Tensor | None = None,
+                entity_mask: torch.Tensor | None = None  # <- NEW (optional)
+                ) -> Tuple[torch.Tensor, Dict]:
+        B, T, N = T_sig.shape
+        device = T_sig.device
+        dtype = T_sig.dtype
+
+        # Build [B,T,N] mask if provided
+        mN = None
+        if entity_mask is not None:
+            mN = entity_mask.to(device=device, dtype=dtype)  # [B,N] or [B,1,N] or [B,T,N]
+            if mN.dim() == 2:  # [B,N] -> [B,1,N]
+                mN = mN.unsqueeze(1)
+            if mN.dim() == 3 and mN.shape[1] == 1:  # [B,1,N] -> [B,T,N]
+                mN = mN.expand(B, T, N)
+            elif mN.dim() == 3 and mN.shape[1] == T:
+                pass  # already [B,T,N]
+            else:
+                raise ValueError("entity_mask must be [B,N], [B,1,N], or [B,T,N]")
+
+            # Zero out padded entities conservatively
+            T_sig = T_sig * mN
+            V_sig = V_sig * mN
+
+        # ---- Tiny numerator conditioner (masked stats over entity axis) ----
+        dT = self._forward_diff(T_sig)  # [B,T,N]
+        dV = self._forward_diff(V_sig)  # [B,T,N]
+
+        if mN is None:
+            s_T = T_sig.mean(dim=-1)  # [B,T]
+            s_V = V_sig.mean(dim=-1)
+            s_dT = dT.mean(dim=-1)
+            s_dV = dV.mean(dim=-1)
+        else:
+            s_T = self._masked_mean(T_sig, mN, dim=-1)
+            s_V = self._masked_mean(V_sig, mN, dim=-1)
+            s_dT = self._masked_mean(dT, mN, dim=-1)
+            s_dV = self._masked_mean(dV, mN, dim=-1)
+
+        stats = torch.stack([s_T, s_V, s_dT, s_dV], dim=-1)  # [B,T,4]
+        coeff = self.num_head(stats)  # [B,T,4]
         a0, a1, b0, b1 = torch.unbind(coeff, dim=-1)  # each [B,T]
 
-        # Laplace features + pole-wise time-derivatives (no raw differencing)
-        LT  = self.lap(T_sig, dt=dt)                         # [B,T,2K]
-        LV  = self.lap(V_sig, dt=dt)                         # [B,T,2K]
-        LdT = self.diff(LT)                           # [B,T,2K]
-        LdV = self.diff(LV)                           # [B,T,2K]
+        # ---- Optional renorm by fill ratio (stabilize amplitude across fill) ----
+        if (mN is not None) and self.renorm_by_fill and (self.num_entities > 0):
+            real = mN.sum(dim=-1, keepdim=True).clamp_min(1.0)  # [B,T,1] count of real entities
+            scale = (float(self.num_entities) / real).to(dtype=dtype)  # [B,T,1]
+            T_in = T_sig * scale
+            V_in = V_sig * scale
+        else:
+            T_in, V_in = T_sig, V_sig
+
+        # ---- Laplace features + pole-wise derivative ----
+        LT = self.lap(T_in, dt=dt)  # [B,T,2K]
+        LV = self.lap(V_in, dt=dt)  # [B,T,2K]
+        LdT = self.diff(LT)  # [B,T,2K]
+        LdV = self.diff(LV)  # [B,T,2K]
 
         # Combine per numerator (broadcast over 2K)
         L = (a0.unsqueeze(-1) * LT
-           + a1.unsqueeze(-1) * LdT
-           + b0.unsqueeze(-1) * LV
-           + b1.unsqueeze(-1) * LdV)                  # [B,T,2K]
+             + a1.unsqueeze(-1) * LdT
+             + b0.unsqueeze(-1) * LV
+             + b1.unsqueeze(-1) * LdV)  # [B,T,2K]
 
         aux = {"LT": LT, "LV": LV, "LdT": LdT, "LdV": LdV, "coeff": coeff}
         return L, aux
@@ -221,11 +276,15 @@ class ODELaplaceGuidedSummarizer(nn.Module):
         # Forward diff on feature tensor for T-head input (leading copy)
         return torch.diff(x, dim=1, prepend=x[:, :1])
 
-    def forward(self,
-                x: torch.Tensor,
-                pad_mask: Optional[torch.Tensor] = None,
-                dt: torch.Tensor | None = None,
-                ctx_diff: torch.Tensor | None = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(
+            self,
+            x: torch.Tensor,  # [B,T,N,F]
+            pad_mask: Optional[torch.Tensor] = None,  # [B,T] (True=ignore)
+            dt: torch.Tensor | None = None,
+            ctx_diff: torch.Tensor | None = None,
+            entity_mask: torch.Tensor | None = None,  # [B,N] or [B,1,N] or [B,T,N]
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+
         """
         x:        [B,T,N,F]
         pad_mask: [B,T] (True/1 = ignore padded steps) or None
@@ -233,53 +292,83 @@ class ODELaplaceGuidedSummarizer(nn.Module):
         B, T, N, F = x.shape
         device = x.device
 
-        # 1) Context memory (flatten N,F -> project -> add time pos)
-        ctx = x.reshape(B, T, N * F)                        # [B,T,NF]
-        ctx_h = self.ctx_proj(ctx)                          # [B,T,H]
-        pos = _pos_emb(T, self.H, device=device).unsqueeze(0)  # [1,T,H]
-        K = Vv = ctx_h + pos                                # [B,T,H]
+        mN = None
+        if entity_mask is not None:
+            mN = entity_mask.to(device=x.device, dtype=x.dtype)
+            if mN.dim() == 2:  # [B,N] -> [B,1,N]
+                mN = mN.unsqueeze(1)
+            if mN.size(1) == 1:  # [B,1,N] -> [B,T,N]
+                mN = mN.expand(B, T, N)
+            x = x * mN.unsqueeze(-1)  # zero padded entities in features
 
-        # 2) Per-entity scalars
-        V_sig = self.v_head(x)           # [B,T,N]   (level)
-        Tfeat = ctx_diff if ctx_diff is not None else self._time_diff_feats(x)   # Use dataside pre-compute to avoid artifacts
-        T_sig = self.t_head(Tfeat)       # [B,T,N]   (from feature diff)
+        ctx = x.reshape(B, T, N * F)  # [B,T,NF]
+        ctx_h = self.ctx_proj(ctx)  # [B,T,H]
+        pos = _pos_emb(T, self.H, device=device)  # [1,T,H]
+        K = Vv = ctx_h + pos  # [B,T,H]
+
+        # ----------------------------------------
+        # 2) Per-entity scalars (masked where pad)
+        # ----------------------------------------
+        V_sig = self.v_head(x)  # [B,T,N]
+        Tfeat = ctx_diff if ctx_diff is not None else self._time_diff_feats(x)
+        # If ctx_diff was precomputed upstream (unmasked), mask it here:
+        if mN is not None and ctx_diff is not None:
+            if Tfeat.dim() == 4:  # [B,T,N,*]
+                Tfeat = Tfeat * mN.unsqueeze(-1)
+            else:  # [B,T,N]
+                Tfeat = Tfeat * mN
+        T_sig = self.t_head(Tfeat)  # [B,T,N]
+
+        if mN is not None:
+            V_sig = V_sig * mN
+            T_sig = T_sig * mN
 
         # 3) PDE + Laplace guidance in [B,T,2K]
-        L, lap_aux = self.pde_lap(T_sig, V_sig, dt=dt)             # [B,T,2K]
+        try:
+            L, lap_aux = self.pde_lap(T_sig, V_sig, dt=dt, entity_mask=mN)
+        except TypeError:
+            L, lap_aux = self.pde_lap(T_sig, V_sig, dt=dt)
 
-        # 4) FiLM on keys/values + per-head time bias
-        film = self.lap_to_film(L)                          # [B,T,2H]
-        gamma, beta = torch.chunk(film, 2, dim=-1)          # [B,T,H] each
+        # ----------------------------------------
+        # 4) FiLM + per-head time bias
+        # ----------------------------------------
+        film = self.lap_to_film(L)  # [B,T,2H]
+        gamma, beta = torch.chunk(film, 2, dim=-1)  # [B,T,H] each
         K = (1.0 + gamma) * K + beta
         Vv = (1.0 + gamma) * Vv + beta
 
-        # Per-head additive time bias for attention logits.
-        # attn_mask expects float; shape can be (B*heads, Lq, S) for per-batch biases.
-        bias_ht = self.lap_to_bias(L)                       # [B,T,heads]
+        # Per-head additive time bias for attention logits
+        bias_ht = self.lap_to_bias(L)  # [B,T,heads]
         Lq = self.queries.shape[0]
         attn_bias = bias_ht.permute(0, 2, 1).unsqueeze(2).expand(B, self.num_heads, Lq, T)
         attn_bias = attn_bias.reshape(B * self.num_heads, Lq, T).to(K.dtype)  # [(B*heads), Lq, T]
 
-        # Optional: append guidance tokens
-        if self.add_guidance_tokens:
-            lap_tokens = self.lap_token_proj(L)             # [B,T,H]
-            memory = torch.cat([K, lap_tokens], dim=1)      # [B, 2T, H]
-            values = torch.cat([Vv, lap_tokens], dim=1)     # [B, 2T, H]
+        # ----------------------------------------
+        # 5) Optional guidance tokens branch
+        # ----------------------------------------
+        if getattr(self, "add_guidance_tokens", False):
+            lap_tokens = self.lap_token_proj(L)  # [B,T,H]
+            memory = torch.cat([K, lap_tokens], dim=1)  # [B, 2T, H]
+            values = torch.cat([Vv, lap_tokens], dim=1)  # [B, 2T, H]
+
             zeros_bias = torch.zeros(B * self.num_heads, Lq, T, device=device, dtype=attn_bias.dtype)
             attn_bias = torch.cat([attn_bias, zeros_bias], dim=-1)  # [(B*heads), Lq, 2T]
-            key_padding_mask = None if pad_mask is None else torch.cat(
-                [pad_mask.to(torch.bool), torch.zeros(B, T, device=device, dtype=torch.bool)], dim=1
-            )
+
+            key_padding_mask = (None if pad_mask is None else
+                                torch.cat([pad_mask.to(torch.bool),
+                                           torch.zeros(B, T, device=device, dtype=torch.bool)], dim=1))
         else:
             memory, values = K, Vv
             key_padding_mask = None if pad_mask is None else pad_mask.to(torch.bool)
 
-        # 5) Cross-attention from learned queries
-        Q = self.queries.unsqueeze(0).expand(B, -1, -1)     # [B,Lq,H]
+        # ----------------------------------------
+        # 6) Cross-attention from learned queries
+        # ----------------------------------------
+        Q = self.queries.unsqueeze(0).expand(B, -1, -1)  # [B,Lq,H]
         summary, _ = self.mha(Q, memory, values,
                               key_padding_mask=key_padding_mask,
-                              attn_mask=attn_bias)          # [B,Lq,H]
-        summary = self.norm(self.dropout(summary) + Q)      # residual on queries
+                              attn_mask=attn_bias)  # [B,Lq,H]
+        summary = self.norm(self.dropout(summary) + Q)  # residual on queries
 
         aux = {
             "T": T_sig, "V": V_sig,
