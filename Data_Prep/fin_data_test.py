@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 
 
-mod = importlib.import_module('fin_data_prep_ratio_indexcache')
+mod = importlib.import_module('fin_data_prep_ratiosp_indexcache')
 Tickers = []
 file_path = './The_Ticker_file.txt'
 with open(file_path, 'r') as file:
@@ -118,12 +118,13 @@ train_dl, val_dl, test_dl, sizes = mod.load_dataloaders_with_ratio_split(
     train_ratio=0.7, val_ratio=0.1, test_ratio=0.2,
     n_entities=N,
     shuffle_train=False,
-    coverage_per_window=0.8,     # enforce min entities per date group, date below which will be dropped
+    coverage_per_window=0.8,     # enforce min entities per date group
     date_batching=True,
-    dates_per_batch=64,          # enforce diversity in batch
+    dates_per_batch=64,
     collate_fn=panel_collate,
-    window=120,
-    horizon=10
+    window=K,
+    horizon=H,
+    norm_scope="train_only"
 )
 print("sizes (train,val,test):", sizes)
 
@@ -156,3 +157,4 @@ ok = all(
     for b in range(M.shape[0])
 )
 print("same DATE per panel?", ok)
+
