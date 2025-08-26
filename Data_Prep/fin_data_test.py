@@ -53,6 +53,7 @@ FEATURES_DIR = f"{DATA_DIR}/features"  # your per-ticker parquet/pickle files li
 #     keep_time_meta="end",
 # )
 
+# ============== Statistic Check of Loaded Dataset ==============
 with open(f"{DATA_DIR}/cache_ratio_index/meta.json", "r") as f:
     assets = json.load(f)["assets"]
 N = len(assets)
