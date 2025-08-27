@@ -42,23 +42,18 @@ class TransformerDecoderBlock(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, input_dim, seq_len, latent_dim, num_layers=2, num_heads=4, ff_dim=256):
+    def __init__(self, input_dim, seq_len, latent_dim,
+                 num_layers=2, num_heads=4, ff_dim=256, dropout=0.1):
         super().__init__()
-        self.pos_emb     = nn.Parameter(torch.randn(1, seq_len, latent_dim))
-        self.input_proj  = nn.Linear(input_dim, latent_dim)
-
-        # stack of Transformer‐encoder layers (d_model=latent_dim)
+        self.pos_emb    = nn.Parameter(torch.randn(1, seq_len, latent_dim))
+        self.input_proj = nn.Linear(input_dim, latent_dim)
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
-                d_model=latent_dim,
-                nhead=num_heads,
-                dim_feedforward=ff_dim,
-                activation='gelu',
-                batch_first=True
-            )
-            for _ in range(num_layers)
+                d_model=latent_dim, nhead=num_heads,
+                dim_feedforward=ff_dim, dropout=dropout,
+                activation='gelu', batch_first=True, norm_first=True
+            ) for _ in range(num_layers)
         ])
-
         self.joint_proj = nn.Linear(latent_dim, latent_dim)
 
     def forward(self, x):
@@ -74,19 +69,14 @@ class TransformerEncoder(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, latent_dim, seq_len, num_layers=2, num_heads=4, ff_dim=256, input_dim=None):
+    def __init__(self, latent_dim, seq_len, num_layers=2, num_heads=4, ff_dim=256,
+                 input_dim=None, dropout=0.1):
         super().__init__()
         self.pos_emb = nn.Parameter(torch.randn(1, seq_len, latent_dim))
-
         self.layers = nn.ModuleList([
-            TransformerDecoderBlock(
-                d_model=latent_dim,
-                nhead=num_heads,
-                dim_feedforward=ff_dim
-            )
+            TransformerDecoderBlock(latent_dim, num_heads, ff_dim, dropout=dropout)
             for _ in range(num_layers)
         ])
-
         self.out_proj = nn.Linear(latent_dim, input_dim)
 
     def forward(self, z, encoder_skips=None):
@@ -143,7 +133,7 @@ class LatentVAE(nn.Module):
     
         # VAE bottleneck
         mu     = self.mu_head(z_last)               # [B, T, D]
-        logvar = self.logvar_head(z_last)           # [B, T, D]
+        logvar = self.logvar_head(z_last).clamp(min=-10.0, max=10.0)         # [B, T, D]
         z_sample = self.reparameterize(mu, logvar)  # [B, T, D]
     
         # decode with skips (use encoder_hidden_states)
