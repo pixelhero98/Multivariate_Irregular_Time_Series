@@ -3,47 +3,64 @@ from latent_vae import LatentVAE
 import torch.nn.functional as F
 import torch
 import os
+import json, importlib, torch
+import pandas as pd
+import numpy as np
+
+
+mod = importlib.import_module('fin_data_prep_ratiosp_indexcache')
 
 # -------------------- Config --------------------
-TICKERS = [
-    'AAPL','MSFT','AMZN','NVDA','META','GOOGL','GOOG','TSLA','AVGO','ADBE',
-    'ADSK','ADP','ALGN','AMD','AMGN','AMAT','ANSS','ASML','AZN','BKNG','BKR','CDNS','CEG','CHTR','CMCSA','COST','CPRT',
-    'CRWD','CSCO','CSX','CTAS','CTSH','DASH','DDOG','DLTR','DXCM','EA','EBAY','ENPH','EXC','FANG','FAST','FTNT','GEHC',
-    'GFS','GILD','HON','IDXX','ILMN','INTC','INTU','ISRG','KDP','KHC','KLAC','LRCX','LULU','MAR','MCHP','MDLZ','MELI',
-    'MNST','MRNA','MRVL','MU','NFLX','ODFL','ON','ORLY','PANW','PAYX','PCAR','PDD','PEP','PYPL','QCOM','REGN','ROP',
-    'ROST','SBUX','SIRI','SNPS','TEAM','TMUS','TXN','VRSK','VRTX','WBA','WBD','WDAY','XEL','ZM','ZS'
-]
-START, END = "2020-01-01", "2024-12-31"
+DATA_DIR   = "./ldt/crypto_data"     # crypto_data / equity_data
+FEATURES_DIR = f"{DATA_DIR}/features"  # your per-ticker parquet/pickle files live here
+with open(f"{DATA_DIR}/cache_ratio_index/meta.json", "r") as f:
+    assets = json.load(f)["assets"]
+N = len(assets)
+M = len(features)
 WINDOW = 60
 PRED = 10
-FEATURES = ['Open','High','Low','Close']
-PRED_FEAT = ['Close']
 BATCH_SIZE = 64
+COVERAGE = 0.85
 EPOCHS = 500
 LR = 5e-4
 max_patience = 20
-VAL_FRAC = 0.1
-TEST_FRAC = 0.4
-DATA_DIR = './ldt/data'
+latent_dim = 64
+vae_layers=3
+vae_heads=4
+vae_ff=256
+FREE_BITS_PER_ELEM = 0.3  # τ (nats per (time, latent-dim))
+SOFTNESS = 0.15            # 0.05–0.2 works well
 
-# -------------------- Data --------------------
-prepare_data_and_cache(
-  TICKERS, START, END, FEATURES, WINDOW,
-  data_dir=DATA_DIR, close_feature='Close',
-  val_ratio=VAL_FRAC, test_ratio=TEST_FRAC, horizon=PRED
+# ============== Re-index The Window & Future Horizon For Datasets ==============
+kept = mod.rebuild_window_index_only(
+    data_dir=DATA_DIR,
+    window=WINDOW,
+    horizon=PRED,
 )
-
-train_loader, val_loader, test_loader, (train_size, val_size, test_size) = \
-  load_dataloaders_from_cache(batch_size=BATCH_SIZE, data_dir=DATA_DIR)
+# Use the panel collate + date batching to get grouped-by-date panels
+panel_collate = make_panel_collate(assets)
+train_dl, val_dl, test_dl, sizes = mod.load_dataloaders_with_ratio_split(
+    data_dir=DATA_DIR,
+    train_ratio=0.7, val_ratio=0.1, test_ratio=0.2,
+    n_entities=N,
+    shuffle_train=False,
+    coverage_per_window=COVERAGE,     # enforce min entities per date group
+    date_batching=True,
+    dates_per_batch=BATCH_SIZE,
+    collate_fn=panel_collate,
+    window=WINDOW,
+    horizon=PRED,
+    norm_scope="train_only"
+)
 
 # -------------------- Model --------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 model = LatentVAE(
-    input_dim=len(PRED_FEAT), seq_len=PRED,
-    latent_dim=64,
-    enc_layers=3, enc_heads=4, enc_ff=256,
-    dec_layers=3, dec_heads=4, dec_ff=256
+    input_dim=1, seq_len=PRED, # Since target sequences are univariate, though entities are far greater than 1.
+    latent_dim=latent_dim,
+    enc_layers=vae_layers, enc_heads=vae_heads, enc_ff=vae_ff,
+    dec_layers=vae_layers, dec_heads=vae_heads, dec_ff=vae_ff
 ).to(device)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
@@ -60,10 +77,6 @@ best_val_recon = float('inf')
 patience_counter_recon = 0
 
 print("Starting training.")
-
-FREE_BITS_PER_ELEM = 0.3  # τ (nats per (time, latent-dim))
-SOFTNESS = 0.15            # 0.05–0.2 works well
-
 # -------------------- Train Loop --------------------
 for epoch in range(1, EPOCHS + 1):
     model.train()
@@ -163,6 +176,7 @@ for epoch in range(1, EPOCHS + 1):
         break
 
 print(f"\nTraining complete. Best Val Recon: {best_val_recon:.4f}")
+
 
 
 
