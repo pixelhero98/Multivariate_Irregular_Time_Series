@@ -60,49 +60,6 @@ N = len(assets)
 print("assets in cache:", N)
 print("first few assets:", assets[:10])
 
-def make_panel_collate(assets):
-    asset_count = len(assets)
-    def collate(batch):
-        # find unique dates in the batch (based on end-of-context time)
-        def to_date(t):
-            if isinstance(t, (list, tuple, np.ndarray)):  # 'full' mode may give arrays
-                t = t[-1]
-            return pd.Timestamp(t).normalize().date()
-
-        dates = [to_date(m[2]["ctx_times"]) for m in batch]
-        unique_dates, date_to_idx = [], {}
-        for d in dates:
-            if d not in date_to_idx:
-                date_to_idx[d] = len(unique_dates)
-                unique_dates.append(d)
-        B = len(unique_dates)
-
-        K, F = batch[0][0].shape
-        H = batch[0][1].shape[-1] if batch[0][1].ndim else 1
-
-        V = torch.zeros(B, asset_count, K, F)
-        T = torch.zeros_like(V)
-        Y = torch.zeros(B, asset_count, H)
-        M = torch.zeros(B, asset_count, dtype=torch.bool)
-        ctx_times = [[None]*asset_count for _ in range(B)]
-
-        for x, y, meta in batch:
-            aid = int(meta["asset_id"])
-            b = date_to_idx[to_date(meta["ctx_times"])]
-            V[b, aid] = x
-            td = torch.zeros_like(x); td[1:] = x[1:] - x[:-1]  # first-diff
-            T[b, aid] = td
-            if y.ndim == 0:
-                Y[b, aid, 0] = y
-            else:
-                Y[b, aid, :y.shape[-1]] = y
-            M[b, aid] = True
-            ctx_times[b][aid] = meta["ctx_times"]
-
-        meta_out = {"entity_mask": M, "ctx_times": ctx_times, "dates": unique_dates}
-        return [V, T], Y, meta_out
-    return collate
-
 # ============== Re-index The Window & Future Horizon ==============
 kept = mod.rebuild_window_index_only(
     data_dir=DATA_DIR,
@@ -112,7 +69,7 @@ kept = mod.rebuild_window_index_only(
 print("new total windows indexed:", kept)
 
 # Use the panel collate + date batching to get grouped-by-date panels
-panel_collate = make_panel_collate(assets)
+
 train_dl, val_dl, test_dl, sizes = mod.load_dataloaders_with_ratio_split(
     data_dir=DATA_DIR,
     train_ratio=0.7, val_ratio=0.1, test_ratio=0.2,
@@ -121,9 +78,8 @@ train_dl, val_dl, test_dl, sizes = mod.load_dataloaders_with_ratio_split(
     coverage_per_window=0.8,     # enforce min entities per date group
     date_batching=True,
     dates_per_batch=64,
-    collate_fn=panel_collate,
-    window=K,
-    horizon=H,
+    window=10,
+    horizon=5,
     norm_scope="train_only"
 )
 print("sizes (train,val,test):", sizes)
@@ -157,4 +113,3 @@ ok = all(
     for b in range(M.shape[0])
 )
 print("same DATE per panel?", ok)
-
