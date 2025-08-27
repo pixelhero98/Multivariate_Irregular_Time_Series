@@ -37,7 +37,7 @@ kept = mod.rebuild_window_index_only(
     window=WINDOW,
     horizon=PRED,
 )
-
+print("new total windows indexed:", kept)
 # -------------------- Loaders --------------------
 # Let the module’s default collate return panels + mask
 train_dl, val_dl, test_dl, sizes = mod.load_dataloaders_with_ratio_split(
@@ -54,6 +54,12 @@ train_dl, val_dl, test_dl, sizes = mod.load_dataloaders_with_ratio_split(
     norm_scope="train_only"
 )
 train_size, val_size, test_size = sizes
+xb, yb, meta = next(iter(train_dl))
+V, T = xb
+M = meta["entity_mask"]
+print("V:", V.shape, "T:", T.shape, "y:", yb.shape)         # -> [B,N,K,F], [B,N,K,F], [B,N,H]
+print("min coverage:", float(M.float().mean(1).min().item()))
+print("frac padded:", float((~M).float().mean().item()))
 
 # -------------------- Model --------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -193,3 +199,4 @@ for epoch in range(1, EPOCHS + 1):
     if patience_counter_recon >= max_patience:
         print(f"\nEarly stopping at epoch {epoch}: Recon hasn't improved in {max_patience} epochs.")
         break
+
