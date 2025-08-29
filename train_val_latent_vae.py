@@ -16,7 +16,7 @@ FEATURES_DIR = f"{DATA_DIR}/features"  # your per-ticker parquet/pickle files li
 with open(f"{DATA_DIR}/cache_ratio_index/meta.json", "r") as f:
     assets = json.load(f)["assets"]
 N = len(assets)
-M = len(features)
+
 WINDOW = 60
 PRED = 10
 BATCH_SIZE = 64
@@ -116,7 +116,8 @@ for epoch in range(1, EPOCHS + 1):
             recon_loss = F.mse_loss(y_hat, y_in, reduction='sum')
 
             # KL per element (handles either [B_eff, Z] or [B_eff, H, Z])
-            kl_elem = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+            mu32, logvar32 = mu.float(), logvar.float()
+            kl_elem = -0.5 * (1 + logvar32 - mu32.pow(2) - logvar32.exp())
             kl_div = kl_elem.sum()
 
             # Soft free-bits (average across batch dims, keep time/latent dims if present)
@@ -184,7 +185,7 @@ for epoch in range(1, EPOCHS + 1):
     )
 
     # -------------------- Checkpointing + Early Stop --------------------
-    if val_recon_avg < best_val_recon and per_elem_val_kl >= 0.2:
+    if val_recon_avg < best_val_recon and per_elem_val_kl >= 0.15:
         if current_best_recon_path and os.path.exists(current_best_recon_path):
             os.remove(current_best_recon_path)
         best_val_recon = val_recon_avg
@@ -199,4 +200,5 @@ for epoch in range(1, EPOCHS + 1):
     if patience_counter_recon >= max_patience:
         print(f"\nEarly stopping at epoch {epoch}: Recon hasn't improved in {max_patience} epochs.")
         break
+
 
