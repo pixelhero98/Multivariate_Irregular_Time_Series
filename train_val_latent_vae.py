@@ -1,4 +1,4 @@
-from latent_vae_utils import *
+from latent_vae_utils import normalize_and_check
 from latent_vae import LatentVAE
 import torch.nn.functional as F
 import torch
@@ -200,5 +200,6 @@ for epoch in range(1, EPOCHS + 1):
     if patience_counter_recon >= max_patience:
         print(f"\nEarly stopping at epoch {epoch}: Recon hasn't improved in {max_patience} epochs.")
         break
+
 
 
