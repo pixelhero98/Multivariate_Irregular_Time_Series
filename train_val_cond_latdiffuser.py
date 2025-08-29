@@ -8,18 +8,13 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from latent_vae_utils import normalize_and_check
-from fin_data_prep_f16_ultramem import (
-    prepare_stock_windows_and_cache_v2,
-    load_dataloaders_with_ratio_split,
-    FeatureConfig, CalendarConfig
-)
 from latent_vae import LatentVAE
 from lladit import LLapDiT  # updated model (multi-res + self-cond)
 
 # =====================================================================================
 # Config
 # =====================================================================================
-
+mod = importlib.import_module('fin_data_prep_ratiosp_indexcache')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.backends.cuda.matmul.allow_tf32 = True
 if torch.cuda.is_available():
@@ -39,6 +34,12 @@ WARMUP_FRAC = 0.05      # cosine warmup %
 WEIGHT_DECAY = 0.01
 GRAD_CLIP    = 1.0
 EARLY_STOP_PATIENCE = 20
+
+# VAE
+vae_latent_dim = 64
+vae_layers=3
+vae_heads=4
+vae_ff=256
 
 # Diffusion
 TOTAL_T        = 1500
@@ -81,59 +82,35 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 # =====================================================================================
 # Data prep
 # =====================================================================================
-
-with open(TICKER_LIST, 'r') as fh:
-    TICKS = [ln.strip() for ln in fh if ln.strip()]
-
-feature_cfg = FeatureConfig(
-    price_fields=["Open", "High", "Low", "Close"],
-    returns_mode="log",
-    include_rvol=True,  rvol_span=20, rvol_on="Close",
-    include_dlv=True,
-    market_proxy="SPY",
-    include_oc=False, include_gap=False, include_hl_range=False,
-    target_field="Close",
-    calendar=CalendarConfig(include_dow=True, include_dom=True, include_moy=True),
-)
-
-prepare_stock_windows_and_cache_v2(
-    tickers=TICKS,
-    start="2017-01-01",
-    val_start="2023-01-01",
-    test_start="2024-01-01",
-    end="2025-06-30",
+# ============== Re-index The Window & Future Horizon For Datasets ==============
+kept = mod.rebuild_window_index_only(
+    data_dir=DATA_DIR,
     window=WINDOW,
-    horizon=HORIZON,
-    data_dir=DATA_ROOT,
-    feature_cfg=feature_cfg,
-    normalize_per_ticker=True,
-    min_train_coverage=0.85,
-    liquidity_rank_window=None,
-    top_n_by_dollar_vol=None,
-    regression=True
+    horizon=PRED,
 )
-
-train_dl, val_dl, test_dl, sizes = load_dataloaders_with_ratio_split(
-    data_dir=DATA_ROOT,
-    train_ratio=0.55,
-    val_ratio=0.05,
-    test_ratio=0.40,
-    batch_size=BATCH_SIZE,
-    regression=True,
-    per_asset=True,
-    shuffle_train=True,
-    num_workers=0,
-    seed=42,
+print("new total windows indexed:", kept)
+# -------------------- Loaders --------------------
+# Let the module’s default collate return panels + mask
+train_dl, val_dl, test_dl, sizes = mod.load_dataloaders_with_ratio_split(
+    data_dir=DATA_DIR,
+    train_ratio=0.7, val_ratio=0.1, test_ratio=0.2,
+    n_entities=N,
+    shuffle_train=False,
+    coverage_per_window=COVERAGE,
+    date_batching=True,
+    dates_per_batch=BATCH_SIZE,      # B == number of dates per batch
+    collate_fn=None,                 # <— use the module’s collate
+    window=WINDOW,
+    horizon=PRED,
+    norm_scope="train_only"
 )
-
-def _get_sizes(s):
-    if isinstance(s, dict): return s.get('train', None), s.get('val', None), s.get('test', None)
-    if isinstance(s, (list, tuple)) and len(s) >= 3: return s[0], s[1], s[2]
-    return len(train_dl.dataset), len(val_dl.dataset), len(test_dl.dataset)
-
-N_TRAIN, N_VAL, N_TEST = _get_sizes(sizes)
-x_ctx_sample, _ = next(iter(train_dl))
-ctx_dim = x_ctx_sample.shape[-1]  # works for [B,Lc,F] or [B,M,Lc,F]
+train_size, val_size, test_size = sizes
+xb, yb, meta = next(iter(train_dl))
+V, T = xb
+M = meta["entity_mask"]
+print("V:", V.shape, "T:", T.shape, "y:", yb.shape)         # -> [B,N,K,F], [B,N,K,F], [B,N,H]
+print("min coverage:", float(M.float().mean(1).min().item()))
+print("frac padded:", float((~M).float().mean().item()))
 
 # =====================================================================================
 # VAE (encoder for μ; decoder for final regression)
@@ -142,9 +119,9 @@ ctx_dim = x_ctx_sample.shape[-1]  # works for [B,Lc,F] or [B,M,Lc,F]
 vae = LatentVAE(
     input_dim=1,
     seq_len=HORIZON,
-    latent_dim=64,
-    enc_layers=3, enc_heads=4, enc_ff=256,
-    dec_layers=3, dec_heads=4, dec_ff=256,
+    latent_dim=vae_latent_dim,
+    enc_layers=vae_layers, enc_heads=vae_heads, enc_ff=vae_ff,
+    dec_layers=vae_layers, dec_heads=vae_heads, dec_ff=vae_ff,
 ).to(device)
 
 vae_ckpt_path = './ldt/saved_model/recon_0.0559_epoch_4.pt'
@@ -510,6 +487,7 @@ if best_ckpt_path and os.path.exists(best_ckpt_path):
         print(f"\nValidation regression MSE after decoder FT: {val_reg_mse_ft:.6f}")
 else:
     print("No best checkpoint found; skipping regression eval and decoder fine-tune.")
+
 
 
 
