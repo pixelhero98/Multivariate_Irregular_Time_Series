@@ -61,4 +61,7 @@ CONTEXT_LEN   = HORIZON      # learned summary tokens
 USE_EWMA      = True         # two-stage latent whitening: per-window EWMA, then global
 EWMA_LAMBDA   = 0.94
 
+USE_EMA_EVAL = True
+EMA_DECAY    = 0.999         # 0.999–0.9999 are common; larger for longer runs
+
 CKPT_DIR      = "./ldt/checkpoints"
