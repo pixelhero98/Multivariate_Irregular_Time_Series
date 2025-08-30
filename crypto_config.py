@@ -36,7 +36,7 @@ SOFTNESS = 0.15
 
 # --- LLapDiT Parameters ---
 HORIZON       = PRED           # target length H
-BASE_LR       = 1e-4
+BASE_LR       = 2e-4
 WARMUP_FRAC   = 0.05
 WEIGHT_DECAY  = 5e-4
 GRAD_CLIP     = 1.0
