@@ -10,7 +10,7 @@ from tqdm import tqdm
 from Latent_Space.latent_vae import LatentVAE
 from Model.cond_diffusion_utils import normalize_and_check
 from Model.lladit import LLapDiT
-
+from Model.cond_diffusion_utils import EMA
 # ----------------------------- utils -----------------------------
 def set_torch():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -152,8 +152,10 @@ diff_model = LLapDiT(
     self_conditioning=crypto_config.SELF_COND,
     context_dim=ctx_dim, num_entities=N0, context_len=crypto_config.CONTEXT_LEN
 ).to(device)
+USE_EMA_EVAL = getattr(crypto_config, "USE_EMA_EVAL", True)
+EMA_DECAY    = getattr(crypto_config, "EMA_DECAY", 0.999)
+ema = EMA(diff_model, decay=EMA_DECAY) if USE_EMA_EVAL else None
 scheduler = diff_model.scheduler
-
 optimizer = torch.optim.AdamW(diff_model.parameters(), lr=crypto_config.BASE_LR, weight_decay=crypto_config.WEIGHT_DECAY)
 total_steps = crypto_config.EPOCHS * max(1, len(train_dl))
 lr_sched = make_warmup_cosine(optimizer, total_steps, warmup_frac=crypto_config.WARMUP_FRAC, base_lr=crypto_config.BASE_LR)
@@ -210,6 +212,9 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
         if crypto_config.GRAD_CLIP and crypto_config.GRAD_CLIP > 0:
             nn.utils.clip_grad_norm_(diff_model.parameters(), crypto_config.GRAD_CLIP)
         scaler.step(optimizer); scaler.update()
+        if ema is not None:
+            ema.update(diff_model)
+            
         lr_sched.step()
 
         train_sum += loss.item() * mu_norm.size(0)
@@ -220,6 +225,11 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
     # ---------------- val ----------------
     diff_model.eval()
     val_sum = 0.0; val_count = 0
+
+    if ema is not None:
+        ema.store(diff_model)
+        ema.copy_to(diff_model)
+        
     with torch.no_grad():
         for xb, yb, meta in val_dl:
             V, T = xb
@@ -246,26 +256,39 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
                                   self_cond=False, self_cond_p=0.0, snr_clip=crypto_config.SNR_CLIP)
             val_sum += loss.item() * mu_norm.size(0)
             val_count += mu_norm.size(0)
-
+    if ema is not None:
+        ema.restore(diff_model)
     avg_val = val_sum / max(1, val_count)
     print(f"Epoch {epoch:03d} | train: {avg_train:.6f} | val: {avg_val:.6f}")
 
-    # checkpoint best
+    # ---------------- checkpoint best (with EMA) ----------------
     if avg_val < best_val:
         best_val = avg_val; patience = 0
         if current_best_path and os.path.exists(current_best_path):
             os.remove(current_best_path)
-        ckpt_path = os.path.join(crypto_config.CKPT_DIR, f"best_latdiff_epoch_{epoch:03d}_val_{avg_val:.6f}.pt")
-        torch.save({
-                "epoch": epoch,
-                "model_state": diff_model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "mu_mean": mu_mean.detach().cpu(),
-                "mu_std":  mu_std.detach().cpu(),
-                "predict_type": crypto_config.PREDICT_TYPE,
-                "timesteps": crypto_config.TIMESTEPS,
-                "schedule": crypto_config.SCHEDULE,
-        }, ckpt_path)
+    
+        ckpt_path = os.path.join(
+            crypto_config.CKPT_DIR,
+            f"best_latdiff_epoch_{epoch:03d}_val_{avg_val:.6f}.pt"
+        )
+    
+        save_payload = {
+            "epoch": epoch,
+            "model_state": diff_model.state_dict(),   # raw weights
+            "optimizer_state": optimizer.state_dict(),
+            "mu_mean": mu_mean.detach().cpu(),
+            "mu_std":  mu_std.detach().cpu(),
+            "predict_type": crypto_config.PREDICT_TYPE,
+            "timesteps": crypto_config.TIMESTEPS,
+            "schedule": crypto_config.SCHEDULE,
+        }
+    
+        # If EMA is enabled, stash the EMA shadow too
+        if ema is not None:
+            save_payload["ema_state"] = ema.state_dict()
+            save_payload["ema_decay"] = EMA_DECAY  # (optional, useful when loading)
+    
+        torch.save(save_payload, ckpt_path)
         print("Saved:", ckpt_path)
         current_best_path = ckpt_path
     else:
@@ -276,3 +299,4 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
 
 
 # ---------------- conditional generation (val & test) ----------------
+
