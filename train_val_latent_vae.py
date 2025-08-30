@@ -163,7 +163,7 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
     )
 
     # -------------------- Checkpointing + Early Stop --------------------
-    if val_recon_avg < best_val_recon and per_elem_val_kl >= 0.15:
+    if val_recon_avg < best_val_recon and per_elem_val_kl <= 2.0:
         if current_best_recon_path and os.path.exists(current_best_recon_path):
             os.remove(current_best_recon_path)
         best_val_recon = val_recon_avg
@@ -213,4 +213,5 @@ with torch.no_grad():
         all_mu.append(mu.cpu())
 all_mu = torch.cat(all_mu, dim=0)  # [N, L, D]
 _, mu_d, std_d = normalize_and_check(all_mu, plot=True)
+
 
