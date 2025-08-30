@@ -159,7 +159,7 @@ lr_sched = make_warmup_cosine(optimizer, total_steps, warmup_frac=crypto_config.
 scaler = GradScaler(enabled=(device.type=="cuda"))
 
 best_val = float("inf"); patience = 0
-
+current_best_recon_path = None
 for epoch in range(1, crypto_config.EPOCHS + 1):
     # ---------------- train ----------------
     diff_model.train()
@@ -251,6 +251,8 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
     # checkpoint best
     if avg_val < best_val:
         best_val = avg_val; patience = 0
+        if current_best_recon_path and os.path.exists(current_best_recon_path):
+            os.remove(current_best_recon_path)
         ckpt_path = os.path.join(crypto_config.CKPT_DIR, f"best_latdiff_epoch_{epoch:03d}_val_{avg_val:.6f}.pt")
         torch.save({
                 "epoch": epoch,
@@ -263,6 +265,7 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
                 "schedule": crypto_config.SCHEDULE,
         }, ckpt_path)
         print("Saved:", ckpt_path)
+        current_best_recon_path = ckpt_path
     else:
         patience += 1
         if patience >= crypto_config.EARLY_STOP:
