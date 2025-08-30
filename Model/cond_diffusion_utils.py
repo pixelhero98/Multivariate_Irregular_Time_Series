@@ -238,3 +238,38 @@ def normalize_and_check(all_mu: torch.Tensor, plot: bool = False):
     # Optionally: histograms if your logger supports it
     # log_fn({f"{tag_prefix}alpha_hist": wandb.Histogram(alpha_cat.numpy())}, step=step)
 
+
+# -------- EMA helper (evaluation) --------
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {n: p.detach().clone()
+                       for n, p in model.named_parameters()
+                       if p.requires_grad}
+
+    @torch.no_grad()
+    def update(self, model):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n].lerp_(p.detach(), 1.0 - self.decay)
+
+    def store(self, model):
+        self._backup = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+
+    def copy_to(self, model):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(self.shadow[n].data)
+
+    def restore(self, model):
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(self._backup[n].data)
+
+    def state_dict(self):
+        return {k: v.cpu() for k, v in self.shadow.items()}
+
+    def load_state_dict(self, sd):
+        for k, v in sd.items():
+            if k in self.shadow:
+                self.shadow[k] = v.clone()
