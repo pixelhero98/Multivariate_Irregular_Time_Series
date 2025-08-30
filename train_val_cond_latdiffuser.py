@@ -1,58 +1,14 @@
 import os, math
 from typing import Optional, Tuple
-import torch
-import torch.nn.functional as F
+import torch, importlib
+import crypto_config
 from torch import nn
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
-from latent_vae import LatentVAE
-from cond_diffusion_utils import normalize_and_check
-from lladit import LLapDiT  # your conditional diffusion backbone
-
-# ----------------------------- config -----------------------------
-DATA_MODULE   = "fin_data_prep_ratiosp_indexcache"
-DATA_DIR      = "./ldt/crypto_data"
-WINDOW        = 150          # panel context length K
-HORIZON       = 40           # target length H
-COVERAGE      = 0.85
-
-BATCH_SIZE    = 64
-EPOCHS        = 100
-BASE_LR       = 5e-4
-WARMUP_FRAC   = 0.05
-WEIGHT_DECAY  = 1e-2
-GRAD_CLIP     = 1.0
-EARLY_STOP    = 20
-
-LATENT_DIM    = 64
-VAE_LAYERS    = 3
-VAE_HEADS     = 4
-VAE_FF        = 256
-VAE_CKPT      = ""           # optional path
-
-TIMESTEPS     = 1500
-SCHEDULE      = "cosine"     # ["cosine","linear","sigmoid"]
-PREDICT_TYPE  = "v"          # ["v","eps"]
-DROP_COND_P   = 0.25         # classifier-free guidance (drop conditioning prob)
-SELF_COND     = True
-SELF_COND_P   = 0.50
-SNR_CLIP      = 5.0
-
-MODEL_WIDTH   = 256
-NUM_LAYERS    = 4
-NUM_HEADS     = 4
-LAPLACE_K     = [24, 20, 16, 16]
-GLOBAL_K      = 64
-DROPOUT       = 0.0
-ATTN_DROPOUT  = 0.0
-CONTEXT_LEN   = HORIZON      # learned summary tokens
-
-USE_EWMA      = True         # two-stage latent whitening: per-window EWMA, then global
-EWMA_LAMBDA   = 0.94
-
-CKPT_DIR      = "./ldt/checkpoints"
-os.makedirs(CKPT_DIR, exist_ok=True)
+from Latent_Space.latent_vae import LatentVAE
+from Model.cond_diffusion_utils import normalize_and_check
+from Model.lladit import LLapDiT
 
 # ----------------------------- utils -----------------------------
 def set_torch():
@@ -125,7 +81,7 @@ def compute_latent_stats(vae: LatentVAE, dataloader, device) -> Tuple[torch.Tens
         _, mu, _ = vae(y_in)
         all_mu.append(mu.detach().cpu())
     if len(all_mu) == 0:
-        mu_cat = torch.zeros(1, 1, LATENT_DIM)
+        mu_cat = torch.zeros(1, 1, crypto_config.VAE_LATENT_DIM)
     else:
         mu_cat = torch.cat(all_mu, dim=0)
     _, mu_mean, mu_std = normalize_and_check(mu_cat)
@@ -135,23 +91,21 @@ def compute_latent_stats(vae: LatentVAE, dataloader, device) -> Tuple[torch.Tens
 device = set_torch()
 
 # data module
-mod = __import__(DATA_MODULE, fromlist=['*'])
-
-kept = mod.rebuild_window_index_only(data_dir=DATA_DIR, window=WINDOW, horizon=HORIZON)
+mod = importlib.import_module(crypto_config.DATA_MODULE)
+kept = mod.rebuild_window_index_only(data_dir=crypto_config.DATA_DIR, window=crypto_config.WINDOW, horizon=crypto_config.HORIZON)
 print("new total windows indexed:", kept)
 
 train_dl, val_dl, test_dl, sizes = mod.load_dataloaders_with_ratio_split(
-    data_dir=DATA_DIR,
-    train_ratio=0.7, val_ratio=0.1, test_ratio=0.2,
-    n_entities=None,
-    shuffle_train=False,
-    coverage_per_window=COVERAGE,
-    date_batching=True,
-    dates_per_batch=BATCH_SIZE,
-    collate_fn=None,
-    window=WINDOW,
-    horizon=HORIZON,
-    norm_scope="train_only"
+    data_dir=crypto_config.DATA_DIR,
+    train_ratio=crypto_config.train_ratio, val_ratio=crypto_config.val_ratio, test_ratio=crypto_config.test_ratio,
+    n_entities=crypto_config.NUM_ENTITIES,
+    shuffle_train=crypto_config.shuffle_train,
+    coverage_per_window=crypto_config.COVERAGE,
+    date_batching=crypto_config.date_batching,
+    dates_per_batch=crypto_config.BATCH_SIZE,      # B == number of dates per batch
+    window=crypto_config.WINDOW,
+    horizon=crypto_config.PRED,
+    norm_scope=crypto_config.norm_scope
 )
 print("sizes:", sizes)
 
@@ -165,10 +119,12 @@ print("V:", V0.shape, "T:", T0.shape, "y:", yb0.shape)
 assert Fv == Ft, f"Expected Fv == Ft, got {Fv} vs {Ft}"
 
 # ---- VAE (encode y -> μ) ----
+VAE_CKPT = "./ldt/saved_model/hidden_64_recon_0.0008_kl_4065.711498754005.pt"
 vae = LatentVAE(
-    input_dim=1, seq_len=H, latent_dim=LATENT_DIM,
-    enc_layers=VAE_LAYERS, enc_heads=VAE_HEADS, enc_ff=VAE_FF,
-    dec_layers=VAE_LAYERS, dec_heads=VAE_HEADS, dec_ff=VAE_FF,
+    input_dim=1, seq_len=crypto_config.PRED, # Since target sequences are univariate, though entities are far greater than 1.
+    latent_dim=crypto_config.VAE_LATENT_DIM,
+    enc_layers=crypto_config.VAE_LAYERS, enc_heads=crypto_config.VAE_HEADS, enc_ff=crypto_config.VAE_FF,
+    dec_layers=crypto_config.VAE_LAYERS, dec_heads=crypto_config.VAE_HEADS, dec_ff=crypto_config.VAE_FF
 ).to(device)
 if VAE_CKPT and os.path.isfile(VAE_CKPT):
     ckpt = torch.load(VAE_CKPT, map_location=device)
@@ -187,24 +143,24 @@ mu_mean, mu_std = compute_latent_stats(vae, train_dl, device)
 # it derives both V- and T-like signals internally from a single feature panel.
 ctx_dim = Fv
 diff_model = LLapDiT(
-    data_dim=LATENT_DIM, hidden_dim=MODEL_WIDTH,
-    num_layers=NUM_LAYERS, num_heads=NUM_HEADS,
-    predict_type=PREDICT_TYPE, laplace_k=LAPLACE_K, global_k=GLOBAL_K,
-    timesteps=TIMESTEPS, schedule=SCHEDULE,
-    dropout=DROPOUT, attn_dropout=ATTN_DROPOUT,
-    self_conditioning=SELF_COND,
-    context_dim=ctx_dim, num_entities=N0, context_len=CONTEXT_LEN
+    data_dim=crypto_config.VAE_LATENT_DIM, hidden_dim=crypto_config.MODEL_WIDTH,
+    num_layers=crypto_config.NUM_LAYERS, num_heads=crypto_config.NUM_HEADS,
+    predict_type=crypto_config.PREDICT_TYPE, laplace_k=crypto_config.LAPLACE_K, global_k=crypto_config.GLOBAL_K,
+    timesteps=crypto_config.TIMESTEPS, schedule=crypto_config.SCHEDULE,
+    dropout=crypto_config.DROPOUT, attn_dropout=crypto_config.ATTN_DROPOUT,
+    self_conditioning=crypto_config.SELF_COND,
+    context_dim=ctx_dim, num_entities=N0, context_len=crypto_config.CONTEXT_LEN
 ).to(device)
 scheduler = diff_model.scheduler
 
-optimizer = torch.optim.AdamW(diff_model.parameters(), lr=BASE_LR, weight_decay=WEIGHT_DECAY)
-total_steps = EPOCHS * max(1, len(train_dl))
-lr_sched = make_warmup_cosine(optimizer, total_steps, warmup_frac=WARMUP_FRAC, base_lr=BASE_LR)
+optimizer = torch.optim.AdamW(diff_model.parameters(), lr=crypto_config.BASE_LR, weight_decay=crypto_config.WEIGHT_DECAY)
+total_steps = crypto_config.EPOCHS * max(1, len(train_dl))
+lr_sched = make_warmup_cosine(optimizer, total_steps, warmup_frac=crypto_config.WARMUP_FRAC, base_lr=crypto_config.BASE_LR)
 scaler = GradScaler(enabled=(device.type=="cuda"))
 
 best_val = float("inf"); patience = 0
 
-for epoch in range(1, EPOCHS + 1):
+for epoch in range(1, crypto_config.EPOCHS + 1):
     # ---------------- train ----------------
     diff_model.train()
     train_sum = 0.0; train_count = 0
@@ -215,12 +171,13 @@ for epoch in range(1, EPOCHS + 1):
 
         # series for summarizer: use a *single* feature panel (no concat)
         # Choose V by convention (T can be used equivalently since Fv == Ft).
+        series_diff = T.permute(0,2,1,3).to(device)
         series = V.permute(0,2,1,3).to(device)   # [B,T(=K),N,F]
         mask_bn = mask_bn.to(device)
 
         # global conditional summary once per batch (mask applied inside)
         with torch.no_grad():
-            cond_summary, _ = diff_model.context(series, entity_mask=mask_bn)  # [B,S,Hm]
+            cond_summary, _ = diff_model.context(x=series, ctx_diff=series_diff, entity_mask=mask_bn)  # [B,S,Hm]
 
         # targets: flatten entities, keep only valid ones
         y = yb.to(device)                         # [B,N,H]
@@ -238,19 +195,19 @@ for epoch in range(1, EPOCHS + 1):
         optimizer.zero_grad(set_to_none=True)
         with autocast(enabled=(device.type=="cuda")):
             _, mu, _ = vae(y_in)                      # [B_eff, H, D]
-            mu_norm = two_stage_norm(mu, USE_EWMA, EWMA_LAMBDA, mu_mean, mu_std)
+            mu_norm = two_stage_norm(mu, crypto_config.USE_EWMA, crypto_config.EWMA_LAMBDA, mu_mean, mu_std)
             t = torch.randint(0, scheduler.timesteps, (mu_norm.size(0),), device=device).long()
             # classifier-free drop
-            use_cond = (torch.rand(()) >= DROP_COND_P)
+            use_cond = (torch.rand(()) >= crypto_config.DROP_COND_P)
             cs = cond_summary_flat if use_cond else None
             loss = diffusion_loss(diff_model, scheduler, mu_norm, t,
-                                  cond_summary=cs, predict_type=PREDICT_TYPE,
-                                  self_cond=SELF_COND, self_cond_p=SELF_COND_P,
-                                  snr_clip=SNR_CLIP)
+                                  cond_summary=cs, predict_type=crypto_config.PREDICT_TYPE,
+                                  self_cond=crypto_config.SELF_COND, self_cond_p=crypto_config.SELF_COND_P,
+                                  snr_clip=crypto_config.SNR_CLIP)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        if GRAD_CLIP and GRAD_CLIP > 0:
-            nn.utils.clip_grad_norm_(diff_model.parameters(), GRAD_CLIP)
+        if crypto_config.GRAD_CLIP and crypto_config.GRAD_CLIP > 0:
+            nn.utils.clip_grad_norm_(diff_model.parameters(), crypto_config.GRAD_CLIP)
         scaler.step(optimizer); scaler.update()
         lr_sched.step()
 
@@ -280,11 +237,11 @@ for epoch in range(1, EPOCHS + 1):
             cond_summary_flat = cond_summary[batch_ids]
 
             _, mu, _ = vae(y_in)
-            mu_norm = two_stage_norm(mu, USE_EWMA, EWMA_LAMBDA, mu_mean, mu_std)
+            mu_norm = two_stage_norm(mu, crypto_config.USE_EWMA, crypto_config.EWMA_LAMBDA, mu_mean, mu_std)
             t = torch.randint(0, scheduler.timesteps, (mu_norm.size(0),), device=device).long()
             loss = diffusion_loss(diff_model, scheduler, mu_norm, t,
-                                  cond_summary=cond_summary_flat, predict_type=PREDICT_TYPE,
-                                  self_cond=False, self_cond_p=0.0, snr_clip=SNR_CLIP)
+                                  cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE,
+                                  self_cond=False, self_cond_p=0.0, snr_clip=crypto_config.SNR_CLIP)
             val_sum += loss.item() * mu_norm.size(0)
             val_count += mu_norm.size(0)
 
@@ -294,20 +251,20 @@ for epoch in range(1, EPOCHS + 1):
     # checkpoint best
     if avg_val < best_val:
         best_val = avg_val; patience = 0
-        ckpt_path = os.path.join(CKPT_DIR, f"best_latdiff_epoch_{epoch:03d}_val_{avg_val:.6f}.pt")
+        ckpt_path = os.path.join(crypto_config.CKPT_DIR, f"best_latdiff_epoch_{epoch:03d}_val_{avg_val:.6f}.pt")
         torch.save({
                 "epoch": epoch,
                 "model_state": diff_model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "mu_mean": mu_mean.detach().cpu(),
                 "mu_std":  mu_std.detach().cpu(),
-                "predict_type": PREDICT_TYPE,
-                "timesteps": TIMESTEPS,
-                "schedule": SCHEDULE,
+                "predict_type": crypto_config.PREDICT_TYPE,
+                "timesteps": crypto_config.TIMESTEPS,
+                "schedule": crypto_config.SCHEDULE,
         }, ckpt_path)
         print("Saved:", ckpt_path)
     else:
         patience += 1
-        if patience >= EARLY_STOP:
+        if patience >= crypto_config.EARLY_STOP:
             print("Early stopping.")
             break
