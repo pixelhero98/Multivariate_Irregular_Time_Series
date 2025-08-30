@@ -159,7 +159,7 @@ lr_sched = make_warmup_cosine(optimizer, total_steps, warmup_frac=crypto_config.
 scaler = GradScaler(enabled=(device.type=="cuda"))
 
 best_val = float("inf"); patience = 0
-current_best_recon_path = None
+current_best_path = None
 for epoch in range(1, crypto_config.EPOCHS + 1):
     # ---------------- train ----------------
     diff_model.train()
@@ -223,8 +223,9 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
         for xb, yb, meta in val_dl:
             V, T = xb
             mask_bn = meta["entity_mask"].to(device)
+            series_diff = T.permute(0,2,1,3).to(device)
             series = V.permute(0,2,1,3).to(device)  # single panel, no concat
-            cond_summary, _ = diff_model.context(series, entity_mask=mask_bn)
+            cond_summary, _ = diff_model.context(x=series, ctx_diff=series_diff, entity_mask=mask_bn)
 
             y = yb.to(device)
             B,N,Hcur = y.shape
@@ -251,8 +252,8 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
     # checkpoint best
     if avg_val < best_val:
         best_val = avg_val; patience = 0
-        if current_best_recon_path and os.path.exists(current_best_recon_path):
-            os.remove(current_best_recon_path)
+        if current_best_path and os.path.exists(current_best_path):
+            os.remove(current_best_path)
         ckpt_path = os.path.join(crypto_config.CKPT_DIR, f"best_latdiff_epoch_{epoch:03d}_val_{avg_val:.6f}.pt")
         torch.save({
                 "epoch": epoch,
@@ -265,9 +266,10 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
                 "schedule": crypto_config.SCHEDULE,
         }, ckpt_path)
         print("Saved:", ckpt_path)
-        current_best_recon_path = ckpt_path
+        current_best_path = ckpt_path
     else:
         patience += 1
         if patience >= crypto_config.EARLY_STOP:
             print("Early stopping.")
             break
+
