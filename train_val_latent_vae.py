@@ -1,62 +1,39 @@
-from latent_vae_utils import normalize_and_check
-from latent_vae import LatentVAE
+from Model.cond_diffusion_utils import normalize_and_check
+from Latent_Space.latent_vae import LatentVAE
 import torch.nn.functional as F
-import torch
 import os
-import json, importlib, torch
-import pandas as pd
-import numpy as np
-
-
-mod = importlib.import_module('fin_data_prep_ratiosp_indexcache')
+import torch, importlib
+import crypto_config
 
 # -------------------- Config --------------------
-DATA_DIR   = "./ldt/crypto_data"     # crypto_data / equity_data
-FEATURES_DIR = f"{DATA_DIR}/features"  # your per-ticker parquet/pickle files live here
-with open(f"{DATA_DIR}/cache_ratio_index/meta.json", "r") as f:
-    assets = json.load(f)["assets"]
-N = len(assets)
-
-WINDOW = 60
-PRED = 10
-BATCH_SIZE = 64
-COVERAGE = 0.85
-EPOCHS = 500
-LR = 5e-4
-max_patience = 20
-latent_dim = 64
-vae_layers=3
-vae_heads=4
-vae_ff=256
-FREE_BITS_PER_ELEM = 0.3  # τ (nats per (time, latent-dim))
-SOFTNESS = 0.15            # 0.05–0.2 works well
+mod = importlib.import_module(crypto_config.DATA_MODULE)
 
 # ============== Re-index The Window & Future Horizon For Datasets ==============
 kept = mod.rebuild_window_index_only(
-    data_dir=DATA_DIR,
-    window=WINDOW,
-    horizon=PRED,
+    data_dir=crypto_config.DATA_DIR,
+    window=crypto_config.WINDOW,
+    horizon=crypto_config.PRED,
 )
 print("new total windows indexed:", kept)
 # -------------------- Loaders --------------------
 # Let the module’s default collate return panels + mask
 train_dl, val_dl, test_dl, sizes = mod.load_dataloaders_with_ratio_split(
-    data_dir=DATA_DIR,
-    train_ratio=0.7, val_ratio=0.1, test_ratio=0.2,
-    n_entities=N,
-    shuffle_train=False,
-    coverage_per_window=COVERAGE,
-    date_batching=True,
-    dates_per_batch=BATCH_SIZE,      # B == number of dates per batch
-    collate_fn=None,                 # <— use the module’s collate
-    window=WINDOW,
-    horizon=PRED,
-    norm_scope="train_only"
+    data_dir=crypto_config.DATA_DIR,
+    train_ratio=crypto_config.train_ratio, val_ratio=crypto_config.val_ratio, test_ratio=crypto_config.test_ratio,
+    n_entities=crypto_config.NUM_ENTITIES,
+    shuffle_train=crypto_config.shuffle_train,
+    coverage_per_window=crypto_config.COVERAGE,
+    date_batching=crypto_config.date_batching,
+    dates_per_batch=crypto_config.BATCH_SIZE,      # B == number of dates per batch
+    window=crypto_config.WINDOW,
+    horizon=crypto_config.PRED,
+    norm_scope=crypto_config.norm_scope
 )
 train_size, val_size, test_size = sizes
 xb, yb, meta = next(iter(train_dl))
 V, T = xb
 M = meta["entity_mask"]
+print("sizes:", sizes)
 print("V:", V.shape, "T:", T.shape, "y:", yb.shape)         # -> [B,N,K,F], [B,N,K,F], [B,N,H]
 print("min coverage:", float(M.float().mean(1).min().item()))
 print("frac padded:", float((~M).float().mean().item()))
@@ -65,13 +42,13 @@ print("frac padded:", float((~M).float().mean().item()))
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 model = LatentVAE(
-    input_dim=1, seq_len=PRED, # Since target sequences are univariate, though entities are far greater than 1.
-    latent_dim=latent_dim,
-    enc_layers=vae_layers, enc_heads=vae_heads, enc_ff=vae_ff,
-    dec_layers=vae_layers, dec_heads=vae_heads, dec_ff=vae_ff
+    input_dim=1, seq_len=crypto_config.PRED, # Since target sequences are univariate, though entities are far greater than 1.
+    latent_dim=crypto_config.VAE_LATENT_DIM,
+    enc_layers=crypto_config.VAE_LAYERS, enc_heads=crypto_config.VAE_HEADS, enc_ff=crypto_config.VAE_FF,
+    dec_layers=crypto_config.VAE_LAYERS, dec_heads=crypto_config.VAE_HEADS, dec_ff=crypto_config.VAE_FF
 ).to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+optimizer = torch.optim.AdamW(model.parameters(), lr=crypto_config.LEARNING_RATE)
 
 # AMP scaler (safe on CPU too; it’ll just be disabled)
 scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
@@ -83,22 +60,23 @@ os.makedirs(model_dir, exist_ok=True)  # <- fix: import os
 current_best_recon_path = None
 best_val_recon = float('inf')
 patience_counter_recon = 0
-
+warm_up_epochs = 200
 print("Starting training.")
 # -------------------- Train Loop --------------------
-for epoch in range(1, EPOCHS + 1):
+for epoch in range(1, crypto_config.EPOCHS + 1):
     model.train()
     total_recon, total_kl = 0.0, 0.0
     total_valid = 0        # number of valid entity sequences seen this epoch
 
-    annealing_period = 1000
-    beta = min(0.2, epoch / annealing_period)
-
+    annealing_period = 2000
+    if epoch <= warm_up_epochs:
+        beta = 0
+    else:
+        beta = min(0.2, (epoch - warm_up_epochs) / annealing_period)
     for (_, yb, meta) in train_dl:
         # yb: [B, N, H], mask: [B, N]
         M = meta["entity_mask"].to(device)               # [B, N] bool
         y = yb.to(device)                                # [B, N, H]
-
         # Flatten panels, select valid entities only
         B, N, H = y.shape
         y_flat = y.reshape(B * N, H)                     # [B*N, H]
@@ -125,8 +103,8 @@ for epoch in range(1, EPOCHS + 1):
             reduce_axes = tuple(i for i in range(kl_elem.dim()) if i == 0)
             kl_per_elem_mean = kl_elem.mean(dim=reduce_axes)  # [(H,)Z] or [Z]
             excess_per_elem = F.softplus(
-                (kl_per_elem_mean - FREE_BITS_PER_ELEM) / SOFTNESS
-            ) * SOFTNESS
+                (kl_per_elem_mean - crypto_config.FREE_BITS_PER_ELEM) / crypto_config.SOFTNESS
+            ) * crypto_config.SOFTNESS
             kl_div_eff = excess_per_elem.sum() * y_in.size(0)  # scale back by batch size
 
             loss = (recon_loss + beta * kl_div_eff) / y_in.size(0)
@@ -168,16 +146,16 @@ for epoch in range(1, EPOCHS + 1):
     val_kl_avg = val_kl_sum / max(1, val_valid)
 
     # Per-element (time × feature=1)
-    per_elem_train_recon = train_recon_avg / (PRED * 1)
-    per_elem_val_recon   = val_recon_avg   / (PRED * 1)
-    per_elem_train_kl    = train_kl_avg    / (PRED * latent_dim)
-    per_elem_val_kl      = val_kl_avg      / (PRED * latent_dim)
+    per_elem_train_recon = train_recon_avg / (crypto_config.PRED * 1)
+    per_elem_val_recon   = val_recon_avg   / (crypto_config.PRED * 1)
+    per_elem_train_kl    = train_kl_avg    / (crypto_config.PRED * crypto_config.VAE_LATENT_DIM)
+    per_elem_val_kl      = val_kl_avg      / (crypto_config.PRED * crypto_config.VAE_LATENT_DIM)
 
     train_elbo = train_recon_avg + train_kl_avg
     val_elbo   = val_recon_avg   + val_kl_avg
 
     print(
-        f"Epoch {epoch}/{EPOCHS} - β={beta:.3f} | "
+        f"Epoch {epoch}/{crypto_config.EPOCHS} - β={beta:.3f} | "
         f"Train ELBO: {train_elbo:.4f} (Recon: {train_recon_avg:.4f} /elem: {per_elem_train_recon:.6f}, "
         f"KL: {train_kl_avg:.4f} /elem: {per_elem_train_kl:.6f}) | "
         f"Val ELBO: {val_elbo:.4f} (Recon: {val_recon_avg:.4f} /elem: {per_elem_val_recon:.6f}, "
@@ -190,16 +168,49 @@ for epoch in range(1, EPOCHS + 1):
             os.remove(current_best_recon_path)
         best_val_recon = val_recon_avg
         patience_counter_recon = 0
-        new_path = os.path.join(model_dir, f"recon_{val_recon_avg:.4f}_epoch_{epoch}.pt")
+        new_path = os.path.join(model_dir, f"hidden_{crypto_config.VAE_LATENT_DIM}_recon_{val_recon_avg:.4f}_kl_{val_kl_avg}.pt")
         torch.save(model.state_dict(), new_path)
         current_best_recon_path = new_path
         print(f"  -> New best Recon model saved: {os.path.basename(new_path)}")
     else:
         patience_counter_recon += 1
 
-    if patience_counter_recon >= max_patience:
-        print(f"\nEarly stopping at epoch {epoch}: Recon hasn't improved in {max_patience} epochs.")
+    if patience_counter_recon >= crypto_config.MAX_PATIENCE:
+        print(f"\nEarly stopping at epoch {epoch}: Recon hasn't improved in {crypto_config.MAX_PATIENCE} epochs.")
         break
 
 
+# --- Load pre-trained VAE ---
+vae = LatentVAE(
+    input_dim=1, seq_len=crypto_config.PRED, # Since target sequences are univariate, though entities are far greater than 1.
+    latent_dim=crypto_config.VAE_LATENT_DIM,
+    enc_layers=crypto_config.VAE_LAYERS, enc_heads=crypto_config.VAE_HEADS, enc_ff=crypto_config.VAE_FF,
+    dec_layers=crypto_config.VAE_LAYERS, dec_heads=crypto_config.VAE_HEADS, dec_ff=crypto_config.VAE_FF
+).to(device)
+
+vae.load_state_dict(torch.load(
+    current_best_recon_path,
+    map_location=device
+))
+vae.eval()
+# Freeze encoder parameters
+for param in vae.encoder.parameters():
+    param.requires_grad = False
+
+# --- Compute global μ statistics for normalization ---
+all_mu = []
+with torch.no_grad():
+    for (_, y, m) in train_dl:
+        M = meta["entity_mask"].to(device)  # [B, N]
+        y = yb.to(device)  # [B, N, H]
+        B, N, H = y.shape
+        y_flat = y.reshape(B * N, H)
+        m_flat = M.reshape(B * N)
+        if not m_flat.any():
+            continue
+        y_in = y_flat[m_flat].unsqueeze(-1)
+        _, mu, _ = vae(y_in)
+        all_mu.append(mu.cpu())
+all_mu = torch.cat(all_mu, dim=0)  # [N, L, D]
+_, mu_d, std_d = normalize_and_check(all_mu, plot=True)
 
