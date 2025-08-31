@@ -131,7 +131,6 @@ class ODELaplaceGuidedSummarizer(nn.Module):
         aux = {"V_sig": V_sig, "T_sig": T_sig, "lap_V": L_v, "lap_T": L_t, "w_v": a.detach(), "w_t": b.detach()}
         return summary, aux
 
-
 # # ---------- Pole-wise derivative in Laplace-feature space ----------
 # class PolewiseDiff(nn.Module):
 #     """
@@ -488,4 +487,5 @@ class ODELaplaceGuidedSummarizer(nn.Module):
 #         }
 
 #         return summary, aux
+
 
