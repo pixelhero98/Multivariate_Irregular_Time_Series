@@ -1,7 +1,6 @@
 import os, math
 import torch, importlib
 import crypto_config
-import numpy as np
 from torch import nn
 from typing import Optional, Tuple
 from torch.cuda.amp import GradScaler, autocast
@@ -315,5 +314,6 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
 
 
 # ---------------- conditional generation (val & test) ----------------
+
 
 
