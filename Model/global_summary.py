@@ -23,59 +23,113 @@ class TVHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # x: [B,T,N,F]
         return self.net(x).squeeze(-1)                   #    [B,T,N]
 
-class TVHead(nn.Module):
-"""Per-entity scalar readout from features at each time: [B,T,N,F] → [B,T,N]."""
-def __init__(self, feat_dim: int, hidden: int = 32):
-super().__init__()
-self.net = nn.Sequential(
-nn.LayerNorm(feat_dim),
-nn.Linear(feat_dim, hidden), nn.GELU(),
-nn.Linear(hidden, 1)
-)
-def forward(self, x: torch.Tensor) -> torch.Tensor:
-return self.net(x).squeeze(-1)
-
-
 class ODELaplaceGuidedSummarizer(nn.Module):
-"""
-Simplified global summarizer using Laplace features over time.
-• Build per-entity scalars V(t) and T(t) via tiny heads
-• Apply simple Laplace basis: L_v = lap(V), L_t = lap(T)
-• Learnable scalars a,b mix streams: L = a*L_v + b*L_t
-• Project Laplace tokens and concatenate to context memory
-• Cross-attend learned queries to produce [B,Lq,H]
-"""
-def __init__(self,
-num_entities: int,
-feat_dim: int,
-hidden_dim: int,
-out_len: int,
-num_heads: int = 4,
-lap_k: int = 8,
-dropout: float = 0.0,
-add_guidance_tokens: bool = True,
-**_):
-super().__init__()
-assert hidden_dim % num_heads == 0
-self.N, self.F, self.H = num_entities, feat_dim, hidden_dim
-self.num_heads = num_heads
-self.add_guidance_tokens = add_guidance_tokens
+    """
+    Simplified global summarizer using Laplace features over time.
+      • Build per-entity scalars V(t) and T(t) via tiny heads
+      • Apply simple Laplace basis: L_v = lap(V), L_t = lap(T)
+      • Learnable scalars a,b mix streams: L = a*L_v + b*L_t
+      • Project Laplace tokens and concatenate to context memory
+      • Cross-attend learned queries to produce [B,Lq,H]
+    """
+    def __init__(self,
+                 num_entities: int,
+                 feat_dim: int,
+                 hidden_dim: int,
+                 out_len: int,
+                 num_heads: int = 4,
+                 lap_k: int = 8,
+                 dropout: float = 0.0,
+                 add_guidance_tokens: bool = True,
+                 **_):
+        super().__init__()
+        assert hidden_dim % num_heads == 0
+        self.N, self.F, self.H = num_entities, feat_dim, hidden_dim
+        self.num_heads = num_heads
+        self.add_guidance_tokens = add_guidance_tokens
 
+        # Context projection: [B,T,NF] → [B,T,H]
+        self.ctx_proj = nn.Linear(num_entities * feat_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
 
-# Context projection: [B,T,NF] → [B,T,H]
-self.ctx_proj = nn.Linear(num_entities * feat_dim, hidden_dim)
-self.dropout = nn.Dropout(dropout)
-self.norm = nn.LayerNorm(hidden_dim)
+        # Per-entity scalar heads and Laplace basis over time
+        self.v_head = TVHead(feat_dim)
+        self.t_head = TVHead(feat_dim)
+        self.lap = LearnableLaplacianBasis(k=lap_k, feat_dim=num_entities)
 
+        # Learnable mix scalars a, b (positive via softplus) init≈1.0
+        init_raw = math.log(math.e - 1.0)  # ~0.5413 → softplus=1.0
+        self.w_v_raw = nn.Parameter(torch.tensor(init_raw))
+        self.w_t_raw = nn.Parameter(torch.tensor(init_raw))
 
-# Per-entity scalar heads and Laplace basis over time
-self.v_head = TVHead(feat_dim)
-self.t_head = TVHead(feat_dim)
-self.lap = LearnableLaplacianBasis(k=lap_k, feat_dim=num_entities)
+        if add_guidance_tokens:
+            self.lap_token_proj = nn.Linear(2 * lap_k, hidden_dim)
 
+        # Learned queries + MHA
+        self.queries = nn.Parameter(torch.randn(out_len, hidden_dim) / math.sqrt(hidden_dim))
+        self.mha = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads,
+                                         dropout=dropout, batch_first=True)
 
-# Learnable mix scalars a, b (positive via softplus)
-return summary, aux
+    def forward(self,
+                x: torch.Tensor,                    # [B,T,N,F]
+                pad_mask: Optional[torch.Tensor] = None,  # [B,T] True=ignore
+                dt: torch.Tensor = None,            # accepted but ignored (compat)
+                ctx_diff: torch.Tensor = None,      # [B,T,N,F]
+                entity_mask: Optional[torch.Tensor] = None,
+                ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        B, T, N, F = x.shape
+        device = x.device
+
+        # mask entities if provided
+        mN = None
+        if entity_mask is not None:
+            mN = entity_mask.to(device=x.device, dtype=x.dtype)
+            if mN.dim() == 2:  # [B,N] -> [B,1,N] -> [B,T,N]
+                mN = mN.unsqueeze(1).expand(B, T, N)
+            x = x * mN.unsqueeze(-1)
+
+        # context memory from raw features
+        ctx = x.reshape(B, T, N * F)
+        K = self.ctx_proj(ctx) + _pos_emb(T, self.H, device=device)
+
+        # per-entity scalars for V and T
+        V_sig = self.v_head(x)                               # [B,T,N]
+        if ctx_diff is None:
+            x_diff = torch.zeros_like(x)
+            x_diff[:, 1:] = x[:, 1:] - x[:, :-1]
+        else:
+            x_diff = ctx_diff.to(device)
+        if mN is not None:
+            x_diff = x_diff * mN.unsqueeze(-1)
+        T_sig = self.t_head(x_diff)                          # [B,T,N]
+
+        # Laplace over time on both streams & learnable mix
+        L_v = self.lap(V_sig)                                # [B,T,2K]
+        L_t = self.lap(T_sig)                                # [B,T,2K]
+        a = F.softplus(self.w_v_raw)                         # ≥0
+        b = F.softplus(self.w_t_raw)                         # ≥0
+        L = a * L_v + b * L_t                                # [B,T,2K]
+
+        # build memory (concat lap tokens)
+        if self.add_guidance_tokens:
+            lap_tokens = self.lap_token_proj(L)              # [B,T,H]
+            memory = torch.cat([K, lap_tokens], dim=1)       # [B,2T,H]
+            values = memory
+            key_padding_mask = (None if pad_mask is None else
+                                torch.cat([pad_mask.to(torch.bool),
+                                           torch.zeros(B, T, device=device, dtype=torch.bool)], dim=1))
+        else:
+            memory = values = K
+            key_padding_mask = None if pad_mask is None else pad_mask.to(torch.bool)
+
+        # cross-attend learned queries to memory
+        Q = self.queries.unsqueeze(0).expand(B, -1, -1)
+        summary, _ = self.mha(Q, memory, values, key_padding_mask=key_padding_mask)
+        summary = self.norm(self.dropout(summary) + Q)
+
+        aux = {"V_sig": V_sig, "T_sig": T_sig, "lap_V": L_v, "lap_T": L_t, "w_v": a.detach(), "w_t": b.detach()}
+        return summary, aux
 
 
 # # ---------- Pole-wise derivative in Laplace-feature space ----------
@@ -434,3 +488,4 @@ return summary, aux
 #         }
 
 #         return summary, aux
+
