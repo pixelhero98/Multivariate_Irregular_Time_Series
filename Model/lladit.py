@@ -9,53 +9,29 @@ from Model.lapformer import LapFormer
 
 
 class LLapDiT(nn.Module):
-    def __init__(self, data_dim: int, hidden_dim: int, num_layers: int, 
-                 num_heads: int, *, predict_type: str = 'v', 
-                 laplace_k: Union[int, List[int]] = 32, global_k: int = 64, 
-                 timesteps: int = 1000, schedule: str = 'cosine', 
-                 dropout: float = 0.0, attn_dropout: float = 0.0, 
-                 self_conditioning: bool = False, context_dim: Optional[int] = None,
-                 num_entities: int = None, context_len: int = 16):
+    def __init__(self, data_dim: int, hidden_dim: int, num_layers: int, num_heads: int, *, predict_type: str = 'v', laplace_k: Union[int, List[int]] = 32, global_k: int = 64, timesteps: int = 1000, schedule: str = 'cosine', dropout: float = 0.0, attn_dropout: float = 0.0, self_conditioning: bool = False, context_dim: Optional[int] = None, num_entities: int = None, context_len: int = 16):
         super().__init__()
         assert predict_type in ('eps', 'v')
         if num_entities is None: raise ValueError("num_entities must be provided (int) for the global summarizer.")
         self.predict_type = predict_type; self.self_conditioning = bool(self_conditioning)
         self.scheduler = NoiseScheduler(timesteps=timesteps, schedule=schedule)
         ctx_dim = context_dim if context_dim is not None else data_dim
-        self.context = ODELaplaceGuidedSummarizer(num_entities=num_entities, feat_dim=ctx_dim, 
-                                                  hidden_dim=hidden_dim, out_len=context_len, 
-                                                  num_heads=num_heads, lap_k=global_k)
-        self.model = LapFormer(input_dim=data_dim, hidden_dim=hidden_dim, num_layers=num_layers,
-                               num_heads=num_heads, laplace_k=laplace_k, dropout=dropout, 
-                               attn_dropout=attn_dropout, self_conditioning=self_conditioning)
+        self.context = ODELaplaceGuidedSummarizer(num_entities=num_entities, feat_dim=ctx_dim, hidden_dim=hidden_dim, out_len=context_len, num_heads=num_heads, lap_k=global_k)
+        self.model = LapFormer(input_dim=data_dim, hidden_dim=hidden_dim, num_layers=num_layers, num_heads=num_heads, laplace_k=laplace_k, dropout=dropout, attn_dropout=attn_dropout, self_conditioning=self_conditioning)
         self.time_dim = hidden_dim
     def _time_embed(self, t: torch.Tensor) -> torch.Tensor:
         te = timestep_embedding(t, self.time_dim)
         return F.silu(te)
-    def _maybe_build_cond(self, series, cond_summary=None,
-                          entity_ids=None, ctx_dt=None,
-                          ctx_diff=None, entity_mask=None):
+    def _maybe_build_cond(self, series, cond_summary=None, entity_ids=None, ctx_dt=None, ctx_diff=None, entity_mask=None):
         if cond_summary is not None or series is None: return cond_summary
         summary, _ = self.context(series, pad_mask=None, ctx_diff=ctx_diff, entity_mask=entity_mask)
         return summary
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor, *,
-                series: Optional[torch.Tensor] = None, series_mask: Optional[torch.Tensor] = None,
-                cond_summary: Optional[torch.Tensor] = None, entity_ids: Optional[torch.Tensor] = None,
-                sc_feat: Optional[torch.Tensor] = None, dt: Optional[torch.Tensor] = None, 
-                series_dt: Optional[torch.Tensor] = None, series_diff: Optional[torch.Tensor] = None) -> torch.Tensor:
-        cond_summary = self._maybe_build_cond(series, cond_summary=cond_summary, 
-                                              entity_ids=entity_ids, ctx_dt=series_dt, 
-                                              ctx_diff=series_diff, entity_mask=series_mask)
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, *, series: Optional[torch.Tensor] = None, series_mask: Optional[torch.Tensor] = None, cond_summary: Optional[torch.Tensor] = None, entity_ids: Optional[torch.Tensor] = None, sc_feat: Optional[torch.Tensor] = None, dt: Optional[torch.Tensor] = None, series_dt: Optional[torch.Tensor] = None, series_diff: Optional[torch.Tensor] = None) -> torch.Tensor:
+        cond_summary = self._maybe_build_cond(series, cond_summary=cond_summary, entity_ids=entity_ids, ctx_dt=series_dt, ctx_diff=series_diff, entity_mask=series_mask)
         t_emb = self._time_embed(t).to(x_t.dtype)
         return self.model(x_t, t_emb, cond_summary=cond_summary, sc_feat=sc_feat)
     @torch.no_grad()
-    def generate(self, shape, steps: int = 36, guidance_strength=2.0, 
-                 guidance_power: float = 0.3, eta: float = 0.0, *,
-                 series=None, series_mask=None, cond_summary=None, 
-                 entity_ids=None, y_obs: torch.Tensor = None, 
-                 obs_mask: torch.Tensor = None, dt: Optional[torch.Tensor] = None, 
-                 series_dt: Optional[torch.Tensor] = None, series_diff: Optional[torch.Tensor] = None, 
-                 cfg_rescale: bool = True, self_cond: bool = True,):
+    def generate(self, shape, steps: int = 36, guidance_strength=2.0, guidance_power: float = 0.3, eta: float = 0.0, *, series=None, series_mask=None, cond_summary=None, entity_ids=None, y_obs: torch.Tensor = None, obs_mask: torch.Tensor = None, dt: Optional[torch.Tensor] = None, series_dt: Optional[torch.Tensor] = None, series_diff: Optional[torch.Tensor] = None, cfg_rescale: bool = True, self_cond: bool = True,):
         device = next(self.parameters()).device
         B, L, D = shape
         def _alpha_bar(t_b):
@@ -100,12 +76,8 @@ class LLapDiT(nn.Module):
         last_x0 = None
         for t_i, t_prev_i in zip(step_indices, ts_prev):
             t_b = t_i.repeat(B)
-            pred_u = self.forward(x_t, t_b, series=None, series_mask=None, 
-                                  cond_summary=None, sc_feat=sc_feat_next if self_cond else None,
-                                  entity_ids=entity_ids)
-            pred_c = self.forward(x_t, t_b, series=series, series_mask=series_mask,
-                                  cond_summary=cond_summary, sc_feat=sc_feat_next if self_cond else None, 
-                                  entity_ids=entity_ids, series_diff=series_diff)
+            pred_u = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None, sc_feat=sc_feat_next if self_cond else None, entity_ids=entity_ids)
+            pred_c = self.forward(x_t, t_b, series=series, series_mask=series_mask, cond_summary=cond_summary, sc_feat=sc_feat_next if self_cond else None, entity_ids=entity_ids, series_diff=series_diff)
             ab = _alpha_bar(t_b)
             if isinstance(guidance_strength, (tuple, list)):
                 g_min, g_max = guidance_strength
