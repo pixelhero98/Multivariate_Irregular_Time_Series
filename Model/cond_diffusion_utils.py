@@ -184,7 +184,21 @@ def log_pole_health(modules: List[nn.Module], log_fn, step: int, tag_prefix: str
             f"{tag_prefix}alpha_max": alpha_cat.max().item(),
             f"{tag_prefix}omega_abs_mean": omega_cat.abs().mean().item()}, step=step)
 
-
+def _print_log(metrics: dict, step: int, csv_path: str = None):
+    # pretty console log
+    msg = " | ".join(f"{k}={v:.4g}" for k, v in metrics.items())
+    print(f"[poles] step {step:>7d} | {msg}")
+    # optional CSV append
+    if csv_path is not None:
+        import csv, os
+        head = ["step"] + list(metrics.keys())
+        row  = [step]  + [metrics[k] for k in metrics]
+        write_header = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow(head)
+            w.writerow(row)
 # ------------------------- Latent stats helpers -------------------------
 def compute_per_dim_stats(all_mu: torch.Tensor):
     """
@@ -273,3 +287,4 @@ class EMA:
         for k, v in sd.items():
             if k in self.shadow:
                 self.shadow[k] = v.clone()
+
