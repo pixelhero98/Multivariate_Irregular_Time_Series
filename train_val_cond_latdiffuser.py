@@ -8,9 +8,8 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from Latent_Space.latent_vae import LatentVAE
-from Model.cond_diffusion_utils import normalize_and_check
 from Model.lladit import LLapDiT
-from Model.cond_diffusion_utils import EMA
+from Model.cond_diffusion_utils import normalize_and_check, EMA, log_pole_health, _print_log
 # ----------------------------- utils -----------------------------
 def set_torch():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -162,7 +161,7 @@ lr_sched = make_warmup_cosine(optimizer, total_steps, warmup_frac=crypto_config.
 scaler = GradScaler(enabled=(device.type=="cuda"))
 
 best_val = float("inf"); patience = 0
-current_best_path = None
+current_best_path = None; global_step = 0
 for epoch in range(1, crypto_config.EPOCHS + 1):
     # ---------------- train ----------------
     diff_model.train()
@@ -217,6 +216,16 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
             
         lr_sched.step()
 
+        # ---- pole monitoring (train) ----
+        global_step += 1
+        if global_step % 5 == 0:
+            log_pole_health(
+                modules=[diff_model],
+                log_fn=lambda m, step: _print_log(m, step, csv_path=None),
+                step=global_step,
+                tag_prefix="train/"
+            )
+        
         train_sum += loss.item() * mu_norm.size(0)
         train_count += mu_norm.size(0)
 
@@ -229,6 +238,13 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
     if ema is not None:
         ema.store(diff_model)
         ema.copy_to(diff_model)
+
+        log_pole_health(
+            modules=[diff_model],
+            log_fn=lambda m, step: _print_log(m, step, csv_path=None),
+            step=global_step,
+            tag_prefix="val/"
+        )
         
     with torch.no_grad():
         for xb, yb, meta in val_dl:
@@ -299,4 +315,5 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
 
 
 # ---------------- conditional generation (val & test) ----------------
+
 
