@@ -172,3 +172,123 @@ class LearnableInverseLaplacianBasis(nn.Module):
         h = self.act(self.fc1(h))
         x_hat = self.fc2(h)  # [B,T,D]
         return x_hat
+
+
+
+
+
+# class LearnableLaplacianBasis(nn.Module):
+#     """
+#     Plain, effective Laplace analysis over the time axis.
+#       x : [B, T, D] -> lap_feats : [B, T, 2k]
+
+#     Differences vs your snippet:
+#     - compute complex exp in float32 (complex64) for AMP stability
+#     - clamp |omega| to a safe band
+#     - same spectral-norm projection, same shapes
+#     """
+#     def __init__(
+#         self,
+#         k: int,
+#         feat_dim: int,
+#         alpha_min: float = 1e-6,
+#         omega_max: float = math.pi,
+#     ):
+#         super().__init__()
+#         self.k = k
+#         self.alpha_min = float(alpha_min)
+#         self.omega_max = float(omega_max)
+
+#         # trainable poles: (alpha >= 0, beta unrestricted then clamped)
+#         self.s_real = nn.Parameter(torch.empty(k))  # raw alpha (pre-softplus)
+#         self.s_imag = nn.Parameter(torch.empty(k))  # beta (frequency)
+
+#         # learned projection feat_dim -> k with spectral norm
+#         self.proj = spectral_norm(
+#             nn.Linear(feat_dim, k, bias=True),
+#             n_power_iterations=1, eps=1e-6
+#         )
+#         self.reset_parameters()
+
+#     def reset_parameters(self):
+#         with torch.no_grad():
+#             # small positive alpha, uniform phase
+#             nn.init.uniform_(self.s_real, a=0.0, b=0.1)
+#             nn.init.uniform_(self.s_imag, a=-math.pi, b=math.pi)
+#             if hasattr(self.proj, "weight_orig"):
+#                 nn.init.kaiming_uniform_(self.proj.weight_orig, a=math.sqrt(5))
+#             else:
+#                 nn.init.kaiming_uniform_(self.proj.weight, a=math.sqrt(5))
+#             if self.proj.bias is not None:
+#                 fan_in = self.proj.in_features
+#                 bound = 1 / math.sqrt(fan_in)
+#                 nn.init.uniform_(self.proj.bias, -bound, bound)
+
+#     def forward(self, x: torch.Tensor, *_, **__) -> torch.Tensor:
+#         """
+#         Args:
+#             x: (B, T, feat_dim)
+#         Returns:
+#             lap_feats: (B, T, 2*k)  (concat real/imag parts)
+#         Notes:
+#             - ignores extra args for drop-in compatibility
+#             - does complex exp in float32 for stability, then casts back
+#         """
+#         B, T, _ = x.shape
+#         device = x.device
+#         dtype  = x.dtype
+
+#         # stable pole params
+#         alpha = F.softplus(self.s_real) + self.alpha_min            # [k], >= alpha_min
+#         beta  = self.s_imag.clamp(-self.omega_max, self.omega_max)  # [k], bounded
+
+#         # time indices (float32 to avoid fp16 complex issues)
+#         t_idx = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(1)  # [T,1]
+
+#         # complex exponent in complex64
+#         s = torch.complex(-alpha.float(), beta.float())             # [k], complex64
+#         expo = torch.exp(t_idx * s.unsqueeze(0))                    # [T,k] complex64
+#         re_basis = expo.real.to(dtype)                              # [T,k]
+#         im_basis = expo.imag.to(dtype)                              # [T,k]
+
+#         # learned collapse feat_dim->k at each (B,T)
+#         proj_feats = self.proj(x)                                   # [B,T,k]
+
+#         # elementwise modulation
+#         real_proj = proj_feats * re_basis.unsqueeze(0)              # [B,T,k]
+#         imag_proj = proj_feats * im_basis.unsqueeze(0)              # [B,T,k]
+
+#         return torch.cat([real_proj, imag_proj], dim=2).contiguous()  # [B,T,2k]
+
+
+# class LearnableInverseLaplacianBasis(nn.Module):
+#     """
+#     Simple readout 2k -> D with mild regularization (spectral norm).
+#     """
+#     def __init__(self, laplace_basis: LearnableLaplacianBasis):
+#         super().__init__()
+#         self.lap = laplace_basis
+#         D = laplace_basis.proj.in_features
+#         C = 2 * laplace_basis.k
+
+#         self.norm = nn.LayerNorm(C)
+#         self.fc1  = spectral_norm(nn.Linear(C, max(C, D)), n_power_iterations=1, eps=1e-6)
+#         self.act  = nn.GELU()
+#         self.fc2  = spectral_norm(nn.Linear(max(C, D), D), n_power_iterations=1, eps=1e-6)
+
+#         # nice init: identity through fc1; seed fc2 from analysis.proj^T (cos block)
+#         with torch.no_grad():
+#             w1 = getattr(self.fc1, "weight_orig", self.fc1.weight); w1.zero_()
+#             eye = torch.eye(C, device=w1.device, dtype=w1.dtype)
+#             w1[:min(w1.shape[0], C), :C].copy_(eye[:min(w1.shape[0], C), :])
+#             w2 = getattr(self.fc2, "weight_orig", self.fc2.weight); w2.zero_()
+#             if getattr(self.fc2, "bias", None) is not None:
+#                 self.fc2.bias.zero_()
+#             W = self.lap.proj.weight.data  # [k,D]
+#             if w2.shape[1] >= W.shape[0]:
+#                 w2[:, :W.shape[0]].copy_(W.t())
+
+#     def forward(self, lap_feats: torch.Tensor) -> torch.Tensor:
+#         h = self.norm(lap_feats)
+#         h = self.act(self.fc1(h))
+#         return self.fc2(h)
