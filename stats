@@ -1,35 +1,119 @@
-Epoch 1/1500 - β=0.000 | Train ELBO: 2.015367 (Recon: 1.642032, KL/elem: 0.373335) | Val   ELBO: 1.108545 (Recon: 0.767884, KL/elem: 0.340661)
+Starting training.
+Epoch 1/1500 - β=0.000 | Train ELBO: 2.133056 (Recon: 1.778119, KL/elem: 0.354937) | Val   ELBO: 1.087743 (Recon: 0.773572, KL/elem: 0.314171)
   -> Saved best ELBO
   -> Saved best Recon
-Epoch 2/1500 - β=0.000 | Train ELBO: 1.496592 (Recon: 1.131647, KL/elem: 0.364945) | Val   ELBO: 0.863386 (Recon: 0.521804, KL/elem: 0.341581)
+Epoch 2/1500 - β=0.000 | Train ELBO: 1.438154 (Recon: 1.102250, KL/elem: 0.335904) | Val   ELBO: 0.775793 (Recon: 0.465665, KL/elem: 0.310128)
   -> Saved best ELBO
   -> Saved best Recon
-Epoch 3/1500 - β=0.000 | Train ELBO: 1.215488 (Recon: 0.835651, KL/elem: 0.379837) | Val   ELBO: 0.747360 (Recon: 0.385091, KL/elem: 0.362269)
+Epoch 3/1500 - β=0.000 | Train ELBO: 1.146223 (Recon: 0.792670, KL/elem: 0.353553) | Val   ELBO: 0.700046 (Recon: 0.359125, KL/elem: 0.340920)
   -> Saved best ELBO
   -> Saved best Recon
-Epoch 4/1500 - β=0.000 | Train ELBO: 1.034516 (Recon: 0.606984, KL/elem: 0.427532) | Val   ELBO: 0.698387 (Recon: 0.288351, KL/elem: 0.410036)
+Epoch 4/1500 - β=0.000 | Train ELBO: 1.044521 (Recon: 0.644442, KL/elem: 0.400080) | Val   ELBO: 0.691831 (Recon: 0.309810, KL/elem: 0.382021)
   -> Saved best ELBO
   -> Saved best Recon
-Epoch 5/1500 - β=0.000 | Train ELBO: 0.931118 (Recon: 0.416319, KL/elem: 0.514799) | Val   ELBO: 0.695070 (Recon: 0.207112, KL/elem: 0.487958)
+Epoch 5/1500 - β=0.000 | Train ELBO: 0.996091 (Recon: 0.543424, KL/elem: 0.452667) | Val   ELBO: 0.691192 (Recon: 0.270420, KL/elem: 0.420772)
   -> Saved best ELBO
   -> Saved best Recon
-Epoch 6/1500 - β=0.000 | Train ELBO: 0.925016 (Recon: 0.291829, KL/elem: 0.633187) | Val   ELBO: 0.736818 (Recon: 0.144298, KL/elem: 0.592521)
-  -> Saved best Recon
-Epoch 7/1500 - β=0.000 | Train ELBO: 0.983857 (Recon: 0.218652, KL/elem: 0.765205) | Val   ELBO: 0.812435 (Recon: 0.102160, KL/elem: 0.710275)
-  -> Saved best Recon
-Epoch 8/1500 - β=0.000 | Train ELBO: 1.069486 (Recon: 0.172427, KL/elem: 0.897058) | Val   ELBO: 0.906241 (Recon: 0.075418, KL/elem: 0.830823)
-  -> Saved best Recon
-Epoch 9/1500 - β=0.000 | Train ELBO: 1.165285 (Recon: 0.140312, KL/elem: 1.024973) | Val   ELBO: 1.006211 (Recon: 0.057829, KL/elem: 0.948382)
-  -> Saved best Recon
-Epoch 10/1500 - β=0.000 | Train ELBO: 1.263630 (Recon: 0.117860, KL/elem: 1.145770) | Val   ELBO: 1.105464 (Recon: 0.045702, KL/elem: 1.059762)
-  -> Saved best Recon
-Epoch 11/1500 - β=4.000 | Train ELBO: 1.063232 (Recon: 0.125162, KL/elem: 0.938070) | Val   ELBO: 0.565533 (Recon: 0.109253, KL/elem: 0.456280)
+Epoch 6/1500 - β=0.000 | Train ELBO: 0.957563 (Recon: 0.452434, KL/elem: 0.505130) | Val   ELBO: 0.683326 (Recon: 0.225629, KL/elem: 0.457697)
   -> Saved best ELBO
-Epoch 12/1500 - β=4.000 | Train ELBO: 0.651671 (Recon: 0.244779, KL/elem: 0.406892) | Val   ELBO: 0.382232 (Recon: 0.198650, KL/elem: 0.183583)
+  -> Saved best Recon
+Epoch 7/1500 - β=0.000 | Train ELBO: 0.924285 (Recon: 0.365877, KL/elem: 0.558408) | Val   ELBO: 0.670641 (Recon: 0.174672, KL/elem: 0.495969)
   -> Saved best ELBO
-Epoch 13/1500 - β=4.000 | Train ELBO: 0.558738 (Recon: 0.359403, KL/elem: 0.199336) | Val   ELBO: 0.332160 (Recon: 0.240262, KL/elem: 0.091898)
+  -> Saved best Recon
+Epoch 8/1500 - β=0.000 | Train ELBO: 0.901646 (Recon: 0.287010, KL/elem: 0.614636) | Val   ELBO: 0.669305 (Recon: 0.129409, KL/elem: 0.539896)
   -> Saved best ELBO
-Epoch 14/1500 - β=4.000 | Train ELBO: 0.521479 (Recon: 0.394636, KL/elem: 0.126844) | Val   ELBO: 0.301719 (Recon: 0.241670, KL/elem: 0.060049)
+  -> Saved best Recon
+Epoch 9/1500 - β=0.000 | Train ELBO: 0.899309 (Recon: 0.222100, KL/elem: 0.677209) | Val   ELBO: 0.686579 (Recon: 0.093123, KL/elem: 0.593457)
+  -> Saved best Recon
+Epoch 10/1500 - β=0.000 | Train ELBO: 0.921789 (Recon: 0.173554, KL/elem: 0.748235) | Val   ELBO: 0.728057 (Recon: 0.068113, KL/elem: 0.659944)
+  -> Saved best Recon
+Epoch 11/1500 - β=1.000 | Train ELBO: 0.807830 (Recon: 0.161088, KL/elem: 0.646743) | Val   ELBO: 0.442549 (Recon: 0.099248, KL/elem: 0.343301)
   -> Saved best ELBO
-Epoch 15/1500 - β=4.000 | Train ELBO: 0.493126 (Recon: 0.391633, KL/elem: 0.101493) | Val   ELBO: 0.279545 (Recon: 0.232153, KL/elem: 0.047392)
+Epoch 12/1500 - β=1.000 | Train ELBO: 0.565501 (Recon: 0.204338, KL/elem: 0.361164) | Val   ELBO: 0.330942 (Recon: 0.128007, KL/elem: 0.202934)
   -> Saved best ELBO
+Epoch 13/1500 - β=1.000 | Train ELBO: 0.482740 (Recon: 0.215016, KL/elem: 0.267724) | Val   ELBO: 0.284270 (Recon: 0.120020, KL/elem: 0.164250)
+  -> Saved best ELBO
+Epoch 14/1500 - β=1.000 | Train ELBO: 0.440192 (Recon: 0.202958, KL/elem: 0.237234) | Val   ELBO: 0.257033 (Recon: 0.112900, KL/elem: 0.144133)
+  -> Saved best ELBO
+Epoch 15/1500 - β=1.000 | Train ELBO: 0.412678 (Recon: 0.194455, KL/elem: 0.218223) | Val   ELBO: 0.239743 (Recon: 0.109278, KL/elem: 0.130464)
+  -> Saved best ELBO
+Epoch 16/1500 - β=1.000 | Train ELBO: 0.392231 (Recon: 0.187723, KL/elem: 0.204508) | Val   ELBO: 0.225822 (Recon: 0.105300, KL/elem: 0.120522)
+  -> Saved best ELBO
+Epoch 17/1500 - β=1.000 | Train ELBO: 0.376296 (Recon: 0.181755, KL/elem: 0.194542) | Val   ELBO: 0.214889 (Recon: 0.101694, KL/elem: 0.113195)
+  -> Saved best ELBO
+Epoch 18/1500 - β=1.000 | Train ELBO: 0.363510 (Recon: 0.176787, KL/elem: 0.186723) | Val   ELBO: 0.206738 (Recon: 0.099068, KL/elem: 0.107670)
+  -> Saved best ELBO
+Epoch 19/1500 - β=1.000 | Train ELBO: 0.352194 (Recon: 0.171637, KL/elem: 0.180557) | Val   ELBO: 0.199900 (Recon: 0.096577, KL/elem: 0.103323)
+  -> Saved best ELBO
+Epoch 20/1500 - β=1.000 | Train ELBO: 0.342674 (Recon: 0.167206, KL/elem: 0.175468) | Val   ELBO: 0.194179 (Recon: 0.094198, KL/elem: 0.099981)
+  -> Saved best ELBO
+Epoch 21/1500 - β=1.000 | Train ELBO: 0.333753 (Recon: 0.162613, KL/elem: 0.171139) | Val   ELBO: 0.189399 (Recon: 0.092371, KL/elem: 0.097028)
+  -> Saved best ELBO
+Epoch 22/1500 - β=1.000 | Train ELBO: 0.326009 (Recon: 0.158711, KL/elem: 0.167298) | Val   ELBO: 0.185204 (Recon: 0.090477, KL/elem: 0.094728)
+  -> Saved best ELBO
+Epoch 23/1500 - β=1.000 | Train ELBO: 0.319337 (Recon: 0.155138, KL/elem: 0.164199) | Val   ELBO: 0.180782 (Recon: 0.087875, KL/elem: 0.092906)
+  -> Saved best ELBO
+Epoch 24/1500 - β=1.000 | Train ELBO: 0.312550 (Recon: 0.151094, KL/elem: 0.161455) | Val   ELBO: 0.177488 (Recon: 0.086115, KL/elem: 0.091373)
+  -> Saved best ELBO
+Epoch 25/1500 - β=1.000 | Train ELBO: 0.306602 (Recon: 0.147595, KL/elem: 0.159007) | Val   ELBO: 0.174134 (Recon: 0.084212, KL/elem: 0.089922)
+  -> Saved best ELBO
+Epoch 26/1500 - β=1.000 | Train ELBO: 0.301278 (Recon: 0.144557, KL/elem: 0.156721) | Val   ELBO: 0.171221 (Recon: 0.082484, KL/elem: 0.088737)
+  -> Saved best ELBO
+Epoch 27/1500 - β=1.000 | Train ELBO: 0.295640 (Recon: 0.140991, KL/elem: 0.154648) | Val   ELBO: 0.168635 (Recon: 0.080837, KL/elem: 0.087798)
+  -> Saved best ELBO
+Epoch 28/1500 - β=1.000 | Train ELBO: 0.290645 (Recon: 0.137759, KL/elem: 0.152886) | Val   ELBO: 0.165655 (Recon: 0.078716, KL/elem: 0.086939)
+  -> Saved best ELBO
+Epoch 29/1500 - β=1.000 | Train ELBO: 0.286030 (Recon: 0.134853, KL/elem: 0.151177) | Val   ELBO: 0.163642 (Recon: 0.077407, KL/elem: 0.086235)
+  -> Saved best ELBO
+Epoch 30/1500 - β=1.000 | Train ELBO: 0.281448 (Recon: 0.131948, KL/elem: 0.149500) | Val   ELBO: 0.161525 (Recon: 0.076029, KL/elem: 0.085495)
+  -> Saved best ELBO
+Epoch 31/1500 - β=1.000 | Train ELBO: 0.277171 (Recon: 0.129165, KL/elem: 0.148006) | Val   ELBO: 0.159498 (Recon: 0.074639, KL/elem: 0.084858)
+  -> Saved best ELBO
+Epoch 32/1500 - β=1.000 | Train ELBO: 0.272726 (Recon: 0.126123, KL/elem: 0.146603) | Val   ELBO: 0.156761 (Recon: 0.072512, KL/elem: 0.084249)
+  -> Saved best ELBO
+Epoch 33/1500 - β=1.000 | Train ELBO: 0.268611 (Recon: 0.123450, KL/elem: 0.145161) | Val   ELBO: 0.154920 (Recon: 0.071138, KL/elem: 0.083782)
+  -> Saved best ELBO
+Epoch 34/1500 - β=1.000 | Train ELBO: 0.264827 (Recon: 0.120955, KL/elem: 0.143872) | Val   ELBO: 0.152618 (Recon: 0.069254, KL/elem: 0.083364)
+  -> Saved best ELBO
+Epoch 35/1500 - β=1.000 | Train ELBO: 0.260908 (Recon: 0.118339, KL/elem: 0.142569) | Val   ELBO: 0.150602 (Recon: 0.067783, KL/elem: 0.082818)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 36/1500 - β=1.000 | Train ELBO: 0.257217 (Recon: 0.115952, KL/elem: 0.141265) | Val   ELBO: 0.148386 (Recon: 0.065871, KL/elem: 0.082515)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 37/1500 - β=1.000 | Train ELBO: 0.253620 (Recon: 0.113355, KL/elem: 0.140265) | Val   ELBO: 0.146710 (Recon: 0.064536, KL/elem: 0.082174)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 38/1500 - β=1.000 | Train ELBO: 0.250008 (Recon: 0.111059, KL/elem: 0.138949) | Val   ELBO: 0.145355 (Recon: 0.063563, KL/elem: 0.081792)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 39/1500 - β=1.000 | Train ELBO: 0.246722 (Recon: 0.108845, KL/elem: 0.137878) | Val   ELBO: 0.142917 (Recon: 0.061289, KL/elem: 0.081628)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 40/1500 - β=1.000 | Train ELBO: 0.243256 (Recon: 0.106355, KL/elem: 0.136901) | Val   ELBO: 0.141249 (Recon: 0.059915, KL/elem: 0.081334)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 41/1500 - β=1.000 | Train ELBO: 0.239846 (Recon: 0.104057, KL/elem: 0.135789) | Val   ELBO: 0.139567 (Recon: 0.058428, KL/elem: 0.081139)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 42/1500 - β=1.000 | Train ELBO: 0.236627 (Recon: 0.101858, KL/elem: 0.134769) | Val   ELBO: 0.138264 (Recon: 0.057328, KL/elem: 0.080936)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 43/1500 - β=1.000 | Train ELBO: 0.233570 (Recon: 0.099677, KL/elem: 0.133893) | Val   ELBO: 0.136335 (Recon: 0.055514, KL/elem: 0.080821)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 44/1500 - β=1.000 | Train ELBO: 0.230484 (Recon: 0.097533, KL/elem: 0.132951) | Val   ELBO: 0.134820 (Recon: 0.054206, KL/elem: 0.080614)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 45/1500 - β=1.000 | Train ELBO: 0.227513 (Recon: 0.095555, KL/elem: 0.131958) | Val   ELBO: 0.133363 (Recon: 0.052877, KL/elem: 0.080487)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 46/1500 - β=1.000 | Train ELBO: 0.224560 (Recon: 0.093406, KL/elem: 0.131154) | Val   ELBO: 0.132216 (Recon: 0.051837, KL/elem: 0.080379)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 47/1500 - β=1.000 | Train ELBO: 0.222079 (Recon: 0.091766, KL/elem: 0.130314) | Val   ELBO: 0.130955 (Recon: 0.050541, KL/elem: 0.080413)
+  -> Saved best ELBO
+  -> Saved best Recon
+Epoch 48/1500 - β=1.000 | Train ELBO: 0.219329 (Recon: 0.089781, KL/elem: 0.129548) | Val   ELBO: 0.129504 (Recon: 0.049077, KL/elem: 0.080428)
+  -> Saved best ELBO
+  -> Saved best Recon
