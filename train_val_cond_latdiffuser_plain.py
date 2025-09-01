@@ -140,7 +140,12 @@ vae.eval()
 for p in vae.encoder.parameters():  # freeze encoder (optional)
     p.requires_grad = False
 
-mu_mean, mu_std = compute_latent_stats(vae, train_dl, device)
+mu_mean, mu_std = compute_latent_stats(
+    vae, train_dl, device,
+    use_ewma=crypto_config.USE_EWMA,
+    ewma_lambda=crypto_config.EWMA_LAMBDA
+)
+
 
 # ---- Conditional diffusion model ----
 # IMPORTANT: ctx_dim = Fv (== Ft). LLapDiT/summary will *not* concat V and T;
