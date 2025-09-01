@@ -58,9 +58,12 @@ def diffusion_loss(model: LLapDiT, scheduler, x0_lat_norm: torch.Tensor, t: torc
     return (pred - target).pow(2).mean()
 
 @torch.no_grad()
-def compute_latent_stats(vae: LatentVAE, dataloader, device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Collect μ across train set to get global mean/std (for whitening)."""
-    all_mu = []
+def compute_latent_stats(
+    vae: LatentVAE, dataloader, device,
+    use_ewma: bool, ewma_lambda: float
+):
+    """Collect μ, apply the SAME window-wise step as training, then compute global per-dim mean/std."""
+    all_mu_w = []
     for (_, y, meta) in tqdm(dataloader, desc="Collect μ stats"):
         m = meta["entity_mask"]             # [B,N] bool
         B, N, H = y.shape
@@ -69,16 +72,24 @@ def compute_latent_stats(vae: LatentVAE, dataloader, device) -> Tuple[torch.Tens
         if not m_flat.any():
             continue
         y_in = y_flat[m_flat].to(device)
-        with torch.no_grad():
 
-        _, mu, _ = vae(y_in)
-        all_mu.append(mu.detach().cpu())
-    if len(all_mu) == 0:
+        _, mu, _ = vae(y_in)                # mu: [B_eff, H, Z]
+        if use_ewma:
+            s = ewma_std(mu, lam=ewma_lambda)                     # [B_eff,1,Z]
+        else:
+            s = mu.std(dim=1, keepdim=True).clamp_min(1e-6)       # [B_eff,1,Z]
+        mu_w = (mu / s).clamp(-5, 5)                              # SAME clipping as training
+        all_mu_w.append(mu_w.detach().cpu())
+
+    if len(all_mu_w) == 0:
         mu_cat = torch.zeros(1, 1, crypto_config.VAE_LATENT_DIM)
     else:
-        mu_cat = torch.cat(all_mu, dim=0)
-    _, mu_mean, mu_std = normalize_and_check(mu_cat)
-    return mu_mean.to(device), mu_std.to(device)
+        mu_cat = torch.cat(all_mu_w, dim=0)                       # [Nseq, H, Z]
+
+    # global per-dim stats on mu_w (not raw mu)
+    mu_mean = mu_cat.mean(dim=(0,1)).to(device)                   # [Z]
+    mu_std  = mu_cat.std (dim=(0,1)).clamp_min(1e-6).to(device)   # [Z]
+    return mu_mean, mu_std
 
 # ----------------------------- main -----------------------------
 device = set_torch()
