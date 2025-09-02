@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from Latent_Space.latent_vae import LatentVAE
 from Model.lladit import LLapDiT
-from Model.cond_diffusion_utils import normalize_and_check, EMA, log_pole_health, _print_log
+from Model.cond_diffusion_utils import EMA, log_pole_health, _print_log
 
 # ----------------------------- utils -----------------------------
 def set_torch():
