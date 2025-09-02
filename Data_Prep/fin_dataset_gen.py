@@ -731,15 +731,12 @@ class _IndexBackedDataset(Dataset):
 # --------------------- Date grouping helpers for ratio-split ---------------------
 
 def _normalize_to_day(ts: np.ndarray) -> np.ndarray:
-    # Expect ts as datetime64[ns] or datetime64; convert to day keys (int days since epoch)
+    # ts must be datetime64[*] — convert to day keys safely
     return ts.astype('datetime64[D]').astype(np.int64)
 
-def _build_date_batches_from_pairs(order_pairs: np.ndarray,
-                                   end_times: np.ndarray,
-                                   dates_per_batch: int,
-                                   min_real_entities: int) -> List[np.ndarray]:
-    # order_pairs: [M,2] (aid, start) sorted by end_times
-    days = _normalize_to_day(end_times)
+def _build_date_batches_from_pairs(order_pairs, end_times, dates_per_batch, min_real_entities):
+    # end_times is already datetime64[ns]
+    days = _normalize_to_day(end_times)  # <-- instead of ...astype(np.int64)
     order = np.argsort(days, kind='mergesort')
     days_sorted = days[order]
     _, starts = np.unique(days_sorted, return_index=True)
@@ -912,6 +909,7 @@ def load_dataloaders_with_ratio_split(
     with open(_meta_path(data_dir), 'r') as f:
         meta = json.load(f)
     assets = meta['assets']
+    actual_N = len(assets)
     base_window = int(meta['window']);base_horizon = int(meta['horizon'])
     window = int(window if window is not None else base_window)
     horizon = int(horizon if horizon is not None else base_horizon)
@@ -927,8 +925,8 @@ def load_dataloaders_with_ratio_split(
     # Collate (levels + first-diff), grouped-by-end if requested later
     if collate_fn is None:
         collate_fn = make_collate_level_and_firstdiff(
-            n_entities=len(assets),
-            return_entity_mask = True
+            n_entities=actual_N,  # (was len(assets) already)
+            return_entity_mask=True
         )
 
     # Load small global index
@@ -1009,7 +1007,7 @@ def load_dataloaders_with_ratio_split(
     if date_batching is None:
         date_batching = (coverage_per_window > 0.0)
     if date_batching:
-        min_real = max(1, int(_ceil(coverage_per_window * n_entities))) if coverage_per_window > 0 else 1
+        min_real = 1 if coverage_per_window <= 0 else int(_ceil(coverage_per_window * actual_N))
         # recover split-specific end_times by masking
         tr_mask = (assign == 0); va_mask = (assign == 1); te_mask = (assign == 2)
         batches_tr = _build_date_batches_from_pairs(tr_pairs, end_times[tr_mask], dates_per_batch, min_real)
