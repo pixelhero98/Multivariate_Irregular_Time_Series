@@ -1,52 +1,3 @@
-"""
-Storage-light cache + ratio-split only dataloading.
-
-What this file changes vs your current module:
-- **No gigantic `train_X.npy`/`val_X.npy`/`test_X.npy` files.**
-- Caches only per-ticker feature matrices (float16) + small window indexes.
-- Keeps **only** ratio-based chronological splitting for loaders.
-- Windows are materialized **on the fly** from compact per-ticker arrays.
-- Optional date-aware batching kept (works off stored end-times).
-
-Disk impact (rule of thumb):
-    Old memmaps  : O(#windows * K * F * 4 bytes)
-    New indexcache: O(∑_tickers T * F * 2 bytes) + O(#windows * ~16 bytes)
-Typically this is ~K× smaller (often 50–100×).
-
-Drop-in path names (under data_dir):
-    cache_ratio_index/
-      ├── features_fp16/<asset_id>.npy        # [T,F] float16
-      ├── targets_fp16/<asset_id>.npy         # [T]   float16 (target series)
-      ├── times/<asset_id>.npy                # [T]   datetime64[ns]
-      ├── windows/global_pairs.npy            # [M,2] int32: (asset_id, start_idx)
-      ├── windows/end_times.npy               # [M]   datetime64[ns] (end-of-context)
-      ├── meta.json                           # schema + feature cols + etc
-      └── norm_stats.json                     # per-ticker mean/std for X & Y
-
-Usage (example):
-    from fin_data_prep_ratio_indexcache import (
-        FeatureConfig, CalendarConfig,
-        prepare_features_and_index_cache,
-        load_dataloaders_with_ratio_split,
-    )
-
-    # Once (build compact cache)
-    prepare_features_and_index_cache(
-        tickers=["AAPL","MSFT","AMZN"],
-        start="2012-01-01", end="2025-01-01",
-        window=64, horizon=5, data_dir="./data",
-        feature_cfg=FeatureConfig(...),
-        keep_time_meta="end",                # "none"|"end"|"full"
-        normalize_per_ticker=True,
-        clamp_sigma=5.0,
-    )
-
-    # Every run (ratio split)
-    train_dl, val_dl, test_dl, lengths = load_dataloaders_with_ratio_split(
-        data_dir="./data", batch_size=128, train_ratio=0.55, val_ratio=0.05, test_ratio=0.40,
-        n_entities=8, coverage_per_window=0.0, dates_per_batch=4,
-    )
-"""
 from __future__ import annotations
 from dataclasses import dataclass, field
 import os, json, gc
@@ -262,26 +213,25 @@ def prepare_features_and_index_cache(
         ranks.sort(key=lambda x: x[1], reverse=True)
         tickers = [t for t, _ in ranks[:top_n_by_dollar_vol]]
 
-    
-
     def build_feature_frame(df: 'pd.DataFrame') -> 'pd.DataFrame':
         feat = {}
-        # Base returns
         for field in feature_cfg.price_fields:
             if field in df:
                 if feature_cfg.returns_mode == 'log':
                     feat[f'RET_{field.upper()}'] = _log_return(df[field])
                 else:
                     feat[f'RET_{field.upper()}'] = _safe_pct_change(df[field])
-        # Derived features
         if feature_cfg.include_oc and 'Open' in df and 'Close' in df:
-            oc = (_safe_log_series(df['Close']) - _safe_log_series(df['Open'])) if feature_cfg.returns_mode == 'log' else (df['Close'] / df['Open'] - 1.0)
+            oc = (_safe_log_series(df['Close']) - _safe_log_series(df['Open'])
+                  if feature_cfg.returns_mode == 'log' else (df['Close'] / df['Open'] - 1.0))
             feat['OC_RET'] = oc
         if feature_cfg.include_gap and 'Open' in df and 'Close' in df:
-            gap = (_safe_log_series(df['Open']) - _safe_log_series(df['Close'].shift(1))) if feature_cfg.returns_mode == 'log' else (df['Open'] / df['Close'].shift(1) - 1.0)
+            gap = (_safe_log_series(df['Open']) - _safe_log_series(df['Close'].shift(1))
+                   if feature_cfg.returns_mode == 'log' else (df['Open'] / df['Close'].shift(1) - 1.0))
             feat['GAP_RET'] = gap
         if feature_cfg.include_hl_range and 'High' in df and 'Low' in df:
-            hlr = (_safe_log_series(df['High']) - _safe_log_series(df['Low'])) if feature_cfg.returns_mode == 'log' else (df['High'] / df['Low'] - 1.0)
+            hlr = (_safe_log_series(df['High']) - _safe_log_series(df['Low'])
+                   if feature_cfg.returns_mode == 'log' else (df['High'] / df['Low'] - 1.0))
             feat['HL_RANGE'] = hlr
         if feature_cfg.include_dlv and 'Volume' in df:
             feat['DLV'] = _delta_log_volume(df['Volume'])
@@ -289,8 +239,6 @@ def prepare_features_and_index_cache(
             base_col = f"RET_{feature_cfg.rvol_on.upper()}"
             if base_col in feat:
                 feat[f'RVOL{feature_cfg.rvol_span}_{feature_cfg.rvol_on.upper()}'] = _ewma_vol(feat[base_col], span=feature_cfg.rvol_span)
-            else:
-                raise ValueError(f"include_rvol=True requires base return '{base_col}' to be present. Add '{feature_cfg.rvol_on}' to price_fields.")
         if proxy_ret is not None:
             feat['MKT'] = proxy_ret.reindex(df.index)
         out = pd.DataFrame(feat)
@@ -302,6 +250,7 @@ def prepare_features_and_index_cache(
             if out[c].dtype == np.float64:
                 out[c] = out[c].astype(np.float32)
         return out
+
     # ---- Build per-ticker features ----
     per_ticker: Dict[str, 'pd.DataFrame'] = {}
     min_obs = window + horizon + min_obs_buffer
@@ -691,8 +640,8 @@ class _IndexBackedDataset(Dataset):
         s = int(start); e = s + self.window
         x = Xf[s:e, :].astype(np.float32)  # [K,F]
         y_vec = Yf[e:e+self.horizon].astype(np.float32)  # [H]
-        raw_y_vec = y_vec.copy()
 
+        raw_last_for_label = float(y_vec[-1])
         # Normalize + clamp (train-style). Use per-ticker or global stats
         if self.per_ticker:
             mx = np.array(self.mean_x[aid], dtype=np.float32)   # [1,1,F]
@@ -716,7 +665,7 @@ class _IndexBackedDataset(Dataset):
         if self.regression:
             y_t = torch.tensor(y_vec, dtype=torch.float32)
         else:
-            y_t = torch.tensor(int(raw_y_vec[-1] > 0.0), dtype=torch.int64)  # classification uses RAW target
+            y_t = torch.tensor(int(raw_last_for_label > 0.0), dtype=torch.int64)  # simple example for classification
 
         meta = {'asset_id': int(aid), 'asset': self.assets[int(aid)]}
         if self.keep_time_meta != 'none':
@@ -730,13 +679,16 @@ class _IndexBackedDataset(Dataset):
 
 # --------------------- Date grouping helpers for ratio-split ---------------------
 
-def _normalize_to_day(ts: np.ndarray) -> np.ndarray:
-    # ts must be datetime64[*] — convert to day keys safely
-    return ts.astype('datetime64[D]').astype(np.int64)
+def _normalize_to_day(int64_ns: np.ndarray) -> np.ndarray:
+    a = int64_ns.astype('datetime64[D]').astype(np.int64)
+    return a
 
-def _build_date_batches_from_pairs(order_pairs, end_times, dates_per_batch, min_real_entities):
-    # end_times is already datetime64[ns]
-    days = _normalize_to_day(end_times)  # <-- instead of ...astype(np.int64)
+def _build_date_batches_from_pairs(order_pairs: np.ndarray,
+                                   end_times: np.ndarray,
+                                   dates_per_batch: int,
+                                   min_real_entities: int) -> List[np.ndarray]:
+    # order_pairs: [M,2] (aid, start) sorted by end_times
+    days = _normalize_to_day(end_times)
     order = np.argsort(days, kind='mergesort')
     days_sorted = days[order]
     _, starts = np.unique(days_sorted, return_index=True)
@@ -909,7 +861,6 @@ def load_dataloaders_with_ratio_split(
     with open(_meta_path(data_dir), 'r') as f:
         meta = json.load(f)
     assets = meta['assets']
-    actual_N = len(assets)
     base_window = int(meta['window']);base_horizon = int(meta['horizon'])
     window = int(window if window is not None else base_window)
     horizon = int(horizon if horizon is not None else base_horizon)
@@ -925,18 +876,19 @@ def load_dataloaders_with_ratio_split(
     # Collate (levels + first-diff), grouped-by-end if requested later
     if collate_fn is None:
         collate_fn = make_collate_level_and_firstdiff(
-            n_entities=actual_N,  # (was len(assets) already)
-            return_entity_mask=True
+            n_entities=len(assets),
+            return_entity_mask = True
         )
 
     # Load small global index
     pairs = np.load(os.path.join(_windows_dir(data_dir), 'global_pairs.npy'))  # [M,2]
     end_times = np.load(os.path.join(_windows_dir(data_dir), 'end_times.npy')) # [M]
 
-    # Ensure ordering: per-asset = (asset_id primary, then time); global = time only
+    # Ensure chronological ordering within asset (pairs might already be grouped, but do it anyway)
+    # We'll sort by (asset_id, end_time)
     aid = pairs[:, 0].astype(np.int32)
     if per_asset:
-        order = np.lexsort((end_times.astype('datetime64[ns]').astype(np.int64), aid))  # primary key: aid
+        order = np.lexsort((end_times.astype('datetime64[ns]').astype(np.int64), aid))
     else:
         order = np.argsort(end_times.astype('datetime64[ns]').astype(np.int64))
     pairs = pairs[order]
@@ -1007,7 +959,7 @@ def load_dataloaders_with_ratio_split(
     if date_batching is None:
         date_batching = (coverage_per_window > 0.0)
     if date_batching:
-        min_real = 1 if coverage_per_window <= 0 else int(_ceil(coverage_per_window * actual_N))
+        min_real = max(1, int(_ceil(coverage_per_window * len(assets)))) if coverage_per_window > 0 else 1
         # recover split-specific end_times by masking
         tr_mask = (assign == 0); va_mask = (assign == 1); te_mask = (assign == 2)
         batches_tr = _build_date_batches_from_pairs(tr_pairs, end_times[tr_mask], dates_per_batch, min_real)
@@ -1034,30 +986,3 @@ def load_dataloaders_with_ratio_split(
         test_dl  = _mk(ds_te, 'test')
 
     return train_dl, val_dl, test_dl, (len(ds_tr), len(ds_va), len(ds_te))
-
-
-def run_experiment(data_dir, K, H, *, ratios=(0.7,0.1,0.2),
-                   per_asset=True, norm_scope="train_only",
-                   date_batching=True, coverage=0.85, dates_per_batch=30,
-                   batch_size=64):
-    # Reindex windows for this K/H (fast; no re-download)
-    rebuild_window_index_only(
-        data_dir=data_dir,
-        window=K, horizon=H,
-        update_meta=False,     # keep canonical K_max/H_max
-        backup_old=False       # avoid clutter in sweeps
-    )
-    # Load
-    train_dl, val_dl, test_dl, lengths = load_dataloaders_with_ratio_split(
-        data_dir=data_dir,
-        train_ratio=ratios[0], val_ratio=ratios[1], test_ratio=ratios[2],
-        batch_size=batch_size,
-        regression=True,
-        per_asset=per_asset,
-        norm_scope=norm_scope,        # see “fair comparisons” below
-        date_batching=date_batching,
-        coverage_per_window=coverage,
-        dates_per_batch=dates_per_batch,
-        window=K, horizon=H,
-    )
-    return train_dl, val_dl, test_dl, lengths
