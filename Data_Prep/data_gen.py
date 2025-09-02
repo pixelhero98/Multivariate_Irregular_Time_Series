@@ -1,7 +1,8 @@
 from fin_dataset_gen import (
     FeatureConfig,
     prepare_features_and_index_cache,
-    run_experiment
+    rebuild_window_index_only,
+    load_dataloaders_with_ratio_split,
 )
 import pandas as pd
 
@@ -45,6 +46,50 @@ if "BTC-USD" in Tickers:
 # )
 # print("cache built:", ok)
 
+def run_experiment(
+    data_dir: str,
+    K: int,
+    H: int,
+    *,
+    ratios=(0.7, 0.1, 0.2),
+    per_asset=True,
+    date_batching=True,
+    coverage=0.85,
+    dates_per_batch=30,
+    batch_size=64,
+    norm="train_only",    # default is "train_only" in the patched loader; set "cache" if you want fixed μ/σ
+    reindex=True,         # set False if NOT using date batching and you don’t need to rebuild end_times
+):
+    """
+    Builds loaders for a given (K, H) using the already-downloaded cache.
+    - If date_batching=True, reindex first so day end_times align with K/H.
+    - Coverage threshold is applied per day; panel width is auto-detected from the cache.
+    """
+    if reindex:
+        rebuild_window_index_only(
+            data_dir=data_dir,
+            window=K,
+            horizon=H,
+            update_meta=False,  # keep canonical K_max/H_max while sweeping
+            backup_old=False,   # avoid .bak clutter during sweeps
+        )
+
+    train_dl, val_dl, test_dl, lengths = load_dataloaders_with_ratio_split(
+        data_dir=data_dir,
+        train_ratio=ratios[0],
+        val_ratio=ratios[1],
+        test_ratio=ratios[2],
+        batch_size=batch_size,
+        regression=True,         # set False for classification
+        per_asset=per_asset,     # freely tunable each run
+        norm_scope=norm,         # "train_only" (recommended) or "cache"
+        date_batching=date_batching,
+        coverage_per_window=coverage,
+        dates_per_batch=dates_per_batch,
+        window=K,
+        horizon=H,
+    )
+    return train_dl, val_dl, test_dl, lengths
 
 # 3) Load loaders (chronological per asset; train-only normalization)
 train_dl, val_dl, test_dl, sizes = run_experiment(data_dir=DATA_DIR,
@@ -83,4 +128,5 @@ def dates_seen(dl):
 
 S = dates_seen(train_dl)
 print("dates seen in this split:", len(S))
+
 print(sizes)
