@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Union, List
-from Model.global_summary import ODELaplaceGuidedSummarizer
+from Model.global_summary import UnifiedGlobalSummarizer
 from Model.cond_diffusion_utils import NoiseScheduler
 from Model.pos_time_emb import timestep_embedding
 from Model.lapformer import LapFormer
