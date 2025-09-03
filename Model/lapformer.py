@@ -2,25 +2,9 @@
 import torch
 import torch.nn as nn
 from typing import Optional, Union, List
+from Model.laptrans import LearnableLaplacianBasis, LearnableInverseLaplacianBasis
+from Model.pos_time_emb import get_sinusoidal_pos_emb
 
-# --- Robust imports with fallbacks ---
-try:
-    from Model.laptrans import LearnableLaplacianBasis, LearnableInverseLaplacianBasis
-except Exception:
-    from laptrans import LearnableLaplacianBasis, LearnableInverseLaplacianBasis  # local fallback
-
-try:
-    from Model.pos_time_emb import get_sinusoidal_pos_emb
-except Exception:
-    import math
-    def get_sinusoidal_pos_emb(L: int, dim: int, device: Optional[torch.device] = None) -> torch.Tensor:
-        device = device or torch.device("cpu")
-        pos = torch.arange(L, device=device).unsqueeze(1)
-        div = torch.exp(torch.arange(0, dim, 2, device=device) * (-math.log(10000.0) / dim))
-        pe = torch.zeros(L, dim, device=device)
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        return pe.unsqueeze(0)
 
 def _canon_mode(mode: str) -> str:
     m = mode.lower()
@@ -28,15 +12,19 @@ def _canon_mode(mode: str) -> str:
     if m in {"recurrent", "tv", "time_varying", "time-varying"}: return "recurrent"
     raise ValueError("lap_mode must be 'parallel' or 'recurrent' (or aliases)")
 
+
 class AdaLayerNorm(nn.Module):
     def __init__(self, normalized_shape: int, cond_dim: int):
         super().__init__()
         self.norm = nn.LayerNorm(normalized_shape, elementwise_affine=False)
         self.to_ss = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 2 * normalized_shape))
         nn.init.zeros_(self.to_ss[-1].weight); nn.init.zeros_(self.to_ss[-1].bias)
+        
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        
         h = self.norm(x); s, b = self.to_ss(c).chunk(2, dim=-1)
         return (1 + s).unsqueeze(1) * h + b.unsqueeze(1)
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, hidden_dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0, attn_dropout: float = 0.0):
@@ -52,7 +40,10 @@ class TransformerBlock(nn.Module):
         )
         self.attn_dropout = nn.Dropout(attn_dropout)
         self.resid_dropout = nn.Dropout(dropout)
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, key_padding_mask: Optional[torch.Tensor] = None, attn_bias: Optional[torch.Tensor] = None, t_vec: Optional[torch.Tensor] = None) -> torch.Tensor:
+        
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, key_padding_mask: Optional[torch.Tensor] = None,
+                attn_bias: Optional[torch.Tensor] = None, t_vec: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    
         B, L, H = x.shape
         h = self.norm1(x, t_vec)
         qkv = self.qkv(h).reshape(B, L, 3, self.num_heads, H // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -68,6 +59,7 @@ class TransformerBlock(nn.Module):
         attn_out = torch.matmul(attn_weights, v).transpose(1, 2).reshape(B, L, H)
         x = x + self.resid_dropout(self.proj(attn_out))
         x = x + self.mlp(self.norm2(x, t_vec))
+                    
         return x
 
 class CrossAttnBlock(nn.Module):
@@ -81,7 +73,9 @@ class CrossAttnBlock(nn.Module):
         self.norm_kv = AdaLayerNorm(hidden_dim, hidden_dim)
         self.attn_dropout = nn.Dropout(attn_dropout)
         self.resid_dropout = nn.Dropout(dropout)
+        
     def forward(self, x_q: torch.Tensor, x_kv: torch.Tensor, t_vec: Optional[torch.Tensor] = None) -> torch.Tensor:
+        
         B, L, H = x_q.shape
         xq = self.norm_q(x_q, t_vec); xkv = self.norm_kv(x_kv, t_vec)
         q = self.q(xq).reshape(B, L, self.num_heads, H // self.num_heads).transpose(1, 2)
@@ -91,6 +85,7 @@ class CrossAttnBlock(nn.Module):
         attn = torch.softmax(attn_scores, dim=-1)
         attn = self.attn_dropout(attn)
         out = torch.matmul(attn, v).transpose(1, 2).reshape(B, L, H)
+        
         return x_q + self.resid_dropout(self.proj(out))
 
 class LaplaceSandwichBlock(nn.Module):
@@ -108,9 +103,11 @@ class LaplaceSandwichBlock(nn.Module):
         self.self_blk  = TransformerBlock(hidden_dim, num_heads, mlp_ratio=4.0, dropout=dropout, attn_dropout=attn_dropout)
         self.cross_blk = CrossAttnBlock(hidden_dim, num_heads, dropout=dropout, attn_dropout=attn_dropout)
         nn.init.zeros_(self.hid2lap.weight); nn.init.zeros_(self.hid2lap.bias)
+                     
     def forward(self, x_time: torch.Tensor, pos_emb: torch.Tensor, t_vec: torch.Tensor,
                 attn_bias: Optional[torch.Tensor] = None, summary_kv_H: Optional[torch.Tensor] = None,
                 sc_add_H: Optional[torch.Tensor] = None, dt: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    
         z = self.analysis(x_time, dt=dt) if self.mode == "recurrent" else self.analysis(x_time)
         if self.zero_first_step:
             z = z.clone(); z[:, :1, :] = 0
@@ -120,13 +117,14 @@ class LaplaceSandwichBlock(nn.Module):
         if summary_kv_H is not None:
             h = self.cross_blk(h, summary_kv_H, t_vec=t_vec)
         z_upd  = z + self.hid2lap(h)
+                    
         return self.synthesis(z_upd)
 
 class LapFormer(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, num_heads: int,
                  laplace_k: Union[int, List[int]] = 8, lap_mode: str = "parallel",
                  dropout: float = 0.0, attn_dropout: float = 0.0, self_conditioning: bool = False,
-                 zero_first_step: bool = False):
+                 zero_first_step: bool = True):
         super().__init__()
         self.hidden_dim = hidden_dim; self.self_conditioning = self_conditioning
         self.lap_mode = _canon_mode(lap_mode); self.zero_first_step = zero_first_step
@@ -137,15 +135,19 @@ class LapFormer(nn.Module):
         self.summary2hid = nn.ModuleList([nn.Linear(2 * k, hidden_dim) for k in ks])
         self.self_cond_proj = nn.Linear(input_dim, hidden_dim) if self.self_conditioning else None
         self.blocks = nn.ModuleList([
-            LaplaceSandwichBlock(input_dim, hidden_dim, num_heads, k, lap_mode=self.lap_mode, dropout=dropout, attn_dropout=attn_dropout, zero_first_step=self.zero_first_step)
+            LaplaceSandwichBlock(input_dim, hidden_dim, num_heads, k, 
+                                 lap_mode=self.lap_mode, dropout=dropout,
+                                 attn_dropout=attn_dropout, zero_first_step=self.zero_first_step)
             for k in ks
         ])
         self.head_norm = nn.LayerNorm(input_dim); self.head_proj = nn.Linear(input_dim, input_dim)
         nn.init.zeros_(self.head_proj.weight); nn.init.zeros_(self.head_proj.bias)
+                     
     def _pos(self, L: int, B: int, device: torch.device) -> torch.Tensor:
         if self.pos_cache.shape[1] < L:
             self.pos_cache = get_sinusoidal_pos_emb(L, self.hidden_dim, device=self.pos_cache.device)
         return self.pos_cache[:, :L, :].to(device).expand(B, -1, -1)
+        
     def forward(self, x_tokens: torch.Tensor, t_vec: torch.Tensor, cond_summary: Optional[torch.Tensor] = None,
                 sc_feat: Optional[torch.Tensor] = None, dt: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, D = x_tokens.shape; device = x_tokens.device
@@ -158,4 +160,5 @@ class LapFormer(nn.Module):
         h_time = x_tokens
         for i, blk in enumerate(self.blocks):
             h_time = blk(h_time, pos, t_vec, attn_bias=None, summary_kv_H=kvs[i], sc_add_H=sc_add_H, dt=dt)
+            
         return self.head_proj(self.head_norm(h_time))
