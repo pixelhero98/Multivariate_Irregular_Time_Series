@@ -1,7 +1,7 @@
 
 import math
 from typing import Optional, Dict, Tuple
-
+from Model.laptrans import LearnableLaplacianBasis
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,13 +18,6 @@ except Exception:
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         return pe.unsqueeze(0)
-
-# --- Laplace basis import with fallback path ---
-try:
-    from Model.laptrans import LearnableLaplacianBasis  # user's project path
-except Exception:
-    from laptrans import LearnableLaplacianBasis        # local unified version
-
 
 def _canon_mode(mode: str) -> str:
     m = mode.lower()
