@@ -1,25 +1,9 @@
 import torch
 import torch.nn as nn
 from typing import Optional, Union, List
+from Model.laptrans import LearnableLaplacianBasis, LearnableInverseLaplacianBasis
+from Model.pos_time_emb import get_sinusoidal_pos_emb
 
-# --- Robust imports with fallbacks ---
-try:
-    from Model.laptrans import LearnableLaplacianBasis, LearnableInverseLaplacianBasis
-except Exception:
-    from laptrans import LearnableLaplacianBasis, LearnableInverseLaplacianBasis  # local fallback
-
-try:
-    from Model.pos_time_emb import get_sinusoidal_pos_emb
-except Exception:
-    import math
-    def get_sinusoidal_pos_emb(L: int, dim: int, device: Optional[torch.device] = None) -> torch.Tensor:
-        device = device or torch.device("cpu")
-        pos = torch.arange(L, device=device).unsqueeze(1)
-        div = torch.exp(torch.arange(0, dim, 2, device=device) * (-math.log(10000.0) / dim))
-        pe = torch.zeros(L, dim, device=device)
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        return pe.unsqueeze(0)
 
 def _canon_mode(mode: str) -> str:
     m = mode.lower()
@@ -29,6 +13,7 @@ def _canon_mode(mode: str) -> str:
         return "recurrent"
     raise ValueError("lap_mode must be 'parallel' or 'recurrent' (or aliases)")
 
+
 class AdaLayerNorm(nn.Module):
     def __init__(self, normalized_shape: int, cond_dim: int):
         super().__init__()
@@ -37,9 +22,12 @@ class AdaLayerNorm(nn.Module):
         nn.init.zeros_((self.to_ss[-1]).weight); nn.init.zeros_(self.to_ss[-1].bias)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+
         h = self.norm(x)
         s, b = self.to_ss(c).chunk(2, dim=-1)
+        
         return (1 + s).unsqueeze(1) * h + b.unsqueeze(1)
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, hidden_dim: int, num_heads: int, mlp_ratio: float = 4.0,
@@ -61,22 +49,27 @@ class TransformerBlock(nn.Module):
                 key_padding_mask: Optional[torch.Tensor] = None,
                 attn_bias: Optional[torch.Tensor] = None,
                 t_vec: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    
         B, L, H = x.shape
         h = self.norm1(x, t_vec)
         qkv = self.qkv(h).reshape(B, L, 3, self.num_heads, H // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (k.shape[-1] ** 0.5)
+                    
         if attn_mask is not None: attn_scores = attn_scores + attn_mask
         if attn_bias is not None: attn_scores = attn_scores + attn_bias
         if key_padding_mask is not None:
             big_neg = torch.finfo(attn_scores.dtype).min
             attn_scores = attn_scores.masked_fill(key_padding_mask[:, None, None, :], big_neg)
+            
         attn = torch.softmax(attn_scores, dim=-1)
         attn = self.attn_dropout(attn)
         attn_out = torch.matmul(attn, v).transpose(1, 2).reshape(B, L, H)
         x = x + self.resid_dropout(self.proj(attn_out))
         x = x + self.mlp(self.norm2(x, t_vec))
+
         return x
+
 
 class CrossAttnBlock(nn.Module):
     def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.0, attn_dropout: float = 0.0):
@@ -91,6 +84,7 @@ class CrossAttnBlock(nn.Module):
         self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x_q: torch.Tensor, x_kv: torch.Tensor, t_vec: Optional[torch.Tensor] = None) -> torch.Tensor:
+        
         B, L, H = x_q.shape
         xq = self.norm_q(x_q, t_vec); xkv = self.norm_kv(x_kv, t_vec)
         q = self.q(xq).reshape(B, L, self.num_heads, H // self.num_heads).transpose(1, 2)
@@ -100,7 +94,9 @@ class CrossAttnBlock(nn.Module):
         attn = torch.softmax(attn_scores, dim=-1)
         attn = self.attn_dropout(attn)
         out = torch.matmul(attn, v).transpose(1, 2).reshape(B, L, H)
+        
         return x_q + self.resid_dropout(self.proj(out))
+
 
 class LaplaceSandwichBlock(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, num_heads: int, k: int,
@@ -124,6 +120,7 @@ class LaplaceSandwichBlock(nn.Module):
                 summary_kv_H: Optional[torch.Tensor] = None,
                 sc_add_H: Optional[torch.Tensor] = None,
                 dt: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    
         z = self.analysis(x_time, dt=dt) if self.mode == "recurrent" else self.analysis(x_time)
         h = self.lap2hid(z) + pos_emb + t_vec.unsqueeze(1)
         if sc_add_H is not None:
@@ -133,7 +130,9 @@ class LaplaceSandwichBlock(nn.Module):
             h = self.cross_blk(h, summary_kv_H, t_vec=t_vec)
         z_upd  = z + self.hid2lap(h)
         y_time = self.synthesis(z_upd)
+                    
         return y_time
+
 
 class LapFormer(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, num_layers: int,
