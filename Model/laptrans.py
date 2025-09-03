@@ -42,14 +42,13 @@ class LearnableLaplacianBasis(nn.Module):
     ) -> None:
         super().__init__()
         import warnings
-        canon = self._canonicalize_mode(mode)
+        self.mode = self._canonicalize_mode(mode)
         if mode.lower() in {"static", "tv"}:
             warnings.warn(
                 f"mode='{mode}' is deprecated; use 'parallel' or 'recurrent' instead",
                 DeprecationWarning,
                 stacklevel=2,
             )
-        self.mode = canon
         self.k = int(k)
         self.alpha_min = float(alpha_min)
         self.omega_max = float(omega_max)
@@ -172,7 +171,7 @@ class LearnableLaplacianBasis(nn.Module):
         # Drive
         u = self.proj(x)  # [B, T, k]
 
-        # Recurrence (correct: use previous c,s to update both)
+        # Recurrence (use previous c,s to update both)
         C = torch.empty(B, T, k, dtype=u.dtype, device=device)
         S = torch.empty(B, T, k, dtype=u.dtype, device=device)
         c = torch.zeros(B, k, device=device, dtype=u.dtype)
