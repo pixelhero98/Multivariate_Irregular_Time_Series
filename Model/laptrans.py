@@ -9,16 +9,11 @@ from torch.nn.utils import spectral_norm
 
 class LearnableLaplacianBasis(nn.Module):
     """
-    Unified Laplace feature extractor with two modes (renamed):
-      - mode='parallel'  (formerly 'static'): fixed complex-exponential basis (fast, simple)
-      - mode='recurrent' (alias 'tv'): time-varying, driven damped-sinusoid recurrence with optional per-step dt & modulation
-
-    Backwards-compatible aliases:
-      'static' -> 'parallel'  (deprecated)
-      'global' -> 'parallel'
-      'tv' -> 'recurrent'     (deprecated)
-      'time_varying'/'time-varying' -> 'recurrent'
-
+    Unified Laplace Transform with two modes:
+      - mode='parallel': fixed complex-exponential basis (O(1), fast, simple for long sequences).
+      - mode='recurrent': time-varying, driven damped-sinusoid recurrence with optional per-step dt & modulation,
+      (O(T), can be slow if sequences are long, but supports irregular sampling step).
+      
     Args:
         k:         number of complex poles (outputs are 2*k due to cos/sin parts)
         feat_dim:  input feature dimension (last dim of x)
@@ -33,7 +28,7 @@ class LearnableLaplacianBasis(nn.Module):
           alpha_mod: [B,T,k] optional log-scale modulation of decay  (multiplies alpha)
           omega_mod: [B,T,k] optional log-scale modulation of frequency (multiplies omega)
           tau_mod:   [B,T,1] or [B,T,k] optional log-scale global timescale modulation
-
+          
     Returns:
         lap_feats: [B, T, 2*k]  (concat of cosine-like and sine-like channels)
     """
@@ -62,7 +57,7 @@ class LearnableLaplacianBasis(nn.Module):
 
         # --- Trainable pole parameters ---
         # Real part is stored as raw and mapped by softplus to (0, +inf)
-        self._s_real_raw = nn.Parameter(torch.empty(k))  # raw -> softplus + alpha_min
+        self._s_real_raw = nn.Parameter(torch.empty(k))  # raw -> softplus + alpha_min (pole, or decay rate)
         self.s_imag = nn.Parameter(torch.empty(k))       # imaginary part (frequency)
 
         # Optional global timescale used by 'recurrent' mode
@@ -78,9 +73,9 @@ class LearnableLaplacianBasis(nn.Module):
     @staticmethod
     def _canonicalize_mode(mode: str) -> str:
         m = mode.lower()
-        if m in {"parallel", "static", "global"}:
+        if m in {"parallel"}:
             return "parallel"
-        if m in {"recurrent", "tv", "time_varying", "time-varying"}:
+        if m in {"recurrent"}:
             return "recurrent"
         raise ValueError("mode must be one of {'parallel','recurrent'} or their aliases")
 
