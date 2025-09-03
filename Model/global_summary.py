@@ -1,4 +1,3 @@
-
 import math
 from typing import Optional, Dict, Tuple
 from Model.laptrans import LearnableLaplacianBasis
