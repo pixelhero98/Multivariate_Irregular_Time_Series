@@ -1,22 +1,10 @@
 import math
 from typing import Optional, Dict, Tuple
 from Model.laptrans import LearnableLaplacianBasis
+from Model.pos_time_emb import get_sinusoidal_pos_emb as _pos_emb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# --- Positional embedding (fallback) ---
-try:
-    from Model.pos_time_emb import get_sinusoidal_pos_emb as _pos_emb
-except Exception:
-    def _pos_emb(T: int, H: int, device=None):
-        device = device or torch.device("cpu")
-        position = torch.arange(T, device=device).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, H, 2, device=device) * (-math.log(10000.0) / H))
-        pe = torch.zeros(T, H, device=device)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        return pe.unsqueeze(0)
 
 def _canon_mode(mode: str) -> str:
     m = mode.lower()
@@ -49,12 +37,14 @@ class ParallelLaplaceSummarizer(nn.Module):
                  lap_k: int = 8,
                  dropout: float = 0.0,
                  add_guidance_tokens: bool = True,
+                 zero_first_step: bool = True,
                  **_):
         super().__init__()
         assert hidden_dim % num_heads == 0
         self.N, self.D, self.H = num_entities, feat_dim, hidden_dim
         self.num_heads = num_heads
         self.add_guidance_tokens = add_guidance_tokens
+        self.zero_first_step = zero_first_step
 
         self.ctx_proj = nn.Linear(num_entities * feat_dim, hidden_dim)
         self.dropout = nn.Dropout(dropout)
@@ -76,10 +66,10 @@ class ParallelLaplaceSummarizer(nn.Module):
                                          dropout=dropout, batch_first=True)
 
     def forward(self,
-                x: torch.Tensor,
-                pad_mask: Optional[torch.Tensor] = None,
-                dt: torch.Tensor = None,
-                ctx_diff: torch.Tensor = None,
+                x: torch.Tensor,                    # [B,T,N,D]
+                pad_mask: Optional[torch.Tensor] = None,  # [B,T] True=ignore
+                dt: torch.Tensor = None,            # accepted but ignored
+                ctx_diff: torch.Tensor = None,      # [B,T,N,D]
                 entity_mask: Optional[torch.Tensor] = None,
                 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         B, T, N, D = x.shape
@@ -88,14 +78,14 @@ class ParallelLaplaceSummarizer(nn.Module):
         mN = None
         if entity_mask is not None:
             mN = entity_mask.to(device=x.device, dtype=x.dtype)
-            if mN.dim() == 2:
+            if mN.dim() == 2:  # [B,N] -> [B,T,N]
                 mN = mN.unsqueeze(1).expand(B, T, N)
             x = x * mN.unsqueeze(-1)
 
         ctx = x.reshape(B, T, N * D)
         K = self.ctx_proj(ctx) + _pos_emb(T, self.H, device=device)
 
-        V_sig = self.v_head(x)
+        V_sig = self.v_head(x)  # [B,T,N]
         if ctx_diff is None:
             x_diff = torch.zeros_like(x)
             x_diff[:, 1:] = x[:, 1:] - x[:, :-1]
@@ -103,16 +93,20 @@ class ParallelLaplaceSummarizer(nn.Module):
             x_diff = ctx_diff.to(device)
         if mN is not None:
             x_diff = x_diff * mN.unsqueeze(-1)
-        T_sig = self.t_head(x_diff)
+        T_sig = self.t_head(x_diff)  # [B,T,N]
 
-        L_v = self.lap(V_sig)
-        L_t = self.lap(T_sig)
+        L_v = self.lap(V_sig)  # [B,T,2K]
+        L_t = self.lap(T_sig)  # [B,T,2K]
         a = F.softplus(self.w_v_raw)
         b = F.softplus(self.w_t_raw)
         L = a * L_v + b * L_t
+        if self.zero_first_step:
+            L = L.clone(); L[:, :1, :] = 0
 
         if self.add_guidance_tokens:
-            lap_tokens = self.lap_token_proj(L)
+            lap_tokens = self.lap_token_proj(L)  # [B,T,H]
+            if self.zero_first_step:
+                lap_tokens = lap_tokens.clone(); lap_tokens[:, :1, :] = 0
             memory = torch.cat([K, lap_tokens], dim=1)
             values = memory
             key_padding_mask = (None if pad_mask is None else
@@ -213,8 +207,34 @@ class SecondOrderLaplaceCombinerPolewise(nn.Module):
         return num / den
 
     @staticmethod
-    def _forward_diff(x: torch.Tensor) -> torch.Tensor:
-        return torch.diff(x, dim=1, prepend=x[:, :1])
+    def _forward_diff(x: torch.Tensor,
+                      dt: torch.Tensor = None,
+                      mask: torch.Tensor = None) -> torch.Tensor:
+        B, T, N = x.shape
+        x_prev = torch.cat([x[:, :1], x[:, :-1]], dim=1)
+        dx = x - x_prev
+
+        if dt is not None:
+            if dt.dim() == 1:
+                dt_bt1 = dt.view(1, T, 1).to(device=x.device, dtype=x.dtype).expand(B, T, 1)
+            elif dt.dim() == 2:
+                dt_bt1 = dt.unsqueeze(-1).to(device=x.device, dtype=x.dtype)
+            else:
+                raise ValueError("dt must be [T] or [B,T] if provided")
+            dx = dx / dt_bt1.clamp_min(1e-6)
+
+        if mask is not None:
+            m = mask
+            if m.dim() == 2:
+                m = m.unsqueeze(1)
+            if m.size(1) == 1:
+                m = m.expand(B, T, N)
+            m_prev = torch.cat([m[:, :1], m[:, :-1]], dim=1)
+            valid = (m * m_prev).to(dtype=x.dtype)
+            dx = dx * valid
+
+        dx[:, :1] = 0
+        return dx
 
     def forward(self,
                 T_sig: torch.Tensor,
@@ -240,8 +260,8 @@ class SecondOrderLaplaceCombinerPolewise(nn.Module):
             T_sig = T_sig * mN
             V_sig = V_sig * mN
 
-        dT = self._forward_diff(T_sig)
-        dV = self._forward_diff(V_sig)
+        dT = self._forward_diff(T_sig, dt=dt, mask=mN)
+        dV = self._forward_diff(V_sig, dt=dt, mask=mN)
 
         if mN is None:
             s_T = T_sig.mean(dim=-1)
@@ -291,12 +311,14 @@ class RecurrentLaplaceSummarizer(nn.Module):
                  dropout: float = 0.0,
                  add_guidance_tokens: bool = True,
                  physics_tied_derivative: bool = True,
-                 residual_scale: float = 0.05):
+                 residual_scale: float = 0.05,
+                 zero_first_step: bool = True):
         super().__init__()
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
         self.N, self.D, self.H = num_entities, feat_dim, hidden_dim
         self.num_heads = num_heads
         self.add_guidance_tokens = add_guidance_tokens
+        self.zero_first_step = zero_first_step
 
         self.ctx_proj = nn.Linear(num_entities * feat_dim, hidden_dim)
         self.dropout = nn.Dropout(dropout)
@@ -325,7 +347,7 @@ class RecurrentLaplaceSummarizer(nn.Module):
         return torch.diff(x, dim=1, prepend=x[:, :1])
 
     def forward(self,
-            x: torch.Tensor,
+            x: torch.Tensor,  # [B,T,N,D]
             pad_mask: Optional[torch.Tensor] = None,
             dt: torch.Tensor = None,
             ctx_diff: torch.Tensor = None,
@@ -363,18 +385,29 @@ class RecurrentLaplaceSummarizer(nn.Module):
 
         L, lap_aux = self.ode_lap(T_sig, V_sig, dt=dt, entity_mask=mN)
 
+        if self.zero_first_step:
+            L[:, :1, :] = 0
+
         film = self.lap_to_film(L)
         gamma, beta = torch.chunk(film, 2, dim=-1)
+        if self.zero_first_step:
+            gamma = gamma.clone(); beta = beta.clone()
+            gamma[:, :1, :] = 0
+            beta[:, :1, :] = 0
         K = (1.0 + gamma) * K + beta
         Vv = (1.0 + gamma) * Vv + beta
 
         bias_ht = self.lap_to_bias(L)
+        if self.zero_first_step:
+            bias_ht = bias_ht.clone(); bias_ht[:, :1, :] = 0
         Lq = self.queries.shape[0]
         attn_bias = bias_ht.permute(0, 2, 1).unsqueeze(2).expand(B, self.num_heads, Lq, T)
         attn_bias = attn_bias.reshape(B * self.num_heads, Lq, T).to(K.dtype)
 
         if getattr(self, "add_guidance_tokens", False):
             lap_tokens = self.lap_token_proj(L)
+            if self.zero_first_step:
+                lap_tokens[:, :1, :] = 0
             memory = torch.cat([K, lap_tokens], dim=1)
             values = torch.cat([Vv, lap_tokens], dim=1)
 
@@ -410,7 +443,8 @@ class UnifiedGlobalSummarizer(nn.Module):
                  dropout: float = 0.0,
                  add_guidance_tokens: bool = True,
                  physics_tied_derivative: bool = True,
-                 residual_scale: float = 0.05):
+                 residual_scale: float = 0.05,
+                 zero_first_step: bool = True):
         super().__init__()
         mode = _canon_mode(lap_mode)
         if mode == "parallel":
@@ -418,6 +452,7 @@ class UnifiedGlobalSummarizer(nn.Module):
                 num_entities=num_entities, feat_dim=feat_dim, hidden_dim=hidden_dim,
                 out_len=out_len, num_heads=num_heads, lap_k=lap_k, dropout=dropout,
                 add_guidance_tokens=add_guidance_tokens,
+                zero_first_step=zero_first_step,
             )
         else:
             self.impl = RecurrentLaplaceSummarizer(
@@ -425,6 +460,7 @@ class UnifiedGlobalSummarizer(nn.Module):
                 out_len=out_len, num_heads=num_heads, lap_k=lap_k, dropout=dropout,
                 add_guidance_tokens=add_guidance_tokens,
                 physics_tied_derivative=physics_tied_derivative, residual_scale=residual_scale,
+                zero_first_step=zero_first_step,
             )
 
     def forward(self, *args, **kwargs):
