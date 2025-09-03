@@ -21,9 +21,9 @@ except Exception:
 
 def _canon_mode(mode: str) -> str:
     m = mode.lower()
-    if m in {"parallel", "static", "global"}:
+    if m in {"parallel"}:
         return "parallel"
-    if m in {"recurrent", "tv", "time_varying", "time-varying"}:
+    if m in {"recurrent"}:
         return "recurrent"
     raise ValueError("lap_mode must be one of {'parallel','recurrent'} or their aliases")
 
