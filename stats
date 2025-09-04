@@ -37,12 +37,18 @@ print("val top-8 latent dims:", ", ".join(f"{int(i)}:{v.item():.4f}" for v,i in 
 sizes: (149372, 21284, 42861)
 V: torch.Size([20, 121, 60, 17]) T: torch.Size([20, 121, 60, 17]) y: torch.Size([20, 121, 20])
 Loaded VAE checkpoint: ./ldt/saved_model/16_0.00124_2.16059_best_recon.pt
-Epoch 001 | train: 2.800017 (/Z: 0.175001) | val: 2.641022 (/Z: 0.165064) | cond_gap: 0.000413
-Saved: ./ldt/checkpoints/best_latdiff_epoch_001_val_2.641022.pt
-Epoch 002 | train: 2.796107 (/Z: 0.174757) | val: 2.554339 (/Z: 0.159646) | cond_gap: 0.020972
-Saved: ./ldt/checkpoints/best_latdiff_epoch_002_val_2.554339.pt
-Epoch 003 | train: 2.766004 (/Z: 0.172875) | val: 2.580292 (/Z: 0.161268) | cond_gap: 0.008501
-Epoch 004 | train: 2.711265 (/Z: 0.169454) | val: 2.525406 (/Z: 0.157838) | cond_gap: -0.008521
-Saved: ./ldt/checkpoints/best_latdiff_epoch_004_val_2.525406.pt
-Epoch 005 | train: 2.664506 (/Z: 0.166532) | val: 2.578474 (/Z: 0.161155) | cond_gap: -0.023356
-Epoch 006 | train: 2.629713 (/Z: 0.164357) | val: 2.538120 (/Z: 0.158633) | cond_gap: -0.006521
+val top-16 latent dims: 13:1.0080, 15:0.9639, 11:0.9556, 1:0.9507, 12:0.9461, 3:0.9142, 10:0.8571, 6:0.8320, 2:0.8108, 7:0.7971, 9:0.7844, 5:0.7455, 8:0.7000, 4:0.6693, 0:0.6224, 14:0.6094
+per-dim loss mean=0.8229 std=0.1239
+Epoch 001 | train: 2.802180 (/Z: 0.175136) | val: 2.556047 (/Z: 0.159753) | cond_gap: 0.016165
+Saved: ./ldt/checkpoints/best_latdiff_epoch_001_val_2.556047.pt
+val top-16 latent dims: 15:1.0134, 12:0.9789, 13:0.9764, 11:0.9409, 3:0.9143, 1:0.8867, 7:0.8411, 6:0.8216, 10:0.8206, 2:0.8177, 9:0.7912, 5:0.7339, 8:0.7106, 4:0.6839, 14:0.6545, 0:0.6535
+per-dim loss mean=0.8274 std=0.1141
+Epoch 002 | train: 2.786261 (/Z: 0.174141) | val: 2.544758 (/Z: 0.159047) | cond_gap: -0.007142
+Saved: ./ldt/checkpoints/best_latdiff_epoch_002_val_2.544758.pt
+val top-16 latent dims: 13:1.0442, 15:1.0322, 11:1.0041, 12:0.9599, 3:0.9389, 1:0.9137, 10:0.8820, 6:0.8657, 9:0.8451, 2:0.8304, 7:0.8182, 8:0.7460, 5:0.7406, 0:0.7347, 4:0.7094, 14:0.6613
+per-dim loss mean=0.8579 std=0.1151
+Epoch 003 | train: 2.774882 (/Z: 0.173430) | val: 2.567471 (/Z: 0.160467) | cond_gap: 0.007929
+val top-16 latent dims: 12:1.0250, 13:1.0217, 15:1.0120, 11:0.9716, 3:0.9250, 1:0.8635, 10:0.8387, 2:0.8334, 6:0.8228, 7:0.8222, 9:0.8188, 5:0.7538, 8:0.7356, 4:0.6997, 0:0.6510, 14:0.6293
+per-dim loss mean=0.8390 std=0.1228
+Epoch 004 | train: 2.724047 (/Z: 0.170253) | val: 2.562689 (/Z: 0.160168) | cond_gap: -0.005530
+
