@@ -34,22 +34,89 @@ per_dim = (pred - target).pow(2).mean(dim=(0,1))  # [Z]
 vals, idx = torch.topk(per_dim, k=min(8, per_dim.numel()))
 print("val top-8 latent dims:", ", ".join(f"{int(i)}:{v.item():.4f}" for v,i in zip(vals, idx)))
 
+@torch.no_grad()
+def validate():
+    diff_model.eval()
+    total, count = 0.0, 0
+    cond_gap_accum, cond_gap_batches = 0.0, 0
 
-sizes: (149372, 21284, 42861)
-V: torch.Size([20, 121, 60, 17]) T: torch.Size([20, 121, 60, 17]) y: torch.Size([20, 121, 20])
-Loaded VAE checkpoint: ./ldt/saved_model/16_0.00124_2.16059_best_recon.pt
-val top-16 latent dims: 13:1.0080, 15:0.9639, 11:0.9556, 1:0.9507, 12:0.9461, 3:0.9142, 10:0.8571, 6:0.8320, 2:0.8108, 7:0.7971, 9:0.7844, 5:0.7455, 8:0.7000, 4:0.6693, 0:0.6224, 14:0.6094
-per-dim loss mean=0.8229 std=0.1239
-Epoch 001 | train: 2.802180 (/Z: 0.175136) | val: 2.556047 (/Z: 0.159753) | cond_gap: 0.016165
-Saved: ./ldt/checkpoints/best_latdiff_epoch_001_val_2.556047.pt
-val top-16 latent dims: 15:1.0134, 12:0.9789, 13:0.9764, 11:0.9409, 3:0.9143, 1:0.8867, 7:0.8411, 6:0.8216, 10:0.8206, 2:0.8177, 9:0.7912, 5:0.7339, 8:0.7106, 4:0.6839, 14:0.6545, 0:0.6535
-per-dim loss mean=0.8274 std=0.1141
-Epoch 002 | train: 2.786261 (/Z: 0.174141) | val: 2.544758 (/Z: 0.159047) | cond_gap: -0.007142
-Saved: ./ldt/checkpoints/best_latdiff_epoch_002_val_2.544758.pt
-val top-16 latent dims: 13:1.0442, 15:1.0322, 11:1.0041, 12:0.9599, 3:0.9389, 1:0.9137, 10:0.8820, 6:0.8657, 9:0.8451, 2:0.8304, 7:0.8182, 8:0.7460, 5:0.7406, 0:0.7347, 4:0.7094, 14:0.6613
-per-dim loss mean=0.8579 std=0.1151
-Epoch 003 | train: 2.774882 (/Z: 0.173430) | val: 2.567471 (/Z: 0.160467) | cond_gap: 0.007929
-val top-16 latent dims: 12:1.0250, 13:1.0217, 15:1.0120, 11:0.9716, 3:0.9250, 1:0.8635, 10:0.8387, 2:0.8334, 6:0.8228, 7:0.8222, 9:0.8188, 5:0.7538, 8:0.7356, 4:0.6997, 0:0.6510, 14:0.6293
-per-dim loss mean=0.8390 std=0.1228
-Epoch 004 | train: 2.724047 (/Z: 0.170253) | val: 2.562689 (/Z: 0.160168) | cond_gap: -0.005530
+    # add this guard so we only print once per epoch
+    did_diag_per_dim = False
 
+    if ema is not None:
+        ema.store(diff_model)
+        ema.copy_to(diff_model)
+
+    for xb, yb, meta in val_dl:
+        V, T = xb
+        mask_bn = meta["entity_mask"]
+
+        cond_summary = build_context(diff_model, V, T, mask_bn, device)
+        y_in, batch_ids = flatten_targets(yb, mask_bn, device)
+        if y_in is None:
+            continue
+        cond_summary_flat = cond_summary[batch_ids]
+        mu_norm = encode_mu_norm(
+            vae, y_in,
+            use_ewma=crypto_config.USE_EWMA,
+            ewma_lambda=crypto_config.EWMA_LAMBDA,
+            mu_mean=mu_mean, mu_std=mu_std
+        )
+
+        t = sample_t_uniform(scheduler, mu_norm.size(0), device)
+        loss = diffusion_loss(
+            diff_model, scheduler, mu_norm, t,
+            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
+        )
+        total += loss.item() * mu_norm.size(0)
+        count += mu_norm.size(0)
+
+        # ---------- Conditional gap probe (existing) ----------
+        probe_n = min(128, mu_norm.size(0))
+        if probe_n > 0:
+            mu_p = mu_norm[:probe_n]
+            cs_p = cond_summary_flat[:probe_n]
+            t_p  = sample_t_uniform(scheduler, probe_n, device)
+            loss_cond = diffusion_loss(diff_model, scheduler, mu_p, t_p,
+                                       cond_summary=cs_p, predict_type=crypto_config.PREDICT_TYPE).item()
+            loss_unco = diffusion_loss(diff_model, scheduler, mu_p, t_p,
+                                       cond_summary=None, predict_type=crypto_config.PREDICT_TYPE).item()
+            cond_gap_accum += (loss_unco - loss_cond)
+            cond_gap_batches += 1
+
+        # ---------- NEW: per-dimension loss probe ----------
+        if getattr(crypto_config, "DIAG_PER_DIM", False) and not did_diag_per_dim:
+            # small sub-batch to keep it cheap
+            Bp = min(64, mu_norm.size(0))
+            mu_p = mu_norm[:Bp]
+            cs_p = cond_summary_flat[:Bp]
+            t_p  = sample_t_uniform(scheduler, Bp, device)
+
+            # recreate pred & target to get per-dim errors
+            noise_p = torch.randn_like(mu_p)
+            x_t_p, eps_true_p = scheduler.q_sample(mu_p, t_p, noise_p)
+
+            pred_p = diff_model(x_t_p, t_p, cond_summary=cs_p, sc_feat=None)
+            if crypto_config.PREDICT_TYPE == "eps":
+                target_p = eps_true_p
+            else:  # "v"
+                target_p = scheduler.v_from_eps(x_t_p, t_p, eps_true_p)
+
+            # pred/target shape: [B, H, Z]; mean over B & H -> per-dim [Z]
+            per_dim = (pred_p - target_p).pow(2).mean(dim=(0, 1))  # [Z]
+            k = min(8, per_dim.numel())
+            vals, idx = torch.topk(per_dim, k=k)
+            print("val top-{} latent dims: {}".format(
+                k, ", ".join(f"{int(i)}:{v.item():.4f}" for v, i in zip(vals, idx))
+            ))
+            # also useful: report mean and std of per-dim losses
+            print(f"per-dim loss mean={per_dim.mean().item():.4f} std={per_dim.std(unbiased=False).item():.4f}")
+
+            did_diag_per_dim = True  # only once per epoch
+
+    if ema is not None:
+        ema.restore(diff_model)
+
+    avg_val = total / max(1, count)
+    cond_gap = (cond_gap_accum / cond_gap_batches) if cond_gap_batches > 0 else float("nan")
+    return avg_val, cond_gap
