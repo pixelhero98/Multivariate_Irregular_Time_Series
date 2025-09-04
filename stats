@@ -20,6 +20,7 @@ def diffusion_loss(model: LLapDiT, scheduler, x0_lat_norm: torch.Tensor, t: torc
         gamma = float(getattr(crypto_config, "MIN_SNR_GAMMA", 5.0))
         w = torch.minimum(snr, torch.as_tensor(gamma, device=snr.device, dtype=snr.dtype))
         w = w / (snr + 1.0)                                             # keeps magnitude reasonable
+        w = w / (w.mean().detach() + 1e-8)
         return (w.detach() * per_sample).mean()
     else:
         return per_sample.mean()
