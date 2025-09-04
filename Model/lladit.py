@@ -3,54 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Union, List
-
-# --- Robust imports with fallbacks ---
-try:
-    from Model.global_summary import UnifiedGlobalSummarizer
-except Exception:
-    try:
-        from global_summary import UnifiedGlobalSummarizer  # local fallback
-    except Exception:
-        from global_summary import ODELaplaceGuidedSummarizer as UnifiedGlobalSummarizer
-
-try:
-    from Model.cond_diffusion_utils import NoiseScheduler
-except Exception:
-    # Minimal stub to allow forward-path tests without sampling.
-    class NoiseScheduler:
-        def __init__(self, timesteps: int = 1000, schedule: str = 'cosine'):
-            self.timesteps = int(timesteps)
-            # cosine-ish cumulative alphas for shape; not used in forward()
-            t = torch.linspace(0, 1, self.timesteps)
-            s = 0.008
-            f = torch.cos(((t + s) / (1 + s)) * torch.pi / 2) ** 2
-            self.alpha_bars = f / f[0]
-        def _gather(self, x, t):
-            return x.to(t.device)[t]
-        # The following are only used in generate(); forward() doesn't need them.
-        def q_sample(self, x0, t): return x0, None
-        def to_x0(self, x_t, t, pred, param_type='v'): return pred
-        def ddim_step_from(self, x_t, t, tprev, pred, param_type='v', eta=0.0): return pred
-
-try:
-    from Model.pos_time_emb import timestep_embedding
-except Exception:
-    import math
-    def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
-        # Standard sinusoidal embedding
-        device = t.device
-        half = dim // 2
-        freqs = torch.exp(-math.log(10000) * torch.arange(0, half, device=device) / max(half,1))
-        args = t.float().unsqueeze(-1) * freqs.unsqueeze(0)
-        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        if dim % 2 == 1:
-            emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
-        return emb
-
-try:
-    from Model.lapformer import LapFormer
-except Exception:
-    from lapformer import LapFormer  # local fallback
+from Model.global_summary import UnifiedGlobalSummarizer
+from Model.cond_diffusion_utils import NoiseScheduler
+from Model.pos_time_emb import timestep_embedding
+from Model.lapformer import LapFormer
 
 
 class LLapDiT(nn.Module):
@@ -102,30 +58,18 @@ class LLapDiT(nn.Module):
         )
 
         # main LapFormer (mode tied to summarizer)
-                # main LapFormer (mode tied to summarizer); fall back if 'lap_mode' unsupported
-        try:
-            self.model = LapFormer(
-                input_dim=data_dim,
-                hidden_dim=hidden_dim,
-                num_layers=num_layers,
-                num_heads=num_heads,
-                laplace_k=laplace_k,
-                lap_mode=lap_mode,
-                dropout=dropout,
-                attn_dropout=attn_dropout,
-                self_conditioning=self_conditioning,
-            )
-        except TypeError:
-            self.model = LapFormer(
-                input_dim=data_dim,
-                hidden_dim=hidden_dim,
-                num_layers=num_layers,
-                num_heads=num_heads,
-                laplace_k=laplace_k,
-                dropout=dropout,
-                attn_dropout=attn_dropout,
-                self_conditioning=self_conditioning,
-            )
+                     
+        self.model = LapFormer(
+            input_dim=data_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            laplace_k=laplace_k,
+            lap_mode=lap_mode,
+            dropout=dropout,
+            attn_dropout=attn_dropout,
+            self_conditioning=self_conditioning,
+        )
 
         self.time_dim = hidden_dim  # time embedding dimension
 
