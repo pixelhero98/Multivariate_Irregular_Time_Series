@@ -54,14 +54,9 @@ def diffusion_loss(model, scheduler, x0_lat_norm, t, *,
         return per_sample.mean()
 
     abar = scheduler.alpha_bars[t]  # [B]
-    if weight_scheme == "min_snr":
+    if weight_scheme == "weighted_min_snr":
         snr = abar / (1.0 - abar).clamp_min(1e-8)
         w = torch.minimum(snr, torch.as_tensor(minsnr_gamma, device=snr.device, dtype=snr.dtype))
-        return (w.detach() * per_sample).mean()
-
-    if weight_scheme == "min_log_snr":
-        logsnr = torch.log(abar.clamp_min(1e-12)) - torch.log1p(-abar).clamp_min(1e-12)
-        w = torch.minimum(logsnr, torch.as_tensor(minsnr_gamma, device=logsnr.device, dtype=logsnr.dtype))
         return (w.detach() * per_sample).mean()
 
     return per_sample.mean()
