@@ -118,7 +118,7 @@ class NoiseScheduler(nn.Module):
 
 # ---------------- Laplacian pole logging ----------------
 def iter_laplace_bases(module):
-    from laptrans import LearnableLaplacianBasis
+    from Model.laptrans import LearnableLaplacianBasis
     for m in module.modules():
         if isinstance(m, LearnableLaplacianBasis):
             yield m
@@ -272,3 +272,4 @@ def decode_latents_with_vae(vae, x0_norm: torch.Tensor,
     # your decoder accepts z with optional skips=None
     x_hat = vae.decoder(mu_est, encoder_skips=None)
     return x_hat
+
