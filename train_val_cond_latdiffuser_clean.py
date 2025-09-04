@@ -198,11 +198,12 @@ def validate():
     total, count = 0.0, 0
     cond_gap_accum, cond_gap_batches = 0.0, 0
 
+    # add this guard so we only print once per epoch
+    did_diag_per_dim = False
+
     if ema is not None:
         ema.store(diff_model)
         ema.copy_to(diff_model)
-        # log_pole_health([diff_model], lambda m, step: _print_log(m, step, csv_path=None),
-        #                 step=global_step, tag_prefix="val/")
 
     for xb, yb, meta in val_dl:
         V, T = xb
@@ -228,7 +229,7 @@ def validate():
         total += loss.item() * mu_norm.size(0)
         count += mu_norm.size(0)
 
-        # Conditional gap probe
+        # ---------- Conditional gap probe (existing) ----------
         probe_n = min(128, mu_norm.size(0))
         if probe_n > 0:
             mu_p = mu_norm[:probe_n]
@@ -240,6 +241,36 @@ def validate():
                                        cond_summary=None, predict_type=crypto_config.PREDICT_TYPE).item()
             cond_gap_accum += (loss_unco - loss_cond)
             cond_gap_batches += 1
+
+        # ---------- NEW: per-dimension loss probe ----------
+        if getattr(crypto_config, "DIAG_PER_DIM", False) and not did_diag_per_dim:
+            # small sub-batch to keep it cheap
+            Bp = min(64, mu_norm.size(0))
+            mu_p = mu_norm[:Bp]
+            cs_p = cond_summary_flat[:Bp]
+            t_p  = sample_t_uniform(scheduler, Bp, device)
+
+            # recreate pred & target to get per-dim errors
+            noise_p = torch.randn_like(mu_p)
+            x_t_p, eps_true_p = scheduler.q_sample(mu_p, t_p, noise_p)
+
+            pred_p = diff_model(x_t_p, t_p, cond_summary=cs_p, sc_feat=None)
+            if crypto_config.PREDICT_TYPE == "eps":
+                target_p = eps_true_p
+            else:  # "v"
+                target_p = scheduler.v_from_eps(x_t_p, t_p, eps_true_p)
+
+            # pred/target shape: [B, H, Z]; mean over B & H -> per-dim [Z]
+            per_dim = (pred_p - target_p).pow(2).mean(dim=(0, 1))  # [Z]
+            k = min(16, per_dim.numel())
+            vals, idx = torch.topk(per_dim, k=k)
+            print("val top-{} latent dims: {}".format(
+                k, ", ".join(f"{int(i)}:{v.item():.4f}" for v, i in zip(vals, idx))
+            ))
+            # also useful: report mean and std of per-dim losses
+            print(f"per-dim loss mean={per_dim.mean().item():.4f} std={per_dim.std(unbiased=False).item():.4f}")
+
+            did_diag_per_dim = True  # only once per epoch
 
     if ema is not None:
         ema.restore(diff_model)
