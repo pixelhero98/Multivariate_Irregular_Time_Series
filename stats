@@ -1,26 +1,25 @@
-mu_norm = encode_mu_norm(vae, y_in, use_ewma=..., ewma_lambda=..., mu_mean=mu_mean, mu_std=mu_std)
-m = mu_norm.mean(dim=(0,1))           # [Z]
-s = mu_norm.std (dim=(0,1))           # [Z]
-print("max|mean|:", m.abs().max().item(), " mean(std):", s.mean().item())
-# Expect max|mean| ≲ 0.05 and mean(std) ≈ 1.0
+def diffusion_loss(model: LLapDiT, scheduler, x0_lat_norm: torch.Tensor, t: torch.Tensor,
+                   *, cond_summary: Optional[torch.Tensor], predict_type: str = "v") -> torch.Tensor:
+    """
+    MSE on v/eps with channel-invariant reduction.
+    Optional min-SNR weighting (set in crypto_config).
+    """
+    noise = torch.randn_like(x0_lat_norm)
+    x_t, eps_true = scheduler.q_sample(x0_lat_norm, t, noise)
+    pred = model(x_t, t, cond_summary=cond_summary, sc_feat=None)
+    target = eps_true if predict_type == "eps" else scheduler.v_from_eps(x_t, t, eps_true)
 
-max|mean|: 0.11575071513652802  mean(std): 0.9852234125137329
-max|mean|: 0.07338510453701019  mean(std): 0.9783295392990112
-max|mean|: 0.06115134805440903  mean(std): 0.9991855025291443
-max|mean|: 0.036267802119255066  mean(std): 0.9929130673408508
-max|mean|: 0.07266297191381454  mean(std): 0.9828921556472778
-max|mean|: 0.10656131058931351  mean(std): 0.9781605005264282
-max|mean|: 0.06857383996248245  mean(std): 0.9726665616035461
-max|mean|: 0.09574883431196213  mean(std): 0.9742206335067749
-max|mean|: 0.19157454371452332  mean(std): 0.9718217849731445
-max|mean|: 0.1025337278842926  mean(std): 1.025849461555481
-max|mean|: 0.4349737763404846  mean(std): 1.1093064546585083
-max|mean|: 0.11220886558294296  mean(std): 1.0452378988265991
-max|mean|: 0.13773392140865326  mean(std): 0.9913389086723328
-max|mean|: 0.06931759417057037  mean(std): 1.0221006870269775
-max|mean|: 0.11630383133888245  mean(std): 1.0037870407104492
-max|mean|: 0.0494823083281517  mean(std): 0.9908413887023926
-max|mean|: 0.10182688385248184  mean(std): 0.9952141046524048
-max|mean|: 0.1322655826807022  mean(std): 1.0136568546295166
-max|mean|: 0.11896596848964691  mean(std): 1.0455904006958008
-max|mean|: 0.1639644205570221  mean(std): 1.0461323261260986
+    # [B,H,Z] -> per-sample loss: mean over H, sum over Z  (scale-invariant to Z)
+    err = (pred - target).pow(2)              # [B,H,Z]
+    per_sample = err.mean(dim=1).sum(dim=1)   # [B]
+
+    # Optional: min-SNR weighting to prevent early-t domination
+    if getattr(crypto_config, "USE_MIN_SNR", False):
+        abar = scheduler.alpha_bars[t]                                   # [B]
+        snr  = abar / (1.0 - abar).clamp_min(1e-8)
+        gamma = float(getattr(crypto_config, "MIN_SNR_GAMMA", 5.0))
+        w = torch.minimum(snr, torch.as_tensor(gamma, device=snr.device, dtype=snr.dtype))
+        w = w / (snr + 1.0)                                             # keeps magnitude reasonable
+        return (w.detach() * per_sample).mean()
+    else:
+        return per_sample.mean()
