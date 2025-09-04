@@ -66,9 +66,6 @@ def diffusion_loss(model, scheduler, x0_lat_norm, t, *,
 
     return per_sample.mean()
 
-
-
-
 # ============================ Training setup ============================
 
 device = set_torch()
