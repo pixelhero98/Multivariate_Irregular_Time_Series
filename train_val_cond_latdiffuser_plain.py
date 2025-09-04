@@ -6,15 +6,11 @@ from typing import Optional
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
-
 from Latent_Space.latent_vae import LatentVAE
 from Model.lladit import LLapDiT
-try:
-    from Model.cond_diffusion_utils import (EMA, log_pole_health, _print_log, set_torch, make_warmup_cosine,
+from Model.cond_diffusion_utils import (EMA, log_pole_health, _print_log, set_torch, make_warmup_cosine,
         ewma_std, two_stage_norm, diffusion_loss, compute_latent_stats, normalize_cond_per_batch, sample_t_uniform_logsnr)
-except Exception:
-    from cond_diffusion_utils import (EMA, log_pole_health, _print_log, set_torch, make_warmup_cosine,
-        ewma_std, two_stage_norm, diffusion_loss, compute_latent_stats, normalize_cond_per_batch, sample_t_uniform_logsnr)
+
 
 x: torch.Tensor, lam: float = 0.94, eps: float = 1e-8) -> torch.Tensor:
     """x: [B,L,D] -> [B,1,D]"""
