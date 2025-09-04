@@ -44,6 +44,17 @@ def diffusion_loss(model: LLapDiT, scheduler, x0_lat_norm: torch.Tensor, t: torc
     x_t, eps_true = scheduler.q_sample(x0_lat_norm, t, noise)
     pred = model(x_t, t, cond_summary=cond_summary, sc_feat=None)
     target = eps_true if predict_type == "eps" else scheduler.v_from_eps(x_t, t, eps_true)
+    # err = (pred - target).pow(2)            # [B, H, Z]
+    # loss = err.mean(dim=(0, 1)).sum()       # mean over B,H; sum ov  
+
+    # err = (pred - target).pow(2)
+    # ch = err.ndim - 1                        # last dim is channels Z
+    # spatial = tuple(range(1, ch))            # dims 1..ch-1 (e.g., H)
+    # loss = err.mean(dim=(0, *spatial)).sum()
+
+    # err = (pred - target).pow(2)
+    # loss = err.mean() * pred.size(-1)
+
     return (pred - target).pow(2).mean()
 
 
