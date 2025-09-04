@@ -11,24 +11,6 @@ from Model.lladit import LLapDiT
 from Model.cond_diffusion_utils import (EMA, log_pole_health, _print_log, set_torch, make_warmup_cosine,
         ewma_std, two_stage_norm, diffusion_loss, compute_latent_stats, normalize_cond_per_batch, sample_t_uniform_logsnr)
 
-
-x: torch.Tensor, lam: float = 0.94, eps: float = 1e-8) -> torch.Tensor:
-    """x: [B,L,D] -> [B,1,D]"""
-    B, L, D = x.shape
-    var = x.new_zeros(B, D)
-    mean = x.new_zeros(B, D)
-    for t in range(L):
-        xt = x[:, t, :]
-        mean = lam * mean + (1 - lam) * xt
-        var  = lam * var  + (1 - lam) * (xt - mean) ** 2
-    return (var + eps).sqrt().unsqueeze(1)
-
-
-
-
-# --------- NEW: conditioning z-score & uniform log-SNR t-sampling ----------
-
-
 # ----------------------------- main -----------------------------
 device = set_torch()
 
