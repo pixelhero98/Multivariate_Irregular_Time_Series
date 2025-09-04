@@ -29,6 +29,10 @@ Z = crypto_config.VAE_LATENT_DIM
 print(f"Epoch {epoch:03d} | train: {train_loss:.6f} (/Z: {train_loss/Z:.6f}) "
       f"| val: {val_loss:.6f} (/Z: {val_loss/Z:.6f}) | cond_gap: {cond_gap:.6f}")
 
+per_dim = (pred - target).pow(2).mean(dim=(0,1))  # [Z]
+vals, idx = torch.topk(per_dim, k=min(8, per_dim.numel()))
+print("val top-8 latent dims:", ", ".join(f"{int(i)}:{v.item():.4f}" for v,i in zip(vals, idx)))
+
 
 sizes: (149372, 21284, 42861)
 V: torch.Size([20, 121, 60, 17]) T: torch.Size([20, 121, 60, 17]) y: torch.Size([20, 121, 20])
