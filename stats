@@ -23,3 +23,8 @@ def diffusion_loss(model: LLapDiT, scheduler, x0_lat_norm: torch.Tensor, t: torc
         return (w.detach() * per_sample).mean()
     else:
         return per_sample.mean()
+
+
+Z = crypto_config.VAE_LATENT_DIM
+print(f"Epoch {epoch:03d} | train: {train_loss:.6f} (/Z: {train_loss/Z:.6f}) "
+      f"| val: {val_loss:.6f} (/Z: {val_loss/Z:.6f}) | cond_gap: {cond_gap:.6f}")
