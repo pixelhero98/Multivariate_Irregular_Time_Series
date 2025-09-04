@@ -174,7 +174,8 @@ def train_one_epoch():
         with autocast(enabled=(device.type == "cuda")):
             loss = diffusion_loss(
                 diff_model, scheduler, mu_norm, t,
-                cond_summary=cs, predict_type=crypto_config.PREDICT_TYPE
+                cond_summary=cs, predict_type=crypto_config.PREDICT_TYPE,
+                weight_scheme='min_log_snr'
             )
 
         if not torch.isfinite(loss):
@@ -234,7 +235,8 @@ def validate():
         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
         loss = diffusion_loss(
             diff_model, scheduler, mu_norm, t,
-            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
+            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE,
+            weight_scheme='None'
         )
         total += loss.item() * mu_norm.size(0)
         count += mu_norm.size(0)
