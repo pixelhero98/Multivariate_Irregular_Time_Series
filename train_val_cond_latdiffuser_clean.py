@@ -37,25 +37,35 @@ def encode_mu_norm(vae: LatentVAE, y_in: torch.Tensor, *, use_ewma: bool, ewma_l
     return mu_norm
 
 
-def diffusion_loss(model: LLapDiT, scheduler, x0_lat_norm: torch.Tensor, t: torch.Tensor,
-                   *, cond_summary: Optional[torch.Tensor], predict_type: str = "v") -> torch.Tensor:
-    """Plain MSE on v/eps; no weighting; cond_summary can be None."""
+# --- diffusion_loss: add a scheme flag ---
+def diffusion_loss(model, scheduler, x0_lat_norm, t, *,
+                   cond_summary, predict_type="v",
+                   weight_scheme: str = "none",  # "none" | "min_snr" | "min_log_snr"
+                   minsnr_gamma: float = 5.0) -> torch.Tensor:
     noise = torch.randn_like(x0_lat_norm)
     x_t, eps_true = scheduler.q_sample(x0_lat_norm, t, noise)
     pred = model(x_t, t, cond_summary=cond_summary, sc_feat=None)
     target = eps_true if predict_type == "eps" else scheduler.v_from_eps(x_t, t, eps_true)
-    # err = (pred - target).pow(2)            # [B, H, Z]
-    # loss = err.mean(dim=(0, 1)).sum()       # mean over B,H; sum ov  
 
-    # err = (pred - target).pow(2)
-    # ch = err.ndim - 1                        # last dim is channels Z
-    # spatial = tuple(range(1, ch))            # dims 1..ch-1 (e.g., H)
-    # loss = err.mean(dim=(0, *spatial)).sum()
+    err = (pred - target).pow(2)               # [B,H,Z]
+    per_sample = err.mean(dim=1).sum(dim=1)    # mean over H, sum over Z  -> [B]
 
-    # err = (pred - target).pow(2)
-    # loss = err.mean() * pred.size(-1)
+    if weight_scheme == "none":
+        return per_sample.mean()
 
-    return (pred - target).pow(2).mean()
+    abar = scheduler.alpha_bars[t]  # [B]
+    if weight_scheme == "min_snr":
+        snr = abar / (1.0 - abar).clamp_min(1e-8)
+        w = torch.minimum(snr, torch.as_tensor(minsnr_gamma, device=snr.device, dtype=snr.dtype))
+        return (w.detach() * per_sample).mean()
+
+    if weight_scheme == "min_log_snr":
+        logsnr = torch.log(abar.clamp_min(1e-12)) - torch.log1p(-abar).clamp_min(1e-12)
+        w = torch.minimum(logsnr, torch.as_tensor(minsnr_gamma, device=logsnr.device, dtype=logsnr.dtype))
+        return (w.detach() * per_sample).mean()
+
+    return per_sample.mean()
+
 
 
 
