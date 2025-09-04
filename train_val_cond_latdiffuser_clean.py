@@ -220,8 +220,7 @@ def validate():
         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
         loss = diffusion_loss(
             diff_model, scheduler, mu_norm, t,
-            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE,
-            weight_scheme='None'
+            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
         )
         total += loss.item() * mu_norm.size(0)
         count += mu_norm.size(0)
