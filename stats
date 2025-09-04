@@ -28,3 +28,17 @@ def diffusion_loss(model: LLapDiT, scheduler, x0_lat_norm: torch.Tensor, t: torc
 Z = crypto_config.VAE_LATENT_DIM
 print(f"Epoch {epoch:03d} | train: {train_loss:.6f} (/Z: {train_loss/Z:.6f}) "
       f"| val: {val_loss:.6f} (/Z: {val_loss/Z:.6f}) | cond_gap: {cond_gap:.6f}")
+
+
+sizes: (149372, 21284, 42861)
+V: torch.Size([20, 121, 60, 17]) T: torch.Size([20, 121, 60, 17]) y: torch.Size([20, 121, 20])
+Loaded VAE checkpoint: ./ldt/saved_model/16_0.00124_2.16059_best_recon.pt
+Epoch 001 | train: 2.800017 (/Z: 0.175001) | val: 2.641022 (/Z: 0.165064) | cond_gap: 0.000413
+Saved: ./ldt/checkpoints/best_latdiff_epoch_001_val_2.641022.pt
+Epoch 002 | train: 2.796107 (/Z: 0.174757) | val: 2.554339 (/Z: 0.159646) | cond_gap: 0.020972
+Saved: ./ldt/checkpoints/best_latdiff_epoch_002_val_2.554339.pt
+Epoch 003 | train: 2.766004 (/Z: 0.172875) | val: 2.580292 (/Z: 0.161268) | cond_gap: 0.008501
+Epoch 004 | train: 2.711265 (/Z: 0.169454) | val: 2.525406 (/Z: 0.157838) | cond_gap: -0.008521
+Saved: ./ldt/checkpoints/best_latdiff_epoch_004_val_2.525406.pt
+Epoch 005 | train: 2.664506 (/Z: 0.166532) | val: 2.578474 (/Z: 0.161155) | cond_gap: -0.023356
+Epoch 006 | train: 2.629713 (/Z: 0.164357) | val: 2.538120 (/Z: 0.158633) | cond_gap: -0.006521
