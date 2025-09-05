@@ -525,7 +525,8 @@ def two_stage_norm(
     return mu_g.clamp(-clip_val, clip_val)
 
 
-def normalize_cond_per_batch(cs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def normalize_cond_per_batch(cs: torch.Tensor, eps: float = 1e-7，
+                            unbiased: bool = False) -> torch.Tensor:
     """
     z-score over (B, S) for each feature dimension; preserves gradients.
 
