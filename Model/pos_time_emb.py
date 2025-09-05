@@ -8,7 +8,9 @@ import torch
 # Positional / timestep embeddings
 # -------------------------------
 
-def get_sinusoidal_pos_emb(L: int, dim: int, device: Optional[torch.device] = None) -> torch.Tensor:
+def get_sinusoidal_pos_emb(L: int, dim: int,
+                           device: Optional[torch.device] = None
+                          ) -> torch.Tensor:
     """
     Standard 1D sinusoidal positional embeddings (Transformer style).
 
@@ -22,6 +24,7 @@ def get_sinusoidal_pos_emb(L: int, dim: int, device: Optional[torch.device] = No
     """
     if dim % 2 != 0:
         raise ValueError("pos_emb dim must be even")
+    
     device = device or torch.device("cpu")
     pos = torch.arange(L, device=device).unsqueeze(1).float()            # [L, 1]
     i = torch.arange(dim // 2, device=device).float()                    # [dim/2]
