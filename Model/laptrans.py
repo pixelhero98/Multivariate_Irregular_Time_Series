@@ -229,11 +229,16 @@ class LearnableInverseLaplacianBasis(nn.Module):
         input_dim  = 2 * basis.k
         output_dim = basis.feat_dim
 
+    Implements a complex-aware linear head:
+        y_lin = C @ Wc - S @ Ws
+    Optionally adds a small MLP residual on top for non-linear corrections.
+
     Args:
-        basis:       the paired LearnableLaplacianBasis
-        hidden_dim:  width of the decoder MLP; if None, defaults to max(2*k, feat_dim)
-        num_layers:  number of MLP layers (>=2 recommended)
-        use_sn:      apply spectral norm to linear layers for stability
+        basis:               the paired LearnableLaplacianBasis
+        hidden_dim:          width of the residual MLP; default = max(2k, D)
+        num_layers:          residual MLP depth (>=2 recommended if enabled)
+        use_sn:              apply spectral norm to linear layers
+        use_mlp_residual:    add MLP residual on top of the complex-aware head
     """
 
     def __init__(
@@ -242,39 +247,63 @@ class LearnableInverseLaplacianBasis(nn.Module):
         hidden_dim: Optional[int] = None,
         num_layers: int = 2,
         use_sn: bool = True,
+        use_mlp_residual: bool = True,
     ) -> None:
         super().__init__()
         assert isinstance(basis, LearnableLaplacianBasis), "basis must be a LearnableLaplacianBasis"
         self.basis = basis
+        self.use_mlp_residual = bool(use_mlp_residual)
 
-        in_dim = 2 * basis.k
-        out_dim = basis.feat_dim
-        H = hidden_dim if hidden_dim is not None else max(in_dim, out_dim)
-        H = int(H)
+        k = basis.k
+        D = basis.feat_dim
+        in_dim = 2 * k
+        H = int(hidden_dim if hidden_dim is not None else max(in_dim, D))
 
         def maybe_sn(linear: nn.Linear) -> nn.Linear:
             return spectral_norm(linear, n_power_iterations=1, eps=1e-6) if use_sn else linear
 
-        self.norm = nn.LayerNorm(in_dim)
+        # --- Complex-aware linear head: y = C @ Wc - S @ Ws ---
+        self.head_c = maybe_sn(nn.Linear(k, D, bias=False))
+        self.head_s = maybe_sn(nn.Linear(k, D, bias=False))
 
-        layers = [maybe_sn(nn.Linear(in_dim, H)), nn.GELU()]
-        for _ in range(max(0, num_layers - 2)):
-            layers += [maybe_sn(nn.Linear(H, H)), nn.GELU()]
-        layers += [maybe_sn(nn.Linear(H, out_dim))]
-        self.mlp = nn.Sequential(*layers)
+        # --- Optional residual MLP over [C,S] ---
+        if self.use_mlp_residual:
+            self.norm = nn.LayerNorm(in_dim)
+            layers = [maybe_sn(nn.Linear(in_dim, H)), nn.GELU()]
+            for _ in range(max(0, num_layers - 2)):
+                layers += [maybe_sn(nn.Linear(H, H)), nn.GELU()]
+            layers += [maybe_sn(nn.Linear(H, D))]
+            self.mlp = nn.Sequential(*layers)
 
-        # Standard Kaiming init
+        # Init
         with torch.no_grad():
-            for m in self.mlp:
-                if isinstance(m, nn.Linear):
-                    w = getattr(m, "weight_orig", m.weight)
-                    nn.init.kaiming_uniform_(w, a=math.sqrt(5))
-                    if m.bias is not None:
-                        bound = 1 / math.sqrt(m.in_features)
-                        nn.init.uniform_(m.bias, -bound, bound)
+            for lin in (self.head_c, self.head_s):
+                w = getattr(lin, "weight_orig", lin.weight)
+                nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+            if self.use_mlp_residual:
+                for m in self.mlp:
+                    if isinstance(m, nn.Linear):
+                        w = getattr(m, "weight_orig", m.weight)
+                        nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+                        if m.bias is not None:
+                            bound = 1 / math.sqrt(m.in_features)
+                            nn.init.uniform_(m.bias, -bound, bound)
 
     def forward(self, lap_feats: torch.Tensor) -> torch.Tensor:
-        assert lap_feats.dim() == 3 and lap_feats.size(-1) == 2 * self.basis.k, \
-            f"lap_feats must be [B, T, {2*self.basis.k}]"
+        # lap_feats: [B, T, 2k] with [C | S] halves
+        B, T, Ctot = lap_feats.shape
+        k = self.basis.k
+        assert Ctot == 2 * k, f"lap_feats must be [B, T, {2*k}]"
+
+        C, S = lap_feats[..., :k], lap_feats[..., k:]  # [B,T,k] each
+
+        # Complex-aware linear readout (no LayerNorm to preserve amplitude/phase scale)
+        y_lin = self.head_c(C) - self.head_s(S)       # [B,T,D]
+
+        if not self.use_mlp_residual:
+            return y_lin
+
+        # Residual MLP over concatenated [C,S]
         h = self.norm(lap_feats)
-        return self.mlp(h)  # [B, T, feat_dim]
+        y_mlp = self.mlp(h)                            # [B,T,D]
+        return y_lin + y_mlp
