@@ -1,23 +1,33 @@
 """
-Learnable Laplace transform blocks.
+Learnable Laplace analysis + decoder stack.
 
-- LearnableLaplacianBasis: projects sequences into a 2*k-channel Laplace feature space
-  using either a parallel complex-exponential basis or a time-varying recurrent update.
+- LearnableLaplacianBasis:
+    Projects sequences to a 2*k-channel Laplace feature space using either
+    a parallel complex-exponential basis or a time-varying recurrent update.
 
-- LearnableInverseLaplacianBasis: a decoder (NOT a strict mathematical inverse) that
-  learns to map Laplace features back to the original feature space to optimize the
-  downstream objective.
+- LearnableInverseLaplacianBasis (decoder):
+    Learns to map Laplace features back to the original feature space.
+    This is NOT a strict mathematical inverse; it is a small MLP trained
+    end-to-end for the downstream objective.
 
-- LaplaceBlock: convenience wrapper combining analysis + decoder.
+- LaplaceBlock:
+    Convenience wrapper combining analysis + decoder.
+
+Contract (as requested):
+    The decoder is always used with its paired basis:
+      input_dim  = 2 * k
+      output_dim = feat_dim  (original input dim to the basis)
+    The only optional size is the decoder's hidden_dim.
 """
 import math
 import warnings
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
+
 
 __all__ = [
     "LearnableLaplacianBasis",
@@ -65,6 +75,7 @@ class LearnableLaplacianBasis(nn.Module):
         super().__init__()
         self.mode = self._canonicalize_mode(mode)
         self.k = int(k)
+        self.feat_dim = int(feat_dim)
         self.alpha_min = float(alpha_min)
         self.omega_max = float(omega_max)
 
@@ -74,7 +85,7 @@ class LearnableLaplacianBasis(nn.Module):
         self._tau = nn.Parameter(torch.tensor(0.0))      # global timescale (recurrent)
 
         # Learned projection feat_dim -> k (shared across modes)
-        self.proj = spectral_norm(nn.Linear(feat_dim, k, bias=True), n_power_iterations=1, eps=1e-6)
+        self.proj = spectral_norm(nn.Linear(self.feat_dim, k, bias=True), n_power_iterations=1, eps=1e-6)
 
         self.reset_parameters()
 
@@ -120,7 +131,7 @@ class LearnableLaplacianBasis(nn.Module):
         omega_mod: Optional[torch.Tensor] = None,
         tau_mod: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert x.dim() == 3, "x must be [B, T, D]"
+        assert x.dim() == 3 and x.size(-1) == self.feat_dim, f"x must be [B, T, {self.feat_dim}]"
         B, T, _ = x.shape
         device, dtype = x.device, x.dtype
         k = self.k
@@ -130,10 +141,10 @@ class LearnableLaplacianBasis(nn.Module):
             alpha = self.s_real
             beta = self.s_imag.clamp(-self.omega_max, self.omega_max)
 
-            t_idx = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(1)    # [T,1]
-            s = torch.complex(-alpha.float(), beta.float())                              # [k]
-            expo = torch.exp(t_idx * s.unsqueeze(0))                                     # [T,k] complex
-            re_basis, im_basis = expo.real.to(dtype), expo.imag.to(dtype)               # [T,k] each
+            t_idx = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(1)  # [T,1]
+            s = torch.complex(-alpha.float(), beta.float())                            # [k]
+            expo = torch.exp(t_idx * s.unsqueeze(0))                                   # [T,k] complex
+            re_basis, im_basis = expo.real.to(dtype), expo.imag.to(dtype)             # [T,k] each
 
             proj_feats = self.proj(x)                              # [B,T,k]
             real_proj = proj_feats * re_basis.unsqueeze(0)         # [B,T,k]
@@ -214,73 +225,56 @@ class LearnableInverseLaplacianBasis(nn.Module):
     """
     Decoder that maps Laplace features back to the original feature space.
 
-    It does NOT attempt to explicitly invert the analysis; it simply learns the
-    decoding that best serves the downstream task.
+    Always paired with a LearnableLaplacianBasis:
+        input_dim  = 2 * basis.k
+        output_dim = basis.feat_dim
 
     Args:
-        laplace_basis: optional analysis module (used only to infer shapes).
-        in_channels:   if laplace_basis is None, provide input channels (2*k).
-        out_dim:       if laplace_basis is None, provide output dimension (feat_dim).
-        hidden_mult:   width multiplier for hidden layers.
-        num_layers:    number of MLP layers (>=2).
-        use_sn:        apply spectral norm to linear layers for stability.
+        basis:       the paired LearnableLaplacianBasis
+        hidden_dim:  width of the decoder MLP; if None, defaults to max(2*k, feat_dim)
+        num_layers:  number of MLP layers (>=2 recommended)
+        use_sn:      apply spectral norm to linear layers for stability
     """
 
     def __init__(
         self,
-        laplace_basis: Optional[LearnableLaplacianBasis] = None,
-        *,
-        in_channels: Optional[int] = None,
-        out_dim: Optional[int] = None,
-        hidden_mult: float = 1.0,
+        basis: LearnableLaplacianBasis,
+        hidden_dim: Optional[int] = None,
         num_layers: int = 2,
         use_sn: bool = True,
     ) -> None:
         super().__init__()
+        assert isinstance(basis, LearnableLaplacianBasis), "basis must be a LearnableLaplacianBasis"
+        self.basis = basis
 
-        if laplace_basis is not None:
-            C = 2 * laplace_basis.k
-            D = laplace_basis.proj.in_features
-        else:
-            if in_channels is None or out_dim is None:
-                raise ValueError("Provide laplace_basis or both in_channels and out_dim.")
-            C, D = int(in_channels), int(out_dim)
-
-        H = max(C, D)
-        H = int(H * max(1.0, hidden_mult))
-        ln = nn.LayerNorm(C)
-        layers = []
+        in_dim = 2 * basis.k
+        out_dim = basis.feat_dim
+        H = hidden_dim if hidden_dim is not None else max(in_dim, out_dim)
+        H = int(H)
 
         def maybe_sn(linear: nn.Linear) -> nn.Linear:
             return spectral_norm(linear, n_power_iterations=1, eps=1e-6) if use_sn else linear
 
-        # First layer
-        layers.append(maybe_sn(nn.Linear(C, H)))
-        layers.append(nn.GELU())
+        self.norm = nn.LayerNorm(in_dim)
 
-        # Middle layers
+        layers = [maybe_sn(nn.Linear(in_dim, H)), nn.GELU()]
         for _ in range(max(0, num_layers - 2)):
-            layers.append(maybe_sn(nn.Linear(H, H)))
-            layers.append(nn.GELU())
-
-        # Final layer
-        layers.append(maybe_sn(nn.Linear(H, D)))
-
-        self.norm = ln
+            layers += [maybe_sn(nn.Linear(H, H)), nn.GELU()]
+        layers += [maybe_sn(nn.Linear(H, out_dim))]
         self.mlp = nn.Sequential(*layers)
 
-        # Standard Kaiming init; no weight-tying
+        # Standard Kaiming init
         with torch.no_grad():
-            for mod in self.mlp:
-                if isinstance(mod, nn.Linear):
-                    w = getattr(mod, "weight_orig", mod.weight)
+            for m in self.mlp:
+                if isinstance(m, nn.Linear):
+                    w = getattr(m, "weight_orig", m.weight)
                     nn.init.kaiming_uniform_(w, a=math.sqrt(5))
-                    if mod.bias is not None:
-                        bound = 1 / math.sqrt(mod.in_features)
-                        nn.init.uniform_(mod.bias, -bound, bound)
+                    if m.bias is not None:
+                        bound = 1 / math.sqrt(m.in_features)
+                        nn.init.uniform_(m.bias, -bound, bound)
 
     def forward(self, lap_feats: torch.Tensor) -> torch.Tensor:
-        assert lap_feats.dim() == 3 and lap_feats.size(-1) == self.norm.normalized_shape[0], \
-            f"lap_feats must be [B, T, {self.norm.normalized_shape[0]}]"
+        assert lap_feats.dim() == 3 and lap_feats.size(-1) == 2 * self.basis.k, \
+            f"lap_feats must be [B, T, {2*self.basis.k}]"
         h = self.norm(lap_feats)
-        return self.mlp(h)
+        return self.mlp(h)  # [B, T, feat_dim]
