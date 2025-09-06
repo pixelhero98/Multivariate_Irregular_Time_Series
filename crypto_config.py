@@ -85,7 +85,7 @@ EWMA_LAMBDA   = 0.99
 # Use Exponential Moving Average of model weights for evaluation.
 USE_EMA_EVAL = True
 EMA_DECAY    = 0.999
-
+DECODE_USE_GT_SCALE = True
 # --- Generation Parameters ---
 GEN_STEPS = 36
 # Strength of classifier-free guidance. Key parameter to tune for sample quality.
