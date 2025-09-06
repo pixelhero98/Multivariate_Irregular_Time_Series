@@ -197,7 +197,6 @@ class LearnableLaplacianBasis(nn.Module):
         # Step-wise decay & rotation
         rho = torch.exp(-alpha * dt_bt1)     # [B,T,k]
         theta = omega * dt_bt1               # [B,T,k]
-        cos_t, sin_t = torch.cos(theta), torch.sin(theta)
 
         # Drive (real only)
         u = self.proj(x)                     # [B,T,k]
