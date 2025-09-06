@@ -37,22 +37,36 @@ def encode_mu_norm(vae: LatentVAE, y_in: torch.Tensor, *, use_ewma: bool, ewma_l
     return mu_norm
 
 
-def diffusion_loss(model: LLapDiT, scheduler, x0_lat_norm: torch.Tensor, t: torch.Tensor,
-                   *, cond_summary: Optional[torch.Tensor], predict_type: str = "v",
-                   weight_scheme: str = "none", minsnr_gamma: float = 5.0,
-                   sc_feat: Optional[torch.Tensor] = None) -> torch.Tensor:
+def diffusion_loss(
+    model: LLapDiT,
+    scheduler,
+    x0_lat_norm: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    cond_summary: Optional[torch.Tensor],
+    predict_type: str = "v",
+    weight_scheme: str = "none",
+    minsnr_gamma: float = 5.0,
+    sc_feat: Optional[torch.Tensor] = None,
+    x_t: Optional[torch.Tensor] = None,
+    noise: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     """
     MSE on v/eps with channel-invariant reduction.
     Optional min-SNR weighting.
+    If (x_t, noise) are provided, reuse them (useful for self-conditioning).
     """
-    noise = torch.randn_like(x0_lat_norm)
-    x_t, eps_true = scheduler.q_sample(x0_lat_norm, t, noise)
+    if (x_t is None) or (noise is None):
+        noise = torch.randn_like(x0_lat_norm)
+        x_t, eps_true = scheduler.q_sample(x0_lat_norm, t, noise)
+    else:
+        _, eps_true = x_t, noise
+
     pred = model(x_t, t, cond_summary=cond_summary, sc_feat=sc_feat)
     target = eps_true if predict_type == "eps" else scheduler.v_from_eps(x_t, t, eps_true)
 
-    # [B,H,Z] -> per-sample loss: mean over H, sum over Z  (scale-invariant to Z)
-    err = (pred - target).pow(2)              # [B,H,Z]
-    per_sample = err.mean(dim=1).sum(dim=1)   # [B]
+    err = (pred - target).pow(2)            # [B,H,Z]
+    per_sample = err.mean(dim=1).sum(dim=1) # [B]
 
     if weight_scheme == 'none':
         return per_sample.mean()
@@ -63,6 +77,7 @@ def diffusion_loss(model: LLapDiT, scheduler, x0_lat_norm: torch.Tensor, t: torc
         w = torch.minimum(snr, torch.as_tensor(gamma, device=snr.device, dtype=snr.dtype))
         w = w / (snr + 1.0)
         return (w.detach() * per_sample).mean()
+
 
 
 @torch.no_grad()
