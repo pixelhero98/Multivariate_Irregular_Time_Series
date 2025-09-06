@@ -43,25 +43,32 @@ class NoiseScheduler(nn.Module):
     Diffusion utilities with precomputed buffers and a DDIM sampler.
     Supports 'linear' or 'cosine' schedules and epsilon-/v-/x0-parameterization.
     """
-    def __init__(self, timesteps: int = 1000, schedule: str = "cosine",
-                 beta_start: float = 1e-4, beta_end: float = 2e-2):
+    def __init__(
+        self,
+        timesteps: int = 1000,
+        schedule: str = "cosine",
+        beta_start: float = 1e-4,
+        beta_end: float = 2e-2,
+    ) -> None:
         super().__init__()
         self.timesteps = int(timesteps)
         if schedule not in {"linear", "cosine"}:
             raise ValueError(f"Unknown schedule: {schedule}")
         self.schedule = schedule
 
+        # ---- build betas ----
         if schedule == "linear":
             betas = torch.linspace(beta_start, beta_end, self.timesteps, dtype=torch.float32)
+            betas = betas.clamp(min=1e-8, max=0.999)
         else:
-            ts = torch.linspace(0, 1, self.timesteps + 1, dtype=torch.float32)
+            # cosine ᾱ(t) from Nichol & Dhariwal; turn into alphas and then betas
+            ts   = torch.linspace(0, 1, self.timesteps + 1, dtype=torch.float32)
             abar = _cosine_alpha_bar(ts)
-            abar = abar / abar[0]
+            abar = abar / abar[0]  # ᾱ(0) = 1
             alphas = torch.ones(self.timesteps, dtype=torch.float32)
             alphas[1:] = abar[1:self.timesteps] / abar[0:self.timesteps - 1]
             betas = (1.0 - alphas).clone()
             betas[1:] = betas[1:].clamp(min=1e-8, max=0.999)
-            betas[0] = 0.0
 
         betas[0] = 0.0
         self.register_buffer("betas", betas)
@@ -72,10 +79,7 @@ class NoiseScheduler(nn.Module):
         ab = alpha_bars.clamp(0.0, 1.0)
         self.register_buffer("sqrt_alphas", torch.sqrt(alphas.clamp(0.0, 1.0)))
         self.register_buffer("sqrt_alpha_bars", torch.sqrt(ab))
-        self.register_buffer(
-            "sqrt_one_minus_alpha_bars",
-            torch.sqrt((1.0 - ab).clamp(0.0, 1.0))
-        )
+        self.register_buffer("sqrt_one_minus_alpha_bars", torch.sqrt((1.0 - ab).clamp(0.0, 1.0)))
 
     @torch.no_grad()
     def timesteps_desc(self):
