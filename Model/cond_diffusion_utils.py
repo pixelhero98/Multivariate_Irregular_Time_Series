@@ -294,28 +294,14 @@ def compute_latent_stats(vae, dataloader, device, use_ewma: bool, ewma_lambda: f
 
 
 @torch.no_grad()
-def invert_two_stage_norm(x0_norm: torch.Tensor,
-                          mu_mean: torch.Tensor,
-                          mu_std: torch.Tensor,
-                          window_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """
-    Invert the two-stage normalization used for diffusion training.
-      x0_norm:     [B,L,Z] normalized latent (what diffusion outputs as x0)
-      mu_mean/std: [Z] global stats computed AFTER the window-wise step
-      window_scale:[1] or [Z] or [B,1,Z] (EWMA/plained per-window std). If None, uses 1.0.
-    Returns:
-      mu_est:      [B,L,Z] in the original VAE latent space (μ)
-    """
-    # undo global whitening
-    mu_w = x0_norm * (mu_std.view(1, 1, -1)) + mu_mean.view(1, 1, -1)
-    # undo window-wise scaling (if provided)
-    if window_scale is None:
-        s = 1.0
-    else:
-        # allow scalar, per-dim [Z], or per-sample [B,1,Z]
-        s = window_scale
-    mu_est = mu_w * s
-    return mu_est
+def invert_two_stage_norm(x0_norm, mu_mean, mu_std, window_scale=None):
+    
+    mu_mean = mu_mean.to(device=x0_norm.device, dtype=x0_norm.dtype)
+    mu_std  = mu_std.to (device=x0_norm.device, dtype=x0_norm.dtype)
+    mu_w = x0_norm * mu_std.view(1, 1, -1) + mu_mean.view(1, 1, -1)
+    s = 1.0 if window_scale is None else window_scale
+    
+    return mu_w * s
 
 
 @torch.no_grad()
