@@ -178,7 +178,7 @@ class LapFormer(nn.Module):
         device = x_tokens.device
         pos = self._pos(L, B, device)
 
-        sc_add_H = self.self_cond_proj(sc_feat) if (self.self_conditioning and sc_feat is not None and self.self_cond_proj is not None) else None
+        sc_add_H = self.self_cond_proj(sc_feat) if (self.self_conditioning and sc_feat is not None) else None
 
         kvs: List[Optional[torch.Tensor]] = [None] * len(self.blocks)
         if cond_summary is not None:
