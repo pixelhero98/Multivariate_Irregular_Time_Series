@@ -1,4 +1,4 @@
-from Model.cond_diffusion_utils import normalize_and_check
+from Latent_Space.latent_vae_utils import normalize_and_check  # FIX: correct module
 from Latent_Space.latent_vae import LatentVAE
 import torch.nn.functional as F
 import os
