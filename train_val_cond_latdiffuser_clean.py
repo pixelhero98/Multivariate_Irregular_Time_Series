@@ -363,7 +363,6 @@ def evaluate_regression(diff_model, vae, dataloader, device, mu_mean, mu_std,
             with torch.no_grad():
                 _, mu_gt, _ = vae(y_in)  # latent of the true target window
             if crypto_config.USE_EWMA:
-                from Model.cond_diffusion_utils import ewma_std
                 s = ewma_std(mu_gt, lam=crypto_config.EWMA_LAMBDA)  # [Beff,1,Z]
             else:
                 s = mu_gt.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
