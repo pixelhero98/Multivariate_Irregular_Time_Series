@@ -130,25 +130,26 @@ def train_one_epoch(epoch: int):
         cs = cond_summary_flat if use_cond else None
 
         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
+        # sample once, reuse for SC and loss
         noise = torch.randn_like(mu_norm)
         x_t, eps_true = scheduler.q_sample(mu_norm, t, noise)
-
-        # ----- SELF-CONDITIONING -----
+        
+        # ---- self-conditioning (optional) ----
         sc_feat = None
         if epoch >= crypto_config.SELF_COND_START_EPOCH and torch.rand(()) < crypto_config.SELF_COND_P:
             with torch.no_grad():
-                pred_no_grad = diff_model(x_t, t, cond_summary=cs, sc_feat=None)
-                sc_feat = scheduler.to_x0(x_t, t, pred_no_grad, crypto_config.PREDICT_TYPE).detach()
-        # ------------------------------
-
-        optimizer.zero_grad(set_to_none=True)
+                pred_ng = diff_model(x_t, t, cond_summary=cs, sc_feat=None)  # <— x_t (no grads)
+                sc_feat = scheduler.to_x0(x_t, t, pred_ng, crypto_config.PREDICT_TYPE).detach()
+        
+        # ---- loss (reusing x_t, eps_true) ----
         with autocast(enabled=(device.type == "cuda")):
             loss = diffusion_loss(
                 diff_model, scheduler, mu_norm, t,
                 cond_summary=cs, predict_type=crypto_config.PREDICT_TYPE,
                 weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
                 minsnr_gamma=crypto_config.MINSNR_GAMMA,
-                sc_feat=sc_feat
+                sc_feat=sc_feat,
+                reuse_xt_eps=(x_t, eps_true),
             )
 
         if not torch.isfinite(loss):
