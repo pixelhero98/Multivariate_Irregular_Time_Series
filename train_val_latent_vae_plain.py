@@ -42,7 +42,7 @@ print("frac padded:", float((~M).float().mean().item()))
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 model = LatentVAE(
-    input_dim=1, seq_len=crypto_config.PRED,  # univariate y with horizon=PRED
+    input_dim=1, seq_len=crypto_config.PRED,  # multi-y with horizon=PRED
     latent_dim=crypto_config.VAE_LATENT_DIM,
     enc_layers=crypto_config.VAE_LAYERS, enc_heads=crypto_config.VAE_HEADS, enc_ff=crypto_config.VAE_FF,
     dec_layers=crypto_config.VAE_LAYERS, dec_heads=crypto_config.VAE_HEADS, dec_ff=crypto_config.VAE_FF
