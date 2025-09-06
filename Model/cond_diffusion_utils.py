@@ -63,12 +63,19 @@ class NoiseScheduler(nn.Module):
             betas[1:] = betas[1:].clamp(min=1e-8, max=0.999)
             betas[0] = 0.0
 
+        betas[0] = 0.0
         self.register_buffer("betas", betas)
-        self.register_buffer("alphas", 1.0 - betas)
-        self.register_buffer("alpha_bars", torch.cumprod(1.0 - betas, dim=0))
-        self.register_buffer("sqrt_alphas", torch.sqrt(1.0 - betas))
-        self.register_buffer("sqrt_alpha_bars", torch.sqrt(self.alpha_bars))
-        self.register_buffer("sqrt_one_minus_alpha_bars", torch.sqrt(1.0 - self.alpha_bars))
+        alphas = 1.0 - betas
+        self.register_buffer("alphas", alphas)
+        alpha_bars = torch.cumprod(alphas, dim=0)
+        self.register_buffer("alpha_bars", alpha_bars)
+        ab = alpha_bars.clamp(0.0, 1.0)
+        self.register_buffer("sqrt_alphas", torch.sqrt(alphas.clamp(0.0, 1.0)))
+        self.register_buffer("sqrt_alpha_bars", torch.sqrt(ab))
+        self.register_buffer(
+            "sqrt_one_minus_alpha_bars",
+            torch.sqrt((1.0 - ab).clamp(0.0, 1.0))
+        )
 
     @torch.no_grad()
     def timesteps_desc(self):
