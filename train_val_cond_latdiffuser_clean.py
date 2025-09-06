@@ -243,20 +243,16 @@ def train_one_epoch(epoch: int):
         cs = cond_summary_flat if use_cond else None
 
         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
-
-        # ==================== SELF-CONDITIONING LOGIC START ====================
+        noise = torch.randn_like(mu_norm)
+        x_t, eps_true = scheduler.q_sample(mu_norm, t, noise)
+        
+        # ----- SELF-CONDITIONING -----
         sc_feat = None
-        # Only apply self-conditioning after the specified epoch and with a given probability
         if epoch >= crypto_config.SELF_COND_START_EPOCH and torch.rand(()) < crypto_config.SELF_COND_P:
             with torch.no_grad():
-                # 1. First pass: predict x0 with no gradients
-                pred_no_grad = diff_model(mu_norm, t, cond_summary=cs, sc_feat=None)
-
-                # 2. Convert model output to x0 and detach it from the graph
-                sc_feat = scheduler.to_x0(
-                    mu_norm, t, pred_no_grad, crypto_config.PREDICT_TYPE
-                ).detach()
-        # ===================== SELF-CONDITIONING LOGIC END =====================
+                pred_no_grad = diff_model(x_t, t, cond_summary=cs, sc_feat=None)
+                sc_feat = scheduler.to_x0(x_t, t, pred_no_grad, crypto_config.PREDICT_TYPE).detach()
+        # ------------------------------
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(enabled=(device.type == "cuda")):
