@@ -357,9 +357,19 @@ def evaluate_regression(diff_model, vae, dataloader, device, mu_mean, mu_std,
         )  # [Beff, H, Z]
 
         # Invert normalization and decode
+        use_gt_window_scale = getattr(crypto_config, "DECODE_USE_GT_SCALE", True)
+        s = None
+        if use_gt_window_scale:
+            with torch.no_grad():
+                _, mu_gt, _ = vae(y_in)  # latent of the true target window
+            if crypto_config.USE_EWMA:
+                from Model.cond_diffusion_utils import ewma_std
+                s = ewma_std(mu_gt, lam=crypto_config.EWMA_LAMBDA)  # [Beff,1,Z]
+            else:
+                s = mu_gt.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
+        
         y_hat = decode_latents_with_vae(
-            vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std, window_scale=None
-        )  # [Beff, H, 1]
+          vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std, window_scale=s) # [Beff, H, 1]
 
         # Metrics
         diff = (y_hat - y_in).abs()
