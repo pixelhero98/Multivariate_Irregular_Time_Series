@@ -253,7 +253,7 @@ class LearnableInverseLaplacianBasis(nn.Module):
 
         k = basis.k
         D = basis.feat_dim
-        in_dim = 2 * k
+        in_dim = 4 * k
         H = int(hidden_dim if hidden_dim is not None else max(in_dim, D))
 
         def maybe_sn(linear: nn.Linear) -> nn.Linear:
@@ -263,7 +263,7 @@ class LearnableInverseLaplacianBasis(nn.Module):
         self.head_c = maybe_sn(nn.Linear(k, D, bias=False))
         self.head_s = maybe_sn(nn.Linear(k, D, bias=False))
 
-        # --- Optional residual MLP over [C,S] ---
+        # --- Optional residual MLP over [C,S,mag,phase] ---
         if self.use_mlp_residual:
             self.norm = nn.LayerNorm(in_dim)
             layers = [maybe_sn(nn.Linear(in_dim, H)), nn.GELU()]
@@ -299,8 +299,11 @@ class LearnableInverseLaplacianBasis(nn.Module):
 
         if not self.use_mlp_residual:
             return y_lin
-
-        # Residual MLP over concatenated [C,S]
-        h = self.norm(lap_feats)
-        y_mlp = self.mlp(h)                            # [B,T,D]
+        # Calculate magnitude and phase (numerically stable)
+        magnitude = torch.sqrt(C.pow(2) + S.pow(2) + 1e-8)
+        phase = torch.atan2(S, C)
+        mlp_input = torch.cat([C, S, magnitude, phase], dim=-1)  
+        h = self.norm(mlp_input) 
+        y_mlp = self.mlp(h)                         # [B,T,D]
+        
         return y_lin + y_mlp
