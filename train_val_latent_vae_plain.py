@@ -217,7 +217,5 @@ with torch.no_grad():
 if all_mu:
     all_mu = torch.cat(all_mu, dim=0)         # [N_seq, H, Z]
     _normed, mu_d, std_d = normalize_and_check(all_mu, plot=True)
-    # Save stats for diffusion if you like:
-    # torch.save({"mu": mu_d, "std": std_d}, os.path.join(model_dir, "latent_stats.pt"))
 else:
     print("No μ collected (empty dataloader batch?).")
