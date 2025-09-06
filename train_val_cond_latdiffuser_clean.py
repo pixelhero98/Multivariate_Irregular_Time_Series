@@ -141,7 +141,7 @@ def train_one_epoch(epoch: int):
                 pred_ng = diff_model(x_t, t, cond_summary=cs, sc_feat=None)  # <— x_t (no grads)
                 sc_feat = scheduler.to_x0(x_t, t, pred_ng, crypto_config.PREDICT_TYPE).detach()
         
-        # ---- loss (reusing x_t, eps_true) ----
+        optimizer.zero_grad(set_to_none=True)
         with autocast(enabled=(device.type == "cuda")):
             loss = diffusion_loss(
                 diff_model, scheduler, mu_norm, t,
