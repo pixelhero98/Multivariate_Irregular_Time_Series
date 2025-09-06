@@ -390,3 +390,109 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
         if patience >= crypto_config.EARLY_STOP:
             print("Early stopping.")
             break
+
+
+# ============================ Decoder finetune + regression eval ============================
+@torch.no_grad()
+def _flatten_for_mask(yb, mask_bn, device):
+    y_in, batch_ids = flatten_targets(yb, mask_bn, device)
+    return y_in, batch_ids
+
+def finetune_vae_decoder(vae, train_dl, val_dl, device,
+                         epochs: int = 3, lr: float = 1e-4, weight_decay: float = 1e-6):
+    print(f"[decoder-ft] epochs={epochs}, lr={lr}")
+    # freeze encoder, unfreeze decoder
+    for p in vae.parameters(): p.requires_grad = False
+    for p in vae.decoder.parameters(): p.requires_grad = True
+
+    vae.train()
+    opt = torch.optim.AdamW(vae.decoder.parameters(), lr=lr, weight_decay=weight_decay)
+    crit = nn.MSELoss()
+
+    def _run_epoch(loader, tag):
+        total, count = 0.0, 0
+        for xb, yb, meta in loader:
+            y_in, _ = _flatten_for_mask(yb, meta["entity_mask"], device)
+            if y_in is None: continue
+            with torch.no_grad():
+                _, mu, _ = vae(y_in)      # [Beff, H, Z]
+                mu = mu.detach()
+            pred = vae.decoder(mu, encoder_skips=None)     # [Beff, H, 1]
+            loss = crit(pred, y_in)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            total += loss.item() * y_in.size(0)
+            count += y_in.size(0)
+        print(f"[decoder-ft] {tag} MSE: {total / max(1, count):.6f}")
+
+    for e in range(1, epochs + 1):
+        _run_epoch(train_dl, f"train@{e}")
+        _run_epoch(val_dl,   f"val@{e}")
+    vae.eval()
+    # keep decoder trainable=false after FT
+    for p in vae.decoder.parameters(): p.requires_grad = False
+
+@torch.no_grad()
+def evaluate_regression(diff_model, vae, dataloader, device, mu_mean, mu_std,
+                        steps: int = 36, guidance_strength: float = 2.0, guidance_power: float = 0.3):
+    diff_model.eval()
+    mse_sum, mae_sum, n = 0.0, 0.0, 0
+
+    use_ema = (ema is not None)
+    if use_ema:
+        ema.store(diff_model); ema.copy_to(diff_model)
+
+    for xb, yb, meta in dataloader:
+        V, T = xb
+        mask_bn = meta["entity_mask"]
+        cond_summary = build_context(diff_model, V, T, mask_bn, device)  # [B,S,Hc]
+        y_in, batch_ids = _flatten_for_mask(yb, mask_bn, device)
+        if y_in is None: continue
+        cs = cond_summary[batch_ids]  # align to selected rows
+
+        Beff, Hcur, Z = y_in.size(0), y_in.size(1), crypto_config.VAE_LATENT_DIM
+        # Conditional generation in latent space (normalized x0)
+        x0_norm = diff_model.generate(
+            shape=(Beff, Hcur, Z),
+            steps=steps,
+            guidance_strength=guidance_strength,
+            guidance_power=guidance_power,
+            series=None,
+            cond_summary=cs,
+            self_cond=True,
+            cfg_rescale=True,
+        )  # [Beff, H, Z]
+
+        # Invert normalization and decode
+        y_hat = decode_latents_with_vae(
+            vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std, window_scale=None
+        )  # [Beff, H, 1]
+
+        # Metrics
+        diff = (y_hat - y_in).abs()
+        mae = diff.mean().item()
+        mse = (diff ** 2).mean().item()
+        mae_sum += mae * Beff
+        mse_sum += mse * Beff
+        n += Beff
+
+    if use_ema:
+        ema.restore(diff_model)
+
+    print(f"[test] MAE: {mae_sum / max(1, n):.6f} | MSE: {mse_sum / max(1, n):.6f}")
+
+# ---------- Run decoder FT + test regression once training stops ----------
+if True:
+    # Fine-tune decoder on train+val (optional; set epochs=0 to skip)
+    ft_epochs = getattr(crypto_config, "DECODER_FT_EPOCHS", 3)
+    ft_lr     = getattr(crypto_config, "DECODER_FT_LR", 1e-4)
+    if ft_epochs > 0:
+        finetune_vae_decoder(vae, train_dl, val_dl, device, epochs=ft_epochs, lr=ft_lr)
+
+    # Evaluate conditional regression on test set
+    gen_steps  = getattr(crypto_config, "GEN_STEPS", 36)
+    guidance_g = getattr(crypto_config, "GUIDANCE_STRENGTH", 2.0)
+    guidance_p = getattr(crypto_config, "GUIDANCE_POWER", 0.3)
+    evaluate_regression(diff_model, vae, test_dl, device, mu_mean, mu_std,
+                        steps=gen_steps, guidance_strength=guidance_g, guidance_power=guidance_p)
