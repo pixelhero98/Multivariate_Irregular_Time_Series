@@ -1,67 +1,93 @@
 import json
 
-# --- Data & Model Parameters ---
-DATA_MODULE   = "Dataset.fin_data_prep_ratiosp_indexcache"
+# ============================ Data & Preprocessing ============================
 DATA_DIR = "./ldt/LLapDiT_Data/Crypto_100/crypto_data"
-VAE_DIR = './ldt/saved_model'
-FEATURES_DIR = f"{DATA_DIR}/features"  # your per-ticker parquet/pickle files live here
 with open(f"{DATA_DIR}/cache_ratio_index/meta.json", "r") as f:
     assets = json.load(f)["assets"]
-NUM_ENTITIES = len(assets)
-WINDOW = 128               # panel context length K
-PRED = 20                  # target sequence length H
-COVERAGE = 0.85
-norm_scope = "train_only"
+
+# --- Data Parameters ---
+WINDOW = 60           # Input sequence length (K)
+PRED = 20             # Target sequence length to predict (H)
+COVERAGE = 0.8
 date_batching=True
-shuffle_train=False
+
+# --- Dataloader Parameters ---
+BATCH_SIZE = 20
 train_ratio=0.7
 val_ratio=0.1
 test_ratio=0.2
 
+# ============================ VAE (Encoder/Decoder) ============================
+VAE_DIR = './ldt/saved_model'
+VAE_CKPT = "./ldt/saved_model/16_0.00124_2.16059_best_recon.pt"
+
 # --- VAE Architecture ---
-VAE_LATENT_DIM = 64
+VAE_LATENT_DIM = 16
 VAE_LAYERS = 3
 VAE_HEADS = 4
 VAE_FF = 256
 
-# --- Training Hyperparameters ---
-EPOCHS = 500
-BATCH_SIZE = 64
-LEARNING_RATE = 1e-4
-MAX_PATIENCE = 20
+# --- VAE Fine-Tuning (Optional, after diffusion training) ---
+# Set DECODER_FT_EPOCHS = 0 to disable this step.
+DECODER_FT_EPOCHS = 6
+DECODER_FT_LR = 1e-4
 
-# --- VAE Loss Parameters ---
-FREE_BITS_PER_ELEM = 0.5
-SOFTNESS = 0.15
+# ============================ Diffusion Model (LLapDiT) ============================
+CKPT_DIR = "./ldt/checkpoints"
 
-# --- LLapDiT Parameters ---
-HORIZON       = PRED           # target length H
-BASE_LR       = 1e-2
-WARMUP_FRAC   = 0.05
-WEIGHT_DECAY  = 5e-4
-GRAD_CLIP     = 1.0
-EARLY_STOP    = 50
-TIMESTEPS     = 1500
-SCHEDULE      = "cosine"     # ["cosine","linear","sigmoid"]
-PREDICT_TYPE  = "v"          # ["v","eps"]
-DROP_COND_P   = 0.25         # classifier-free guidance (drop conditioning prob)
-SELF_COND     = True
-SELF_COND_P   = 0.50
-SNR_CLIP      = 5.0
+# --- Diffusion Process ---
+TIMESTEPS     = 1200
+# Recommended to try "cosine", as it pairs well with v-prediction.
+SCHEDULE      = "linear"     # ["cosine", "linear"]
+PREDICT_TYPE  = "v"          # ["v", "eps"]
 
+# --- Loss Function ---
+# 'weighted_min_snr' is highly recommended. Set to 'none' to disable.
+LOSS_WEIGHT_SCHEME = 'weighted_min_snr'
+# The gamma parameter for min-SNR weighting. A value of 5.0 is a common starting point.
+MINSNR_GAMMA = 5.0
+
+# --- LLapDiT Architecture ---
 MODEL_WIDTH   = 256
-NUM_LAYERS    = 4
+NUM_LAYERS    = 5
 NUM_HEADS     = 4
-LAPLACE_K     = [24, 20, 20, 16]
-GLOBAL_K      = 64
+CONTEXT_LEN   = 2 * PRED      # Learned summary tokens
+LAPLACE_K     = 64
+GLOBAL_K      = 128
+LAP_MODE      = 'parallel'    # or 'recurrent'
+
+# ============================ Training Hyperparameters ============================
+EPOCHS = 1500
+BASE_LR = 8e-4
+WARMUP_FRAC = 0.055
+WEIGHT_DECAY = 5e-4
+GRAD_CLIP = 1.0
+EARLY_STOP = 100
+
+# --- Regularization & Conditioning ---
 DROPOUT       = 0.0
 ATTN_DROPOUT  = 0.0
-CONTEXT_LEN   = HORIZON      # learned summary tokens
+# Probability of dropping conditioning for Classifier-Free Guidance.
+DROP_COND_P   = 0.1
 
-USE_EWMA      = True         # two-stage latent whitening: per-window EWMA, then global
-EWMA_LAMBDA   = 0.94
+# --- Self-Conditioning ---
+SELF_COND     = True
+SELF_COND_P   = 0.5
+# Recommended to lower this to see benefits earlier in training.
+SELF_COND_START_EPOCH = 300
 
+# --- Latent Normalization ---
+# two-stage latent whitening: per-window EWMA, then global z-score
+USE_EWMA      = True
+EWMA_LAMBDA   = 0.99
+
+# ============================ Evaluation & Sampling ============================
+# Use Exponential Moving Average of model weights for evaluation.
 USE_EMA_EVAL = True
-EMA_DECAY    = 0.999         # 0.999–0.9999 are common; larger for longer runs
+EMA_DECAY    = 0.999
 
-CKPT_DIR      = "./ldt/checkpoints"
+# --- Generation Parameters ---
+GEN_STEPS = 36
+# Strength of classifier-free guidance. Key parameter to tune for sample quality.
+GUIDANCE_STRENGTH = 2.0
+GUIDANCE_POWER = 0.3
