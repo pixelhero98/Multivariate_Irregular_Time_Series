@@ -190,47 +190,6 @@ def _print_log(metrics: dict, step: int, csv_path: str = None):
 
 
 # ============================ VAE Latent stats helpers ============================
-def compute_per_dim_stats(all_mu: torch.Tensor):
-    """all_mu: [N, L, D] -> (mu_per_dim[D], std_per_dim[D])."""
-    mu_per_dim  = all_mu.mean(dim=(0, 1))
-    std_per_dim = all_mu.std (dim=(0, 1)).clamp(min=1e-6)
-    return mu_per_dim, std_per_dim
-
-
-def normalize_and_check(all_mu: torch.Tensor, plot: bool = False):
-    """
-    Per-dimension normalize and (optionally) plot a histogram.
-    returns (all_mu_norm, mu_per_dim, std_per_dim)
-    """
-    mu_per_dim, std_per_dim = compute_per_dim_stats(all_mu)
-    mu_b  = mu_per_dim.view(1, 1, -1)
-    std_b = std_per_dim.view(1, 1, -1)
-    all_mu_norm = (all_mu - mu_b) / std_b
-
-    all_vals = all_mu_norm.reshape(-1)
-    print(f"Global mean (post-norm): {all_vals.mean().item():.6f}")
-    print(f"Global std  (post-norm): {all_vals.std().item():.6f}")
-
-    per_dim_mean = all_mu_norm.mean(dim=(0, 1))
-    per_dim_std  = all_mu_norm.std (dim=(0, 1))
-    D = all_mu_norm.size(-1)
-    print("\nPer-dim stats (first 10 dims or D if smaller):")
-    for i in range(min(10, D)):  # fixed (was min(1e10, D))
-        print(f"  dim {i:2d}: mean={per_dim_mean[i]:7.4f}, std={per_dim_std[i]:7.4f}")
-
-    if plot:
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(4, 3))
-        plt.hist(all_vals.cpu().numpy(), bins=500, range=(-5, 5))
-        plt.title("Histogram of normalized μ values")
-        plt.xlabel("Value"); plt.ylabel("Count")
-        plt.show()
-
-    print(f"NaNs: {torch.isnan(all_mu_norm).sum().item()} | Infs: {torch.isinf(all_mu_norm).sum().item()}")
-    print(f"Min: {all_mu_norm.min().item():.6f} | Max: {all_mu_norm.max().item():.6f}")
-    return all_mu_norm, mu_per_dim, std_per_dim
-
-
 def flatten_targets(yb: torch.Tensor, mask_bn: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     """yb: [B,N,H] -> y_in: [Beff,H,1], batch_ids: [Beff] mapping to B for cond rows"""
     y = yb.to(device)
