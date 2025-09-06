@@ -437,6 +437,6 @@ def calculate_v_variance(scheduler, dataloader, vae, device, latent_stats,
         return float('nan')
 
     all_v_targets_cat = torch.cat(all_v_targets, dim=0)
-    v_variance = all_v_targets_cat.var().item()
+    v_variance = all_v_targets_cat.var(correction=0).item()
 
     return v_variance
