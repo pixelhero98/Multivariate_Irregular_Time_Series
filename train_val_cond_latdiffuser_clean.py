@@ -372,9 +372,9 @@ def evaluate_regression(diff_model, vae, dataloader, device, mu_mean, mu_std,
           vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std, window_scale=s) # [Beff, H, 1]
 
         # Metrics
-        diff = (y_hat - y_in).abs()
-        mae = diff.mean().item()
-        mse = (diff ** 2).mean().item()
+        res = y_hat - y_in
+        mae = res.abs().mean().item()
+        mse = (res ** 2).mean().item()
         mae_sum += mae * Beff
         mse_sum += mse * Beff
         n += Beff
