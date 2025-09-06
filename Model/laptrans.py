@@ -31,8 +31,7 @@ from torch.nn.utils import spectral_norm
 
 __all__ = [
     "LearnableLaplacianBasis",
-    "LearnableInverseLaplacianBasis",
-    "LaplaceBlock",
+    "LearnableInverseLaplacianBasis"
 ]
 
 
@@ -202,20 +201,19 @@ class LearnableLaplacianBasis(nn.Module):
 
         # Drive (real only)
         u = self.proj(x)                     # [B,T,k]
-
+        
         # z_t = rho_t * e^{i theta_t} * z_{t-1} + u_t
-        C = torch.empty(B, T, k, dtype=u.dtype, device=device)
-        S = torch.empty(B, T, k, dtype=u.dtype, device=device)
-        c = torch.zeros(B, k, dtype=u.dtype, device=device)
-        s = torch.zeros(B, k, dtype=u.dtype, device=device)
-        for t in range(T):
-            rt = rho[:, t, :]
-            ct = cos_t[:, t, :]
-            st = sin_t[:, t, :]
-            c, s = rt * (c * ct - s * st) + u[:, t, :], rt * (c * st + s * ct)
-            C[:, t, :], S[:, t, :] = c, s
 
-        return torch.cat([C, S], dim=2).contiguous()
+        Z = torch.empty(B, T, k, dtype=torch.complex64, device=device)
+        z = torch.zeros(B, k, dtype=torch.complex64, device=device)
+        
+        for t in range(T):
+            update_factor = rho[:, t, :] * torch.exp(1j * theta[:, t, :])
+            z = update_factor * z + u[:, t, :]
+            Z[:, t, :] = z
+        
+        return torch.cat([Z.real.to(x.dtype), Z.imag.to(x.dtype)], dim=2).contiguous()
+
 
 
 # ==============================
