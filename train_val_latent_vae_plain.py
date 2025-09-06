@@ -2,33 +2,20 @@ from Latent_Space.latent_vae_utils import normalize_and_check  # FIX: correct mo
 from Latent_Space.latent_vae import LatentVAE
 import torch.nn.functional as F
 import os
-import torch, importlib
+import torch
 import crypto_config
+from Dataset.fin_dataset import run_experiment
 
-# -------------------- Config --------------------
-mod = importlib.import_module(crypto_config.DATA_MODULE)
-
-# ============== Re-index The Window & Future Horizon For Datasets ==============
-kept = mod.rebuild_window_index_only(
+train_dl, val_dl, test_dl, sizes = run_experiment(
     data_dir=crypto_config.DATA_DIR,
-    window=crypto_config.WINDOW,
-    horizon=crypto_config.PRED,
-)
-
-# -------------------- Data -------------------
-# Let the module’s default collate return panels + mask
-train_dl, val_dl, test_dl, sizes = mod.load_dataloaders_with_ratio_split(
-    data_dir=crypto_config.DATA_DIR,
-    train_ratio=crypto_config.train_ratio, val_ratio=crypto_config.val_ratio, test_ratio=crypto_config.test_ratio,
-    n_entities=crypto_config.NUM_ENTITIES,
-    shuffle_train=crypto_config.shuffle_train,
-    coverage_per_window=crypto_config.COVERAGE,
     date_batching=crypto_config.date_batching,
-    dates_per_batch=crypto_config.BATCH_SIZE,      # B == number of dates per batch
-    window=crypto_config.WINDOW,
-    horizon=crypto_config.PRED,
-    norm_scope=crypto_config.norm_scope
+    dates_per_batch=crypto_config.BATCH_SIZE,
+    K=crypto_config.WINDOW,
+    H=crypto_config.PRED,
+    coverage=crypto_config.COVERAGE
 )
+print("sizes:", sizes)
+
 train_size, val_size, test_size = sizes
 xb, yb, meta = next(iter(train_dl))
 V, T = xb
@@ -37,7 +24,6 @@ print("sizes:", sizes)
 print("V:", V.shape, "T:", T.shape, "y:", yb.shape)         # -> [B,N,K,F], [B,N,K,F], [B,N,H]
 print("min coverage:", float(M.float().mean(1).min().item()))
 print("frac padded:", float((~M).float().mean().item()))
-
 # -------------------- Model --------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -143,46 +129,49 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
     # -------------------- Epoch metrics (per-element means) --------------------
     per_elem_train_recon = train_recon_sum / max(1, train_elems)
     per_elem_val_recon   = val_recon_sum   / max(1, val_elems)
-    # KL we logged on a (B*H) element basis; keep it comparable to recon:
+    
+    # KL we tracked per (B*H); align denominators with recon
     per_elem_train_kl = train_kl_sum / max(1, train_elems)
     per_elem_val_kl   = val_kl_sum   / max(1, val_elems)
-
-    train_elbo = per_elem_train_recon + per_elem_train_kl
-    val_elbo   = per_elem_val_recon   + per_elem_val_kl
-
+    
+    # Report both classical (beta=1) and training (beta=β) objectives
+    beta = 0.0 if epoch <= WARMUP_EPOCHS else VAE_BETA
+    val_elbo_unweighted   = per_elem_val_recon   + per_elem_val_kl
+    train_elbo_unweighted = per_elem_train_recon + per_elem_train_kl
+    val_elbo_beta   = per_elem_val_recon   + beta * per_elem_val_kl
+    train_elbo_beta = per_elem_train_recon + beta * per_elem_train_kl
+    
     print(
         f"Epoch {epoch}/{crypto_config.EPOCHS} - β={beta:.3f} | "
-        f"Train ELBO: {train_elbo:.6f} (Recon: {per_elem_train_recon:.6f}, KL/elem: {per_elem_train_kl:.6f}) | "
-        f"Val   ELBO: {val_elbo:.6f} (Recon: {per_elem_val_recon:.6f}, KL/elem: {per_elem_val_kl:.6f})"
+        f"Train (β·ELBO): {train_elbo_beta:.6f}  [Recon {per_elem_train_recon:.6f}, KL/elem {per_elem_train_kl:.6f}] | "
+        f"Val   (β·ELBO): {val_elbo_beta:.6f}    [Recon {per_elem_val_recon:.6f}, KL/elem {per_elem_val_kl:.6f}]"
     )
-
+    
     # -------------------- Checkpointing + Early Stop --------------------
-    # best ELBO
-    if val_elbo < best_val_elbo:
-        best_val_elbo = val_elbo
+    # Use β·ELBO for selection, to match training objective
+    improved_elbo  = (val_elbo_beta < best_val_elbo - 1e-9)
+    improved_recon = (per_elem_val_recon < best_val_recon - 1e-9)
+    
+    if improved_elbo:
+        best_val_elbo = val_elbo_beta
         best_elbo_path = os.path.join(model_dir, f"best_elbo.pt")
         torch.save(model.state_dict(), best_elbo_path)
-        print("  -> Saved best ELBO")
-
-    # best Recon
-    if per_elem_val_recon < best_val_recon:
+        print("  -> Saved best β·ELBO")
+    
+    if improved_recon:
         best_val_recon = per_elem_val_recon
         best_recon_path = os.path.join(model_dir, f"best_recon.pt")
         torch.save(model.state_dict(), best_recon_path)
         print("  -> Saved best Recon")
-
+    
     # always save last
-    last_path = os.path.join(model_dir, f"last.pt")
-    torch.save(model.state_dict(), last_path)
-
-    # simple patience on ELBO
-    if val_elbo + 1e-8 < best_val_elbo:
-        patience_counter = 0
-    else:
-        patience_counter += 1
+    torch.save(model.state_dict(), os.path.join(model_dir, "last.pt"))
+    
+    patience_counter = 0 if improved_elbo else (patience_counter + 1)
     if patience_counter >= MAX_PATIENCE:
-        print(f"\nEarly stopping at epoch {epoch}: ELBO hasn't improved in {MAX_PATIENCE} epochs.")
+        print(f"\nEarly stopping at epoch {epoch}: β·ELBO hasn't improved in {MAX_PATIENCE} epochs.")
         break
+
 
 # --- Load the preferred checkpoint for downstream use ---
 to_load = best_elbo_path or best_recon_path or os.path.join(model_dir, "last.pt")
