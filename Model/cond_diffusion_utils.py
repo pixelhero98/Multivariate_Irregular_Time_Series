@@ -358,22 +358,27 @@ def encode_mu_norm(vae, y_in: torch.Tensor, *, use_ewma: bool, ewma_lambda: floa
     return mu_norm
 
 
+# cond_diffusion_utils.py
 def diffusion_loss(model, scheduler, x0_lat_norm: torch.Tensor, t: torch.Tensor,
                    *, cond_summary: Optional[torch.Tensor], predict_type: str = "v",
                    weight_scheme: str = "none", minsnr_gamma: float = 5.0,
-                   sc_feat: Optional[torch.Tensor] = None) -> torch.Tensor:
+                   sc_feat: Optional[torch.Tensor] = None,
+                   reuse_xt_eps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
     """
-    MSE on v/eps with channel-invariant reduction.
-    Optional min-SNR weighting.
+    MSE on v/eps with optional MinSNR weighting.
+    If reuse_xt_eps=(x_t, eps_true) is provided, use that instead of re-sampling.
     """
-    noise = torch.randn_like(x0_lat_norm)
-    x_t, eps_true = scheduler.q_sample(x0_lat_norm, t, noise)
-    pred = model(x_t, t, cond_summary=cond_summary, sc_feat=sc_feat)
+    if reuse_xt_eps is None:
+        noise = torch.randn_like(x0_lat_norm)
+        x_t, eps_true = scheduler.q_sample(x0_lat_norm, t, noise)
+    else:
+        x_t, eps_true = reuse_xt_eps
+
+    pred   = model(x_t, t, cond_summary=cond_summary, sc_feat=sc_feat)
     target = eps_true if predict_type == "eps" else scheduler.v_from_eps(x_t, t, eps_true)
 
-    # [B,H,Z] -> per-sample loss: mean over H, sum over Z  (scale-invariant to Z)
-    err = (pred - target).pow(2)              # [B,H,Z]
-    per_sample = err.mean(dim=1).sum(dim=1)   # [B]
+    err = (pred - target).pow(2)            # [B,H,Z]
+    per_sample = err.mean(dim=1).sum(dim=1) # [B]
 
     if weight_scheme == 'none':
         return per_sample.mean()
@@ -384,6 +389,7 @@ def diffusion_loss(model, scheduler, x0_lat_norm: torch.Tensor, t: torch.Tensor,
         w = torch.minimum(snr, torch.as_tensor(gamma, device=snr.device, dtype=snr.dtype))
         w = w / (snr + 1.0)
         return (w.detach() * per_sample).mean()
+
 
 
 @torch.no_grad()
