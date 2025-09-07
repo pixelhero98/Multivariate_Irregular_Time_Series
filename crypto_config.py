@@ -88,7 +88,7 @@ EMA_DECAY    = 0.999
 DECODE_USE_GT_SCALE = True
 # --- Generation Parameters ---
 GEN_STEPS = 36
-# Strength of classifier-free guidance. Key parameter to tune for sample quality.
+NUM_EVAL_SAMPLES = 25
 GUIDANCE_STRENGTH = 2.0
 GUIDANCE_POWER = 0.3
 DECODER_FT_ANCHOR = 0.25
