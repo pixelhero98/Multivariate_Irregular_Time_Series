@@ -224,6 +224,7 @@ class LLapDiT(nn.Module):
 
             if (y_obs is not None) and (obs_u is not None):
                 if int(t_prev_i) >= 0:
+                    # Re-noise the known observations to the next timestep t_prev_i
                     t_inpaint = t_prev_i.repeat(B)
                     x_obs_t, _ = self.scheduler.q_sample(y_obs.to(device=device, dtype=x_t.dtype), t_inpaint)
                     x_t = obs_u * x_obs_t + (1.0 - obs_u) * x_t
