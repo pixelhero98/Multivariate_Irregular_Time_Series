@@ -117,10 +117,21 @@ class ParallelLaplaceSummarizer(nn.Module):
             key_padding_mask = None if pad_mask is None else pad_mask.to(torch.bool)
 
         Q = self.queries.unsqueeze(0).expand(B, -1, -1)
-        summary, _ = self.mha(Q, memory, values, key_padding_mask=key_padding_mask)
+        summary, attn_weights = self.mha(Q, memory, values,
+                                         key_padding_mask=key_padding_mask,
+                                         average_attn_weights=False) # Get per-head weights
+                                         
         summary = self.norm(self.dropout(summary) + Q)
 
-        aux = {"V_sig": V_sig, "T_sig": T_sig, "lap": L, "w_v": a.detach(), "w_t": b.detach()}
+        # Store all useful intermediate tensors for visualization and debugging
+        aux = {
+            "V_sig": V_sig,              # Raw value signal (pre-Laplace)
+            "T_sig": T_sig,              # Raw temporal signal (pre-Laplace)
+            "lap_guidance": L,           # Final combined Laplace features
+            "w_v": a.detach(),           # Learned weight for the value signal
+            "w_t": b.detach(),           # Learned weight for the temporal signal
+            "attn_weights": attn_weights   # Per-head attention weights [B, H, Lq, T_memory]
+        }
         return summary, aux
 
 
@@ -421,10 +432,18 @@ class RecurrentLaplaceSummarizer(nn.Module):
         Q = self.queries.unsqueeze(0).expand(B, -1, -1)
         summary, _ = self.mha(Q, memory, values,
                               key_padding_mask=key_padding_mask,
-                              attn_mask=attn_bias)
+                              attn_mask=attn_bias,
+                              average_attn_weights=False)
         summary = self.norm(self.dropout(summary) + Q)
 
-        aux = {"T": T_sig, "V": V_sig, "lap_guidance": L, **lap_aux}
+        aux = {
+            "T_sig": T_sig,              # Raw temporal signal (pre-Laplace)
+            "V_sig": V_sig,              # Raw value signal (pre-Laplace)
+            "lap_guidance": L,           # Final combined Laplace features
+            "attn_bias": bias_ht,        # Learned attention bias from Laplace features
+            "attn_weights": attn_weights, # Per-head attention weights [B, H, Lq, T_memory]
+            **lap_aux                    # Includes LT, LV, LdT, LdV, and ODE coefficients
+        }
         return summary, aux
 
 
