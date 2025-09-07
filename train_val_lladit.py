@@ -289,40 +289,132 @@ def _flatten_for_mask(yb, mask_bn, device):
     return y_in, batch_ids
 
 
-def finetune_vae_decoder(vae, train_dl, val_dl, device,
-                         epochs: int = 5, lr: float = 1e-4, weight_decay: float = 1e-6):
-    print(f"[decoder-ft] epochs={epochs}, lr={lr}")
-    # freeze encoder, unfreeze decoder
+def finetune_vae_decoder_on_generated(
+    vae,
+    diff_model,
+    train_dl,
+    val_dl,
+    device,
+    *,
+    mu_mean,
+    mu_std,
+    ema=None,                              # swaps EMA weights during FT/eval if provided
+    epochs: int = 3,
+    lr: float = 1e-4,
+    weight_decay: float = 1e-6,
+    gen_steps: int = 36,
+    guidance_strength: float = 2.0,
+    guidance_power: float = 0.3,
+    lambda_rec_anchor: float = 0.25,       # weight for teacher-forced anchor loss
+    use_gt_window_scale: bool = True,      # use ground-truth window scale when decoding
+):
+    """
+    Fine-tune ONLY the VAE decoder to adapt to the diffusion model's generated latent x0_norm.
+
+    Loss = lambda_gen * MSE(dec(decoder(x0_norm_gen)), y_true)
+         + lambda_rec_anchor * MSE(dec(decoder(mu_enc)), y_true)
+    with lambda_gen = 1 by construction.
+    """
+    print(f"[decoder-ft(gen)] epochs={epochs}, lr={lr}, steps={gen_steps}, "
+          f"guidance={guidance_strength}, power={guidance_power}, anchor={lambda_rec_anchor}")
+
+    # --- freeze encoder; train decoder only
     for p in vae.parameters(): p.requires_grad = False
     for p in vae.decoder.parameters(): p.requires_grad = True
-
     vae.train()
-    opt = torch.optim.AdamW(vae.decoder.parameters(), lr=lr, weight_decay=weight_decay)
-    crit = nn.MSELoss()
 
-    def _run_epoch(loader, tag):
-        total, count = 0.0, 0
-        for xb, yb, meta in loader:
-            y_in, _ = _flatten_for_mask(yb, meta["entity_mask"], device)
-            if y_in is None: continue
+    # diffusion is a teacher; no grads
+    diff_model.eval()
+    use_ema = (ema is not None)
+    if use_ema:  # swap EMA weights in
+        ema.store(diff_model)
+        ema.copy_to(diff_model)
+
+    opt = torch.optim.AdamW(vae.decoder.parameters(), lr=lr, weight_decay=weight_decay)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    mse = torch.nn.MSELoss()
+
+    def _decode_with_scale(x0_norm, y_true):
+        """Decode latent with optional per-window scale from the ground-truth window."""
+        s = None
+        if use_gt_window_scale:
             with torch.no_grad():
-                _, mu, _ = vae(y_in)      # [Beff, H, Z]
-                mu = mu.detach()
-            pred = vae.decoder(mu, encoder_skips=None)     # [Beff, H, 1]
-            loss = crit(pred, y_in)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-            total += loss.item() * y_in.size(0)
-            count += y_in.size(0)
-        print(f"[decoder-ft] {tag} MSE: {total / max(1, count):.6f}")
+                _, mu_gt, _ = vae(y_true)  # [Beff, H, Z]
+            if hasattr(crypto_config, "USE_EWMA") and crypto_config.USE_EWMA:
+                from Model.cond_diffusion_utils import ewma_std  # or import once at top
+                s = ewma_std(mu_gt, lam=getattr(crypto_config, "EWMA_LAMBDA", 0.94))
+            else:
+                s = mu_gt.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
+        # decode_latents_with_vae expects normalized latents
+        return decode_latents_with_vae(vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std, window_scale=s)
+
+    def _run_epoch(loader, tag, train: bool):
+        if train: vae.train()
+        else:     vae.eval()
+
+        total_gen, total_anchor, total_all, count = 0.0, 0.0, 0.0, 0
+
+        for xb, yb, meta in loader:
+            V, T = xb
+            mask_bn = meta["entity_mask"]
+            cs_full = build_context(diff_model, V, T, mask_bn, device)  # [B,S,Hc]
+            y_true, batch_ids = _flatten_for_mask(yb, mask_bn, device)
+            if y_true is None:  # no valid rows in this batch
+                continue
+            cs = cs_full[batch_ids]  # align cond to selected rows
+
+            Beff, Hcur = y_true.size(0), y_true.size(1)
+            Z = getattr(crypto_config, "VAE_LATENT_DIM", mu_mean.numel())  # latent dim
+
+            # ---- generate x0_norm in latent space (no grads)
+            with torch.no_grad():
+                x0_norm = diff_model.generate(
+                    shape=(Beff, Hcur, Z),
+                    steps=gen_steps,
+                    guidance_strength=guidance_strength,
+                    guidance_power=guidance_power,
+                    series=None,
+                    cond_summary=cs,
+                    self_cond=True,
+                    cfg_rescale=True,
+                )
+
+            # ---- forward decoder on generated latents (grads flow into decoder)
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                y_hat_gen = _decode_with_scale(x0_norm.detach(), y_true)  # [Beff,H,1]
+                loss_gen = mse(y_hat_gen, y_true)
+
+                # Teacher-forced anchor (decoder should still reconstruct encoder μ)
+                with torch.no_grad():
+                    _, mu_enc, _ = vae(y_true)  # [Beff,H,Z]
+                y_hat_rec = vae.decoder(mu_enc.detach(), encoder_skips=None)  # [Beff,H,1]
+                loss_anchor = mse(y_hat_rec, y_true)
+
+                loss = loss_gen + lambda_rec_anchor * loss_anchor
+
+            if train:
+                opt.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+
+            bs = y_true.size(0)
+            total_gen  += loss_gen.item() * bs
+            total_anchor += loss_anchor.item() * bs
+            total_all += loss.item() * bs
+            count += bs
+
+        print(f"[decoder-ft(gen)] {tag}  loss_gen={total_gen/max(1,count):.6f}  "
+              f"loss_anchor={total_anchor/max(1,count):.6f}  total={total_all/max(1,count):.6f}")
 
     for e in range(1, epochs + 1):
-        _run_epoch(train_dl, f"train@{e}")
-        _run_epoch(val_dl,   f"val@{e}")
-    vae.eval()
-    # keep decoder trainable=false after FT
+        _run_epoch(train_dl, f"train@{e}", train=True)
+        _run_epoch(val_dl,   f"val@{e}",   train=False)
+
+    # restore non-trainable decoder after FT
     for p in vae.decoder.parameters(): p.requires_grad = False
+    if use_ema:
+        ema.restore(diff_model)
 
 
 @torch.no_grad()
@@ -389,12 +481,21 @@ if True:
     # Fine-tune decoder on train+val (optional; set epochs=0 to skip)
     ft_epochs = crypto_config.DECODER_FT_EPOCHS
     ft_lr     = crypto_config.DECODER_FT_LR
-    if ft_epochs > 0:
-        finetune_vae_decoder(vae, train_dl, val_dl, device, epochs=ft_epochs, lr=ft_lr)
-
-    # Evaluate conditional regression on test set
     gen_steps  = crypto_config.GEN_STEPS
     guidance_g = crypto_config.GUIDANCE_STRENGTH
     guidance_p = crypto_config.GUIDANCE_POWER
+  
+    if ft_epochs > 0:
+        finetune_vae_decoder(vae, diff_model, train_dl, val_dl, device,
+                             mu_mean=mu_mean, mu_std=mu_std, ema=ema,
+                             epochs=ft_epochs,
+                             lr=ft_epochs,
+                             gen_steps=gen_steps,
+                             guidance_strength=guidance_g,
+                             guidance_power=guidance_p,
+                             lambda_rec_anchor=crypto_config.DECODER_FT_ANCHOR,
+                             use_gt_window_scale=rypto_config.DECODE_USE_GT_SCALE)
+
+    # Evaluate conditional regression on test set
     evaluate_regression(diff_model, vae, test_dl, device, mu_mean, mu_std,
                         steps=gen_steps, guidance_strength=guidance_g, guidance_power=guidance_p)
