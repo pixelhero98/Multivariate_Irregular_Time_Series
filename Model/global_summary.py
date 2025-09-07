@@ -379,10 +379,7 @@ class RecurrentLaplaceSummarizer(nn.Module):
             else:
                 Tfeat = Tfeat * mN
         T_sig = self.t_head(Tfeat)
-        if mN is not None:
-            V_sig = V_sig * mN
-            T_sig = T_sig * mN
-
+        
         L, lap_aux = self.ode_lap(T_sig, V_sig, dt=dt, entity_mask=mN)
 
         if self.zero_first_step:
