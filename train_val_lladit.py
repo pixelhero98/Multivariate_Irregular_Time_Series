@@ -411,15 +411,16 @@ def finetune_vae_decoder(
 
 
 @torch.no_grad()
-def evaluate_regression(diff_model, vae, dataloader, device, mu_mean, mu_std, config,
+def evaluate_regression(diff_model, vae, dataloader, device, mu_mean, mu_std, config, ema=None,
                         steps: int = 36, guidance_strength: float = 2.0, guidance_power: float = 0.3):
     diff_model.eval()
     mse_sum, mae_sum, n = 0.0, 0.0, 0
+    num_samples = getattr(config, "NUM_EVAL_SAMPLES", 1) # Get sample count from config
 
-    use_ema = hasattr(config, 'ema') and config.ema is not None
+    use_ema = (ema is not None)
     if use_ema:
-        config.ema.store(diff_model)
-        config.ema.copy_to(diff_model)
+        ema.store(diff_model)
+        ema.copy_to(diff_model)
 
     for xb, yb, meta in dataloader:
         V, T = xb
@@ -430,32 +431,41 @@ def evaluate_regression(diff_model, vae, dataloader, device, mu_mean, mu_std, co
         cs = cond_summary[batch_ids]
 
         Beff, Hcur, Z = y_in.size(0), y_in.size(1), config.VAE_LATENT_DIM
-        # ---- Conditional generation in latent space ----
-        x0_norm = diff_model.generate(
-            shape=(Beff, Hcur, Z), steps=steps,
-            guidance_strength=guidance_strength, guidance_power=guidance_power,
-            cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
-        )
 
-        # ---- Invert normalization and decode ----
-        s = None
-        if getattr(config, "DECODE_USE_GT_SCALE", True):
-            s = get_window_scale(vae, y_in, config)
+        # ---- Generate multiple samples ----
+        all_y_hats = []
+        for _ in range(num_samples):
+            # ---- Conditional generation in latent space ----
+            x0_norm = diff_model.generate(
+                shape=(Beff, Hcur, Z), steps=steps,
+                guidance_strength=guidance_strength, guidance_power=guidance_power,
+                cond_summary=cs, self_cond=config.SELF_COND, cfg_rescale=True,
+            )
 
-        y_hat = decode_latents_with_vae(
-            vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std, window_scale=s
-        )
+            # ---- Invert normalization and decode ----
+            s = None
+            if getattr(config, "DECODE_USE_GT_SCALE", True):
+                s = get_window_scale(vae, y_in, config)
+
+            y_hat_sample = decode_latents_with_vae(
+                vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std, window_scale=s
+            )
+            all_y_hats.append(y_hat_sample)
+
+        # ---- Aggregate the samples ----
+        # Stack all samples along a new dimension and take the mean
+        y_hat_ensemble = torch.stack(all_y_hats, dim=0).mean(dim=0)
 
         # ---- Metrics ----
-        res = y_hat - y_in
+        res = y_hat_ensemble - y_in # Use the ensemble prediction for metrics
         mae_sum += res.abs().mean().item() * Beff
         mse_sum += (res ** 2).mean().item() * Beff
         n += Beff
 
     if use_ema:
-        config.ema.restore(diff_model)
+        ema.restore(diff_model)
 
-    print(f"[test] MAE: {mae_sum / max(1, n):.6f} | MSE: {mse_sum / max(1, n):.6f}")
+    print(f"[test ({num_samples} samples)] MAE: {mae_sum / max(1, n):.6f} | MSE: {mse_sum / max(1, n):.6f}")
 
 
 # ---------- Run decoder FT + test regression once training stops ----------
