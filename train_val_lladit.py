@@ -33,7 +33,7 @@ xb0, yb0, meta0 = next(iter(train_dl))
 V0, T0 = xb0
 B0, N0, K0, Fv = V0.shape
 Ft = T0.shape[-1]
-H  = yb0.shape[-1]
+H = yb0.shape[-1]
 assert Fv == Ft, f"Expected Fv == Ft, got {Fv} vs {Ft}"
 print("V:", V0.shape, "T:", T0.shape, "y:", yb0.shape)
 
@@ -61,7 +61,6 @@ mu_mean, mu_std = compute_latent_stats(
     ewma_lambda=crypto_config.EWMA_LAMBDA
 )
 
-
 # ---- Conditional diffusion model ----
 diff_model = LLapDiT(
     data_dim=crypto_config.VAE_LATENT_DIM, hidden_dim=crypto_config.MODEL_WIDTH,
@@ -74,11 +73,10 @@ diff_model = LLapDiT(
     lap_mode=crypto_config.LAP_MODE
 ).to(device)
 
-
 # ---- Calculate the variance of the v-prediction target ----
 v_variance = calculate_v_variance(
     scheduler=diff_model.scheduler,
-    dataloader=train_dl,
+    dataloader=val_dl,
     vae=vae,
     device=device,
     latent_stats=(mu_mean, mu_std),
@@ -87,7 +85,6 @@ v_variance = calculate_v_variance(
 )
 print(f"calculated V-Prediction Target Variance: {v_variance:.4f}")
 print("=========================================================")
-
 
 ema = EMA(diff_model, decay=crypto_config.EMA_DECAY) if crypto_config.USE_EMA_EVAL else None
 
@@ -105,7 +102,8 @@ scaler = GradScaler(enabled=(device.type == "cuda"))
 # ============================ train/val loops ============================
 def train_one_epoch(epoch: int):
     diff_model.train()
-    running_loss = 0.0; num_samples = 0
+    running_loss = 0.0;
+    num_samples = 0
     global global_step
 
     for xb, yb, meta in train_dl:
@@ -133,7 +131,7 @@ def train_one_epoch(epoch: int):
         # sample once, reuse for SC and loss
         noise = torch.randn_like(mu_norm)
         x_t, eps_true = scheduler.q_sample(mu_norm, t, noise)
-        
+
         # ---- self-conditioning (optional) ----
         sc_feat = None
         if (epoch >= crypto_config.SELF_COND_START_EPOCH
@@ -141,7 +139,7 @@ def train_one_epoch(epoch: int):
             with torch.no_grad():
                 pred_ng = diff_model(x_t, t, cond_summary=cs, sc_feat=None)  # <— x_t (no grads)
                 sc_feat = scheduler.to_x0(x_t, t, pred_ng, crypto_config.PREDICT_TYPE).detach()
-        
+
         optimizer.zero_grad(set_to_none=True)
         with autocast(enabled=(device.type == "cuda")):
             loss = diffusion_loss(
@@ -162,7 +160,8 @@ def train_one_epoch(epoch: int):
         scaler.unscale_(optimizer)
         if getattr(crypto_config, "GRAD_CLIP", 0.0) and crypto_config.GRAD_CLIP > 0:
             nn.utils.clip_grad_norm_(diff_model.parameters(), crypto_config.GRAD_CLIP)
-        scaler.step(optimizer); scaler.update()
+        scaler.step(optimizer);
+        scaler.update()
         if ema is not None:
             ema.update(diff_model)
         lr_sched.step()
@@ -220,7 +219,7 @@ def validate():
         if probe_n > 0:
             mu_p = mu_norm[:probe_n]
             cs_p = cond_summary_flat[:probe_n]
-            t_p  = sample_t_uniform(scheduler, probe_n, device)
+            t_p = sample_t_uniform(scheduler, probe_n, device)
             loss_cond = diffusion_loss(diff_model, scheduler, mu_p, t_p,
                                        cond_summary=cs_p, predict_type=crypto_config.PREDICT_TYPE).item()
             loss_unco = diffusion_loss(diff_model, scheduler, mu_p, t_p,
@@ -252,7 +251,8 @@ for epoch in tqdm(range(1, crypto_config.EPOCHS + 1), desc="Epochs"):
 
     # checkpoint best (with EMA state)
     if val_loss < best_val:
-        best_val = val_loss; patience = 0
+        best_val = val_loss;
+        patience = 0
         if current_best_path and os.path.exists(current_best_path):
             os.remove(current_best_path)
 
@@ -265,7 +265,7 @@ for epoch in tqdm(range(1, crypto_config.EPOCHS + 1), desc="Epochs"):
             "model_state": diff_model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "mu_mean": mu_mean.detach().cpu(),
-            "mu_std":  mu_std.detach().cpu(),
+            "mu_std": mu_std.detach().cpu(),
             "predict_type": crypto_config.PREDICT_TYPE,
             "timesteps": crypto_config.TIMESTEPS,
             "schedule": crypto_config.SCHEDULE,
@@ -463,6 +463,7 @@ if True:
     # It's good practice to pass the whole config object
     # to avoid long argument lists and make adding new parameters easier.
     if crypto_config.DECODER_FT_EPOCHS > 0:
+        torch.manual_seed(42)
         finetune_vae_decoder(
             vae, diff_model, train_dl, val_dl, device,
             mu_mean=mu_mean, mu_std=mu_std,
