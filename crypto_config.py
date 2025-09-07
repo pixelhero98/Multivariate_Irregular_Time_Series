@@ -91,3 +91,4 @@ GEN_STEPS = 36
 # Strength of classifier-free guidance. Key parameter to tune for sample quality.
 GUIDANCE_STRENGTH = 2.0
 GUIDANCE_POWER = 0.3
+DECODER_FT_ANCHOR = 0.25
