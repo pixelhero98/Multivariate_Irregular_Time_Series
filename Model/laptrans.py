@@ -8,12 +8,12 @@ Learnable Laplace analysis + decoder stack.
 - LearnableInverseLaplacianBasis (decoder):
     Learns to map Laplace features back to the original feature space.
     This is NOT a strict mathematical inverse; it is a small MLP trained
-    end-to-end for the downstream objective.
+    end-to-end for the downstream objective. But, supports spectral_norm (sn).
 
 - LaplaceBlock:
     Convenience wrapper combining analysis + decoder.
 
-Contract (as requested):
+Other comments:
     The decoder is always used with its paired basis:
       input_dim  = 2 * k
       output_dim = feat_dim  (original input dim to the basis)
@@ -34,33 +34,32 @@ __all__ = [
     "LearnableInverseLaplacianBasis"
 ]
 
-
-# =========================
-# Analysis: Laplace features
-# =========================
+# =========================================
+# Analysis: Laplace features (Real and Img)
+# =========================================
 class LearnableLaplacianBasis(nn.Module):
     """
     Learnable Laplace transform basis producing 2*k channels (cos & sin branches).
 
     Args:
-        k:         number of complex poles (output channels = 2*k)
+        k:         number of complex poles and frequencies (output channels = 2*k)
         feat_dim:  input feature dimension (last dim of x)
         mode:      'parallel' (fixed basis) or 'recurrent' (time-varying recurrence)
                    Aliases: 'static'→'parallel' (deprecated), 'tv'→'recurrent' (deprecated)
-        alpha_min: strictly positive floor for the real part (decay)
-        omega_max: clamp for imaginary part (frequency) in 'parallel' mode
+        alpha_min: strictly positive floor for the real part (decay), ensuring stable learning.
+        omega_max: clamp for imaginary part (frequency) in 'parallel' mode, ensuring no drastic phase change.
 
     Forward:
         x: [B, T, D]
 
         For mode='recurrent' you may also pass:
-          dt:        [T] or [B, T] step sizes; None -> uniform over [0,1]
+          dt:        [T] or [B, T] step sizes, which supports irregular data sampling interval; None (regular) -> uniform over [0,1]
           alpha_mod: [B, T, k] log-scale modulation of decay (multiplies alpha)
           omega_mod: [B, T, k] log-scale modulation of frequency (multiplies omega)
           tau_mod:   [B, T, 1] or [B, T, k] log-scale global timescale modulation
 
     Returns:
-        lap_feats: [B, T, 2*k]  (concat of cosine-like and sine-like channels)
+        lap_feats: [B, T, 2*k]  (concat of poles and frequencies)
     """
 
     def __init__(
@@ -216,7 +215,7 @@ class LearnableLaplacianBasis(nn.Module):
 
 
 # ==============================
-# Decoder (NOT a strict inverse)
+# Synthesis (non-strict inverse)
 # ==============================
 class LearnableInverseLaplacianBasis(nn.Module):
     """
