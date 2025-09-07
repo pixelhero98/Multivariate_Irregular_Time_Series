@@ -7,7 +7,7 @@ from Dataset.fin_dataset import run_experiment
 from Latent_Space.latent_vae import LatentVAE
 from Model.lladit import LLapDiT
 from Model.cond_diffusion_utils import (EMA, set_torch, encode_mu_norm,
-                                        make_warmup_cosine,
+                                        make_warmup_cosine, ewma_std,
                                         calculate_v_variance, compute_latent_stats,
                                         diffusion_loss, build_context,
                                         flatten_targets, sample_t_uniform,
