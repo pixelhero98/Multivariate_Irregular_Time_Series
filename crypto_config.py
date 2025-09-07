@@ -6,13 +6,13 @@ with open(f"{DATA_DIR}/cache_ratio_index/meta.json", "r") as f:
     assets = json.load(f)["assets"]
 
 # --- Data Parameters ---
-WINDOW = 60           # Input sequence length (K)
+WINDOW = 200           # Input sequence length (K)
 PRED = 20             # Target sequence length to predict (H)
 COVERAGE = 0.8
 date_batching=True
 
 # --- Dataloader Parameters ---
-BATCH_SIZE = 20
+BATCH_SIZE = 5
 train_ratio=0.7
 val_ratio=0.1
 test_ratio=0.2
@@ -29,7 +29,7 @@ VAE_FF = 256
 
 # --- VAE Fine-Tuning (Optional, after diffusion training) ---
 # Set DECODER_FT_EPOCHS = 0 to disable this step.
-DECODER_FT_EPOCHS = 6
+DECODER_FT_EPOCHS = 10
 DECODER_FT_LR = 1e-4
 
 # ============================ Diffusion Model (LLapDiT) ============================
@@ -71,7 +71,7 @@ ATTN_DROPOUT  = 0.0
 DROP_COND_P   = 0.1
 
 # --- Self-Conditioning ---
-SELF_COND     = True
+SELF_COND     = False
 SELF_COND_P   = 0.5
 # Recommended to lower this to see benefits earlier in training.
 SELF_COND_START_EPOCH = 300
@@ -87,7 +87,7 @@ USE_EMA_EVAL = True
 EMA_DECAY    = 0.999
 DECODE_USE_GT_SCALE = True
 # --- Generation Parameters ---
-GEN_STEPS = 36
+GEN_STEPS = 100
 NUM_EVAL_SAMPLES = 25
 GUIDANCE_STRENGTH = 2.0
 GUIDANCE_POWER = 0.3
