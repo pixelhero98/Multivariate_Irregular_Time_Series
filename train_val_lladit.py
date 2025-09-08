@@ -387,9 +387,6 @@ def finetune_vae_decoder(
                     guidance_strength=guidance_strength, guidance_power=guidance_power,
                     cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
                 )
-            with torch.no_grad():
-                r = torch.exp(0.20 * torch.randn(Beff, 1, Z, device=x0_norm_gen.device, dtype=x0_norm_gen.dtype))
-                x0_norm_aug = x0_norm_gen * r 
             # ---- Forward decoder on generated latents ----
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 s = get_window_scale(vae, y_true, config) if use_gt_window_scale else None
