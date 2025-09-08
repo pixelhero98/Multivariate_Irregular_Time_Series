@@ -260,7 +260,12 @@ else:
     # --- TRAINING LOOP ---
     if skip_with_trained_model:
          print(f"Model path not found: {skip_with_trained_model}. Starting training from scratch.")
-
+      
+    best_val = float("inf")
+    patience = 0
+    current_best_path = None
+    os.makedirs(crypto_config.CKPT_DIR, exist_ok=True)
+  
     for epoch in tqdm(range(1, crypto_config.EPOCHS + 1), desc="Epochs"):
         train_loss = train_one_epoch(epoch)
         val_loss, cond_gap = validate()
