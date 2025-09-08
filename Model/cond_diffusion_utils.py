@@ -315,7 +315,6 @@ def invert_two_stage_norm(x0_norm, mu_mean, mu_std, window_scale=None):
     return mu_w * s
 
 
-@torch.no_grad()
 def decode_latents_with_vae(vae, x0_norm: torch.Tensor,
                             mu_mean: torch.Tensor, mu_std: torch.Tensor,
                             window_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
