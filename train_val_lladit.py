@@ -237,50 +237,69 @@ def validate():
 
 
 # ============================ run ============================
-best_val = float("inf")
-patience = 0
-current_best_path = None
-global_step = 0
+skip_with_trained_model = "PATH_TO_YOUR_BEST_MODEL.pt" 
 
-for epoch in tqdm(range(1, crypto_config.EPOCHS + 1), desc="Epochs"):
-    train_loss = train_one_epoch(epoch)
-    val_loss, cond_gap = validate()
-    Z = crypto_config.VAE_LATENT_DIM
-    print(f"Epoch {epoch:03d} | train: {train_loss:.6f} (/Z: {train_loss / Z:.6f}) "
-          f"| val: {val_loss:.6f} (/Z: {val_loss / Z:.6f}) | cond_gap: {cond_gap:.6f}")
+if skip_with_trained_model and os.path.exists(skip_with_trained_model):
+    print(f"Skipping training. Loading model from: {skip_with_trained_model}")
+    ckpt = torch.load(skip_with_trained_model, map_location=device)
+    
+    # Load model weights
+    diff_model.load_state_dict(ckpt["model_state"])
+    print("Loaded model state.")
+    
+    # Load EMA weights if they exist in the checkpoint and are enabled
+    if ema is not None and "ema_state" in ckpt:
+        ema.load_state_dict(ckpt["ema_state"])
+        print("Loaded EMA state.")
 
-    # checkpoint best (with EMA state)
-    if val_loss < best_val:
-        best_val = val_loss;
-        patience = 0
-        if current_best_path and os.path.exists(current_best_path):
-            os.remove(current_best_path)
+    # Load stats needed for downstream tasks
+    mu_mean = ckpt["mu_mean"].to(device)
+    mu_std = ckpt["mu_std"].to(device)
+    
+else:
+    # --- TRAINING LOOP ---
+    if skip_with_trained_model:
+         print(f"Model path not found: {skip_with_trained_model}. Starting training from scratch.")
 
-        ckpt_path = os.path.join(
-            crypto_config.CKPT_DIR,
-            f"best_latdiff_epoch_{epoch:03d}_val_{val_loss / Z:.6f}.pt"
-        )
-        save_payload = {
-            "epoch": epoch,
-            "model_state": diff_model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "mu_mean": mu_mean.detach().cpu(),
-            "mu_std": mu_std.detach().cpu(),
-            "predict_type": crypto_config.PREDICT_TYPE,
-            "timesteps": crypto_config.TIMESTEPS,
-            "schedule": crypto_config.SCHEDULE,
-        }
-        if ema is not None:
-            save_payload["ema_state"] = ema.state_dict()
-            save_payload["ema_decay"] = crypto_config.EMA_DECAY
-        torch.save(save_payload, ckpt_path)
-        # print("Saved:", ckpt_path)
-        current_best_path = ckpt_path
-    else:
-        patience += 1
-        if patience >= crypto_config.EARLY_STOP:
-            print("Early stopping.")
-            break
+    for epoch in tqdm(range(1, crypto_config.EPOCHS + 1), desc="Epochs"):
+        train_loss = train_one_epoch(epoch)
+        val_loss, cond_gap = validate()
+        Z = crypto_config.VAE_LATENT_DIM
+        print(f"Epoch {epoch:03d} | train: {train_loss:.6f} (/Z: {train_loss / Z:.6f}) "
+              f"| val: {val_loss:.6f} (/Z: {val_loss / Z:.6f}) | cond_gap: {cond_gap:.6f}")
+    
+        # checkpoint best (with EMA state)
+        if val_loss < best_val:
+            best_val = val_loss;
+            patience = 0
+            if current_best_path and os.path.exists(current_best_path):
+                os.remove(current_best_path)
+    
+            ckpt_path = os.path.join(
+                crypto_config.CKPT_DIR,
+                f"best_latdiff_epoch_{epoch:03d}_val_{val_loss / Z:.6f}.pt"
+            )
+            save_payload = {
+                "epoch": epoch,
+                "model_state": diff_model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "mu_mean": mu_mean.detach().cpu(),
+                "mu_std": mu_std.detach().cpu(),
+                "predict_type": crypto_config.PREDICT_TYPE,
+                "timesteps": crypto_config.TIMESTEPS,
+                "schedule": crypto_config.SCHEDULE,
+            }
+            if ema is not None:
+                save_payload["ema_state"] = ema.state_dict()
+                save_payload["ema_decay"] = crypto_config.EMA_DECAY
+            torch.save(save_payload, ckpt_path)
+            # print("Saved:", ckpt_path)
+            current_best_path = ckpt_path
+        else:
+            patience += 1
+            if patience >= crypto_config.EARLY_STOP:
+                print("Early stopping.")
+                break
 
 
 # ============================ Decoder finetune + regression eval ============================
