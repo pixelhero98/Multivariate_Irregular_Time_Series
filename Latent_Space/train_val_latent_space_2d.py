@@ -1,4 +1,3 @@
-
 from Latent_Space.latent_vae_utils import normalize_and_check  # plotting/stats helper (unchanged)
 from Latent_Space.latent_vae_2d import VAE2D
 import torch.nn.functional as F
