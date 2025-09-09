@@ -110,11 +110,11 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
         x_in   = y.unsqueeze(-1).to(device)        # [B,N,H,1]
         m_2d   = M                                  # [B,N] bool
         m_full = m_2d.unsqueeze(-1).expand_as(y)    # [B,N,H] (broadcast mask across time)
-
+        use_mask = None if bool(m_full.all()) else m_full
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
             # forward (coverage computed inside if mask provided)
-            y_hat, mu_g, logvar_g, z_grid, cov, grid, orig = model(x_in, mask=m_full)
+            y_hat, mu_g, logvar_g, z_grid, cov, grid, orig = model(x_in, mask=use_mask)
 
             # losses
             recon_loss = masked_mse(y_hat, y, m_2d)           # entity-masked MSE
