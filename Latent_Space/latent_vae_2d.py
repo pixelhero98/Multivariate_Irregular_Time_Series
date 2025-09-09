@@ -1,4 +1,3 @@
-
 import torch, math
 import torch.nn as nn
 import torch.nn.functional as F
@@ -159,7 +158,6 @@ class VAE2D(nn.Module):
         B, N, H, D = x.shape
         tokens, grid, orig = self.patch(x)                        # [B,T,P], (N',H')
         pos = self.pos2d(grid, tokens.device)                     # [T, d_model]
-        # (simple: let encoder learn to mix pos by projection)
         # coverage/padding
         coverage, key_pad = self._coverage_from_mask(mask, grid) if mask is not None else (None, None)
         enc = self.encoder(tokens, key_padding_mask=key_pad)      # [B,T,d_model]
