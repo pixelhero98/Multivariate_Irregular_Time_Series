@@ -42,6 +42,7 @@ VAE_CKPT = crypto_config.VAE_CKPT
 vae = LatentVAE(
     input_dim=1, seq_len=crypto_config.PRED,
     latent_dim=crypto_config.VAE_LATENT_DIM,
+    latent_channel=crypto_config.VAE_LATENT_CHANNELS,
     enc_layers=crypto_config.VAE_LAYERS, enc_heads=crypto_config.VAE_HEADS, enc_ff=crypto_config.VAE_FF,
     dec_layers=crypto_config.VAE_LAYERS, dec_heads=crypto_config.VAE_HEADS, dec_ff=crypto_config.VAE_FF
 ).to(device)
@@ -63,7 +64,7 @@ mu_mean, mu_std = compute_latent_stats(
 
 # ---- Conditional diffusion model ----
 diff_model = LLapDiT(
-    data_dim=crypto_config.VAE_LATENT_DIM, hidden_dim=crypto_config.MODEL_WIDTH,
+    data_dim=crypto_config.VAE_LATENT_CHANNELS, hidden_dim=crypto_config.MODEL_WIDTH,
     num_layers=crypto_config.NUM_LAYERS, num_heads=crypto_config.NUM_HEADS,
     predict_type=crypto_config.PREDICT_TYPE, laplace_k=crypto_config.LAPLACE_K, global_k=crypto_config.GLOBAL_K,
     timesteps=crypto_config.TIMESTEPS, schedule=crypto_config.SCHEDULE,
@@ -95,7 +96,8 @@ optimizer = torch.optim.AdamW(diff_model.parameters(),
 total_steps = crypto_config.EPOCHS * max(1, len(train_dl))
 lr_sched = make_warmup_cosine(optimizer, total_steps,
                               warmup_frac=crypto_config.WARMUP_FRAC,
-                              base_lr=crypto_config.BASE_LR)
+                              base_lr=crypto_config.BASE_LR,
+                              min_lr=crypto_config.MIN_LR)
 scaler = GradScaler(enabled=(device.type == "cuda"))
 
 
@@ -237,16 +239,16 @@ def validate():
 
 
 # ============================ run ============================
-skip_with_trained_model = "PATH_TO_YOUR_BEST_MODEL.pt" 
+skip_with_trained_model = "./ldt/checkpoints/epoch_292_val_0.195497_cond_0.05251141956874302.pt"
 
 if skip_with_trained_model and os.path.exists(skip_with_trained_model):
     print(f"Skipping training. Loading model from: {skip_with_trained_model}")
     ckpt = torch.load(skip_with_trained_model, map_location=device)
-    
+
     # Load model weights
     diff_model.load_state_dict(ckpt["model_state"])
     print("Loaded model state.")
-    
+
     # Load EMA weights if they exist in the checkpoint and are enabled
     if ema is not None and "ema_state" in ckpt:
         ema.load_state_dict(ckpt["ema_state"])
@@ -255,34 +257,34 @@ if skip_with_trained_model and os.path.exists(skip_with_trained_model):
     # Load stats needed for downstream tasks
     mu_mean = ckpt["mu_mean"].to(device)
     mu_std = ckpt["mu_std"].to(device)
-    
+
 else:
     # --- TRAINING LOOP ---
     if skip_with_trained_model:
-         print(f"Model path not found: {skip_with_trained_model}. Starting training from scratch.")
-      
+        print(f"Model path not found: {skip_with_trained_model}. Starting training from scratch.")
+
     best_val = float("inf")
     patience = 0
     current_best_path = None
     os.makedirs(crypto_config.CKPT_DIR, exist_ok=True)
-  
+
     for epoch in tqdm(range(1, crypto_config.EPOCHS + 1), desc="Epochs"):
         train_loss = train_one_epoch(epoch)
         val_loss, cond_gap = validate()
-        Z = crypto_config.VAE_LATENT_DIM
+        Z = crypto_config.VAE_LATENT_CHANNELS
         print(f"Epoch {epoch:03d} | train: {train_loss:.6f} (/Z: {train_loss / Z:.6f}) "
               f"| val: {val_loss:.6f} (/Z: {val_loss / Z:.6f}) | cond_gap: {cond_gap:.6f}")
-    
+
         # checkpoint best (with EMA state)
         if val_loss < best_val:
             best_val = val_loss;
             patience = 0
             if current_best_path and os.path.exists(current_best_path):
                 os.remove(current_best_path)
-    
+
             ckpt_path = os.path.join(
                 crypto_config.CKPT_DIR,
-                f"best_latdiff_epoch_{epoch:03d}_val_{val_loss / Z:.6f}.pt"
+                f"epoch_{epoch:03d}_val_{val_loss / Z:.6f}_cond_{cond_gap}.pt"
             )
             save_payload = {
                 "epoch": epoch,
@@ -337,16 +339,16 @@ def finetune_vae_decoder(
         *,
         mu_mean,
         mu_std,
-        config, # Pass config object for parameters
+        config,  # Pass config object for parameters
         ema=None,
         epochs: int = 3,
         lr: float = 1e-4,
-        weight_decay: float = 1e-6,
+        weight_decay: float = 1e-5,
         gen_steps: int = 36,
         guidance_strength: float = 2.0,
         guidance_power: float = 0.3,
         lambda_rec_anchor: float = 0.25,
-        use_gt_window_scale: bool = True,
+        use_gt_window_scale: False
 ):
     """
     Fine-tune ONLY the VAE decoder to adapt to the diffusion model's generated latent x0_norm.
@@ -392,7 +394,8 @@ def finetune_vae_decoder(
                     guidance_strength=guidance_strength, guidance_power=guidance_power,
                     cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
                 )
-            # ---- Forward decoder on generated latents ----
+
+                # ---- Forward decoder on generated latents ----
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 s = get_window_scale(vae, y_true, config) if use_gt_window_scale else None
                 y_hat_gen = decode_latents_with_vae(
@@ -435,10 +438,25 @@ def finetune_vae_decoder(
 
 @torch.no_grad()
 def evaluate_regression(diff_model, vae, dataloader, device, mu_mean, mu_std, config, ema=None,
-                        steps: int = 36, guidance_strength: float = 2.0, guidance_power: float = 0.3):
+                        steps: int = 36, guidance_strength: float = 2.0, guidance_power: float = 0.3,
+                        aggregation_method: str = 'mean'):  # MODIFICATION 1: New parameter
+    """
+    Evaluates the model by generating multiple samples and creating a probabilistic forecast.
+
+    Args:
+        ...
+        aggregation_method (str): Method to create a point forecast from samples. 
+                                  Options: 'mean', 'median'.
+    """
     diff_model.eval()
-    mse_sum, mae_sum, n = 0.0, 0.0, 0
-    num_samples = getattr(config, "NUM_EVAL_SAMPLES", 1) # Get sample count from config
+    mse_sum, mae_sum, crps_sum, n = 0.0, 0.0, 0.0, 0
+    num_samples = config.NUM_EVAL_SAMPLES
+
+    if aggregation_method not in ['mean', 'median']:
+        raise ValueError("aggregation_method must be either 'mean' or 'median'")
+
+    if num_samples <= 1 and aggregation_method == 'median':
+        print("Warning: Median aggregation is more meaningful with num_samples > 1.")
 
     use_ema = (ema is not None)
     if use_ema:
@@ -453,42 +471,60 @@ def evaluate_regression(diff_model, vae, dataloader, device, mu_mean, mu_std, co
         if y_in is None: continue
         cs = cond_summary[batch_ids]
 
-        Beff, Hcur, Z = y_in.size(0), y_in.size(1), config.VAE_LATENT_DIM
+        Beff, Hcur, Z = y_in.size(0), y_in.size(1), config.VAE_LATENT_CHANNELS
 
         # ---- Generate multiple samples ----
         all_y_hats = []
         for _ in range(num_samples):
-            # ---- Conditional generation in latent space ----
             x0_norm = diff_model.generate(
                 shape=(Beff, Hcur, Z), steps=steps,
                 guidance_strength=guidance_strength, guidance_power=guidance_power,
                 cond_summary=cs, self_cond=config.SELF_COND, cfg_rescale=True,
             )
-
-            # ---- Invert normalization and decode ----
-            s = None
-            if getattr(config, "DECODE_USE_GT_SCALE", True):
-                s = get_window_scale(vae, y_in, config)
-
+            s = get_window_scale(vae, y_in, config) if config.DECODE_USE_GT_SCALE else None
             y_hat_sample = decode_latents_with_vae(
                 vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std, window_scale=s
             )
             all_y_hats.append(y_hat_sample)
 
-        # ---- Aggregate the samples ----
-        # Stack all samples along a new dimension and take the mean
-        y_hat_ensemble = torch.stack(all_y_hats, dim=0).mean(dim=0)
+        # MODIFICATION 2: Stack all samples and then aggregate
+        all_samples = torch.stack(all_y_hats, dim=0)  # Shape: [num_samples, Beff, Hcur, 1]
+
+        # ---- Aggregate the samples to get a point forecast ----
+        if aggregation_method == 'mean':
+            point_forecast = all_samples.mean(dim=0)
+        elif aggregation_method == 'median':
+            point_forecast = all_samples.median(dim=0).values
 
         # ---- Metrics ----
-        res = y_hat_ensemble - y_in # Use the ensemble prediction for metrics
+        # 1. MAE and MSE of the point forecast
+        res = point_forecast - y_in
         mae_sum += res.abs().mean().item() * Beff
         mse_sum += (res ** 2).mean().item() * Beff
+
+        # MODIFICATION 3: Calculate CRPS for the full distribution
+        # CRPS = E[|X - y|] - 0.5 * E[|X - X'|]
+        term1 = (all_samples - y_in.unsqueeze(0)).abs().mean(dim=0)
+
+        # For the second term, we shuffle along the sample dimension to create X'
+        shuffled_samples = all_samples[torch.randperm(all_samples.shape[0])]
+        term2 = (all_samples - shuffled_samples).abs().mean(dim=0)
+
+        batch_crps = (term1 - 0.5 * term2).mean().item()
+        crps_sum += batch_crps * Beff
+
         n += Beff
 
     if use_ema:
         ema.restore(diff_model)
 
-    print(f"[test ({num_samples} samples)] MAE: {mae_sum / max(1, n):.6f} | MSE: {mse_sum / max(1, n):.6f}")
+    # MODIFICATION 4: Update print statement
+    mae = mae_sum / max(1, n)
+    mse = mse_sum / max(1, n)
+    crps = crps_sum / max(1, n)
+
+    print(f"[test ({num_samples} samples, aggregation: {aggregation_method})]")
+    print(f"  CRPS: {crps:.6f} | MAE: {mae:.6f} | MSE: {mse:.6f}")
 
 
 # ---------- Run decoder FT + test regression once training stops ----------
@@ -514,8 +550,9 @@ if True:
     # Evaluate conditional regression on test set
     evaluate_regression(
         diff_model, vae, test_dl, device, mu_mean, mu_std,
-        config=crypto_config, # Pass config object
+        config=crypto_config,  # Pass config object
         steps=crypto_config.GEN_STEPS,
         guidance_strength=crypto_config.GUIDANCE_STRENGTH,
-        guidance_power=crypto_config.GUIDANCE_POWER
+        guidance_power=crypto_config.GUIDANCE_POWER,
+        aggregation_method='median'
     )
