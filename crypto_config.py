@@ -1,9 +1,7 @@
-import json
 
 # ============================ Data & Preprocessing ============================
-DATA_DIR = "./ldt/LLapDiT_Data/Crypto_100/crypto_data"
-with open(f"{DATA_DIR}/cache_ratio_index/meta.json", "r") as f:
-    assets = json.load(f)["assets"]
+DATA_DIR = "./ldt/LLapDiT_Data/CRYPTO_130_data"
+
 
 # --- Data Parameters ---
 WINDOW = 200           # Input sequence length (K)
@@ -19,18 +17,26 @@ test_ratio=0.2
 
 # ============================ VAE (Encoder/Decoder) ============================
 VAE_DIR = './ldt/saved_model'
-VAE_CKPT = "./ldt/saved_model/16_0.00124_2.16059_best_recon.pt"
+VAE_CKPT = "./ldt/saved_model/PRED|HDIM_20|24_recon.pt"
 
 # --- VAE Architecture ---
-VAE_LATENT_DIM = 16
+VAE_PATCH_N = 1
+VAE_PATCH_H = 5
+VAE_LATENT_CHANNELS = 24
+VAE_LATENT_DIM = 64
 VAE_LAYERS = 3
 VAE_HEADS = 4
 VAE_FF = 256
-
+VAE_DROPOUT = 0.0
 # --- VAE Fine-Tuning (Optional, after diffusion training) ---
 # Set DECODER_FT_EPOCHS = 0 to disable this step.
-DECODER_FT_EPOCHS = 10
-DECODER_FT_LR = 1e-4
+VAE_LEARNING_RATE = 2e-4
+VAE_WEIGHT_DECAY = 5e-4
+VAE_WARMUP_EPOCHS = 8
+VAE_BETA = 0.8
+VAE_MAX_PATIENCE = 10
+DECODER_FT_EPOCHS = 20
+DECODER_FT_LR = 2e-4
 
 # ============================ Diffusion Model (LLapDiT) ============================
 CKPT_DIR = "./ldt/checkpoints"
@@ -45,24 +51,25 @@ PREDICT_TYPE  = "v"          # ["v", "eps"]
 # 'weighted_min_snr' is highly recommended. Set to 'none' to disable.
 LOSS_WEIGHT_SCHEME = 'weighted_min_snr'
 # The gamma parameter for min-SNR weighting. A value of 5.0 is a common starting point.
-MINSNR_GAMMA = 5.0
+MINSNR_GAMMA = 3.0
 
 # --- LLapDiT Architecture ---
 MODEL_WIDTH   = 256
 NUM_LAYERS    = 5
 NUM_HEADS     = 4
-CONTEXT_LEN   = 2 * PRED      # Learned summary tokens
+CONTEXT_LEN   = 2 * PRED  if PRED <= 100 else 200    # Learned summary tokens
 LAPLACE_K     = 64
 GLOBAL_K      = 128
 LAP_MODE      = 'parallel'    # or 'recurrent'
 
 # ============================ Training Hyperparameters ============================
 EPOCHS = 1500
-BASE_LR = 8e-4
-WARMUP_FRAC = 0.055
+BASE_LR = 6e-4
+MIN_LR = 1e-5
+WARMUP_FRAC = 0.06
 WEIGHT_DECAY = 5e-4
 GRAD_CLIP = 1.0
-EARLY_STOP = 100
+EARLY_STOP = 80
 
 # --- Regularization & Conditioning ---
 DROPOUT       = 0.0
@@ -85,10 +92,10 @@ EWMA_LAMBDA   = 0.99
 # Use Exponential Moving Average of model weights for evaluation.
 USE_EMA_EVAL = True
 EMA_DECAY    = 0.999
-DECODE_USE_GT_SCALE = True
+DECODE_USE_GT_SCALE = False
 # --- Generation Parameters ---
 GEN_STEPS = 100
-NUM_EVAL_SAMPLES = 25
+NUM_EVAL_SAMPLES = 10
 GUIDANCE_STRENGTH = 2.0
 GUIDANCE_POWER = 0.3
-DECODER_FT_ANCHOR = 0.25
+DECODER_FT_ANCHOR = 0.01 # 0.1
