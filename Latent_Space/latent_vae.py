@@ -7,7 +7,7 @@ class TransformerDecoderBlock(nn.Module):
     A decoder block with self-attention and optional cross-attention for skip connections.
     """
 
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, enc_dim: int, nhead: int, dim_feedforward: int, dropout: float = 0.1):
         super().__init__()
         # Standard PyTorch layers for self-attention and cross-attention
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
@@ -26,6 +26,7 @@ class TransformerDecoderBlock(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
+        self.skip_proj = nn.Linear(enc_dim, d_model)
 
     def forward(self, x, skip=None):
         x_norm = self.norm1(x)
@@ -34,6 +35,7 @@ class TransformerDecoderBlock(nn.Module):
 
         # 2. Conditionally perform Cross-Attention if a skip connection is provided
         if skip is not None:
+            skip = self.skip_proj(skip)
             x = x + self.dropout(self.cross_attn(self.norm2(x), skip, skip)[0])
 
         # 3. Feed-Forward Network (with pre-norm and residual connection)
@@ -69,12 +71,12 @@ class TransformerEncoder(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, latent_dim, seq_len, num_layers=2, num_heads=4, ff_dim=256,
+    def __init__(self, latent_dim, enc_dim, seq_len, num_layers=2, num_heads=4, ff_dim=256,
                  input_dim=None, dropout=0.1):
         super().__init__()
         self.pos_emb = nn.Parameter(torch.randn(1, seq_len, latent_dim))
         self.layers = nn.ModuleList([
-            TransformerDecoderBlock(latent_dim, num_heads, ff_dim, dropout=dropout)
+            TransformerDecoderBlock(latent_dim, enc_dim, num_heads, ff_dim, dropout=dropout)
             for _ in range(num_layers)
         ])
         self.out_proj = nn.Linear(latent_dim, input_dim)
@@ -96,7 +98,7 @@ class TransformerDecoder(nn.Module):
 
 
 class LatentVAE(nn.Module):
-    def __init__(self, input_dim, seq_len, latent_dim,
+    def __init__(self, input_dim, seq_len, latent_dim, latent_channel,
                  enc_layers=2, enc_heads=4, enc_ff=256,
                  dec_layers=2, dec_heads=4, dec_ff=256):
         super().__init__()
@@ -106,12 +108,12 @@ class LatentVAE(nn.Module):
             num_layers=enc_layers, num_heads=enc_heads, ff_dim=enc_ff
         )
         # VAE heads
-        self.mu_head     = nn.Linear(latent_dim, latent_dim)
-        self.logvar_head = nn.Linear(latent_dim, latent_dim)
+        self.mu_head     = nn.Linear(latent_dim, latent_channel)
+        self.logvar_head = nn.Linear(latent_dim, latent_channel)
 
         # decoder consumes sampled z + skips
         self.decoder = TransformerDecoder(
-            latent_dim, seq_len,
+            latent_channel, latent_dim, seq_len,
             num_layers=dec_layers, num_heads=dec_heads, ff_dim=dec_ff,
             input_dim=input_dim
         )
@@ -134,5 +136,3 @@ class LatentVAE(nn.Module):
         # decode with skips (use encoder_hidden_states)
         x_hat = self.decoder(z_sample, encoder_skips=encoder_hidden_states)
         return x_hat, mu, logvar
-
-
