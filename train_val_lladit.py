@@ -437,94 +437,152 @@ def finetune_vae_decoder(
 
 
 @torch.no_grad()
-def evaluate_regression(diff_model, vae, dataloader, device, mu_mean, mu_std, config, ema=None,
-                        steps: int = 36, guidance_strength: float = 2.0, guidance_power: float = 0.3,
-                        aggregation_method: str = 'mean'):  # MODIFICATION 1: New parameter
+def evaluate_regression(
+    diff_model, vae, dataloader, device, mu_mean, mu_std, config, ema=None,
+    steps: int = 36, guidance_strength: float = 2.0, guidance_power: float = 0.3,
+    aggregation_method: str = 'mean',
+    quantiles: tuple = (0.1, 0.5, 0.9),
+):
     """
     Evaluates the model by generating multiple samples and creating a probabilistic forecast.
 
+    Metrics:
+      - MAE / MSE on the aggregated point forecast (mean or median across samples) — exact per-element.
+      - CRPS via all-pairs estimator: CRPS = E[|X - y|] - 0.5 * E[|X - X'|].
+      - Pinball (quantile) loss for given quantiles:
+            L_q(y, ŷ_q) = mean( max(q*(y - ŷ_q), (q-1)*(y - ŷ_q)) )
+        where ŷ_q is the sample quantile of the predictive distribution at level q.
+
     Args:
-        ...
-        aggregation_method (str): Method to create a point forecast from samples. 
-                                  Options: 'mean', 'median'.
+        aggregation_method: 'mean' or 'median' for the point forecast.
+        quantiles: tuple of quantile levels in (0,1), e.g., (0.1, 0.5, 0.9).
+
+    Returns:
+        dict with keys:
+            crps, mae, mse, num_samples, aggregation, pinball (dict {q: loss})
     """
-    diff_model.eval()
-    mse_sum, mae_sum, crps_sum, n = 0.0, 0.0, 0.0, 0
-    num_samples = config.NUM_EVAL_SAMPLES
+    import torch
 
     if aggregation_method not in ['mean', 'median']:
         raise ValueError("aggregation_method must be either 'mean' or 'median'")
+    if not all(0.0 < float(q) < 1.0 for q in quantiles):
+        raise ValueError("All quantiles must be in the open interval (0, 1).")
 
+    diff_model.eval()
+
+    # Exact element-wise accumulators for deterministic metrics
+    abs_sum, sq_sum, elts = 0.0, 0.0, 0
+    # Batch-weighted CRPS accumulator (matches your previous semantics)
+    crps_sum, n = 0.0, 0
+    # Element-wise accumulators for pinball losses per quantile
+    pinball_sums = {float(q): 0.0 for q in quantiles}
+
+    num_samples = int(getattr(config, "NUM_EVAL_SAMPLES", 1))
     if num_samples <= 1 and aggregation_method == 'median':
         print("Warning: Median aggregation is more meaningful with num_samples > 1.")
 
+    # Use EMA weights if provided
     use_ema = (ema is not None)
     if use_ema:
         ema.store(diff_model)
         ema.copy_to(diff_model)
 
+    warned_no_gt_scale = False  # one-time notice if config asks for GT-scale
+
     for xb, yb, meta in dataloader:
         V, T = xb
         mask_bn = meta["entity_mask"]
+
         cond_summary = build_context(diff_model, V, T, mask_bn, device)
         y_in, batch_ids = _flatten_for_mask(yb, mask_bn, device)
-        if y_in is None: continue
+        if y_in is None:
+            continue
         cs = cond_summary[batch_ids]
 
         Beff, Hcur, Z = y_in.size(0), y_in.size(1), config.VAE_LATENT_CHANNELS
 
-        # ---- Generate multiple samples ----
+        # ---- Generate multiple samples in latent space and decode (no GT-scale at eval) ----
         all_y_hats = []
         for _ in range(num_samples):
             x0_norm = diff_model.generate(
                 shape=(Beff, Hcur, Z), steps=steps,
                 guidance_strength=guidance_strength, guidance_power=guidance_power,
-                cond_summary=cs, self_cond=config.SELF_COND, cfg_rescale=True,
+                cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
             )
-            s = get_window_scale(vae, y_in, config) if config.DECODE_USE_GT_SCALE else None
+
+            if getattr(config, "DECODE_USE_GT_SCALE", False) and not warned_no_gt_scale:
+                print("Warning: DECODE_USE_GT_SCALE is True in config, but disabled during evaluation to avoid leakage.")
+                warned_no_gt_scale = True
+
             y_hat_sample = decode_latents_with_vae(
-                vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std, window_scale=s
+                vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std, window_scale=None
             )
             all_y_hats.append(y_hat_sample)
 
-        # MODIFICATION 2: Stack all samples and then aggregate
-        all_samples = torch.stack(all_y_hats, dim=0)  # Shape: [num_samples, Beff, Hcur, 1]
+        # Stack samples: [S, B, H, C]
+        all_samples = torch.stack(all_y_hats, dim=0)
 
-        # ---- Aggregate the samples to get a point forecast ----
+        # ---- Point forecast via aggregation ----
         if aggregation_method == 'mean':
             point_forecast = all_samples.mean(dim=0)
-        elif aggregation_method == 'median':
+        else:  # 'median'
             point_forecast = all_samples.median(dim=0).values
 
-        # ---- Metrics ----
-        # 1. MAE and MSE of the point forecast
+        # ---- Deterministic metrics (exact) ----
         res = point_forecast - y_in
-        mae_sum += res.abs().mean().item() * Beff
-        mse_sum += (res ** 2).mean().item() * Beff
+        abs_sum += res.abs().sum().item()
+        sq_sum  += (res ** 2).sum().item()
+        elts    += res.numel()
 
-        # MODIFICATION 3: Calculate CRPS for the full distribution
+        # ---- CRPS using all-pairs estimator ----
         # CRPS = E[|X - y|] - 0.5 * E[|X - X'|]
-        term1 = (all_samples - y_in.unsqueeze(0)).abs().mean(dim=0)
+        M = all_samples.shape[0]
+        term1 = (all_samples - y_in.unsqueeze(0)).abs().mean(dim=0)  # [B,H,C]
 
-        # For the second term, we shuffle along the sample dimension to create X'
-        shuffled_samples = all_samples[torch.randperm(all_samples.shape[0])]
-        term2 = (all_samples - shuffled_samples).abs().mean(dim=0)
+        if M <= 1:
+            term2 = torch.zeros_like(term1)
+        else:
+            diffs = (all_samples.unsqueeze(0) - all_samples.unsqueeze(1)).abs()  # [M,M,B,H,C]
+            iu = torch.triu_indices(M, M, offset=1, device=diffs.device)
+            diffs_ij = diffs[iu[0], iu[1], ...]                                   # [M*(M-1)/2,B,H,C]
+            term2 = (2.0 / (M * (M - 1))) * diffs_ij.mean(dim=0)                  # [B,H,C]
 
         batch_crps = (term1 - 0.5 * term2).mean().item()
         crps_sum += batch_crps * Beff
-
         n += Beff
+
+        # ---- Pinball (quantile) loss ----
+        # Compute predictive quantiles from the sample set, then apply quantile loss vs y_in.
+        # y_q: [B,H,C] for each q
+        for q in quantiles:
+            q = float(q)
+            y_q = torch.quantile(all_samples, q, dim=0, interpolation="linear")   # [B,H,C]
+            diff = y_in - y_q                                                     # note: y - ŷ_q
+            # pinball per element
+            loss_q = torch.maximum(q * diff, (q - 1.0) * diff)                    # [B,H,C]
+            pinball_sums[q] += loss_q.sum().item()
 
     if use_ema:
         ema.restore(diff_model)
 
-    # MODIFICATION 4: Update print statement
-    mae = mae_sum / max(1, n)
-    mse = mse_sum / max(1, n)
+    mae = abs_sum / max(1, elts)
+    mse = sq_sum  / max(1, elts)
     crps = crps_sum / max(1, n)
+    pinball = {q: (pinball_sums[q] / max(1, elts)) for q in pinball_sums.keys()}
 
+    # Print a concise summary
+    qs_fmt = ", ".join(f"{q:.2f}:{pinball[q]:.6f}" for q in sorted(pinball.keys()))
     print(f"[test ({num_samples} samples, aggregation: {aggregation_method})]")
-    print(f"  CRPS: {crps:.6f} | MAE: {mae:.6f} | MSE: {mse:.6f}")
+    print(f"  CRPS: {crps:.6f} | MAE: {mae:.6f} | MSE: {mse:.6f} | Pinball[{qs_fmt}]")
+
+    return {
+        "crps": crps,
+        "mae": mae,
+        "mse": mse,
+        "pinball": pinball,
+        "num_samples": num_samples,
+        "aggregation": aggregation_method,
+    }
 
 
 # ---------- Run decoder FT + test regression once training stops ----------
@@ -554,5 +612,6 @@ if True:
         steps=crypto_config.GEN_STEPS,
         guidance_strength=crypto_config.GUIDANCE_STRENGTH,
         guidance_power=crypto_config.GUIDANCE_POWER,
-        aggregation_method='median'
+        aggregation_method='median',
+        quantiles=(0.1, 0.5, 0.9)
     )
