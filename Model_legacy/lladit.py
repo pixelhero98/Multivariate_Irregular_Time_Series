@@ -30,54 +30,88 @@ class LLapDiT(nn.Module):
         cond_summary = self._maybe_build_cond(series, cond_summary=cond_summary, entity_ids=entity_ids, ctx_dt=series_dt, ctx_diff=series_diff, entity_mask=series_mask)
         t_emb = self._time_embed(t).to(x_t.dtype)
         return self.model(x_t, t_emb, cond_summary=cond_summary, sc_feat=sc_feat)
+
     @torch.no_grad()
-    def generate(self, shape, steps: int = 36, guidance_strength=2.0, guidance_power: float = 0.3, eta: float = 0.0, *, series=None, series_mask=None, cond_summary=None, entity_ids=None, y_obs: torch.Tensor = None, obs_mask: torch.Tensor = None, dt: Optional[torch.Tensor] = None, series_dt: Optional[torch.Tensor] = None, series_diff: Optional[torch.Tensor] = None, cfg_rescale: bool = True, self_cond: bool = True,):
+    def generate(self, shape,
+                 steps: int = 36,
+                 guidance_strength=2.0,
+                 guidance_power: float = 0.3,
+                 eta: float = 0.0,
+                 *,
+                 series=None,
+                 series_mask=None,
+                 cond_summary=None,
+                 entity_ids=None,
+                 y_obs: torch.Tensor = None,
+                 obs_mask: torch.Tensor = None,
+                 dt: Optional[torch.Tensor] = None,
+                 series_dt: Optional[torch.Tensor] = None,
+                 series_diff: Optional[torch.Tensor] = None,
+                 cfg_rescale: bool = True,
+                 self_cond: bool = True):
         device = next(self.parameters()).device
         B, L, D = shape
+
         def _alpha_bar(t_b):
             return self.scheduler._gather(self.scheduler.alpha_bars, t_b).view(B, 1, 1)
+
         def _karras_step_indices(T: int, n: int, rho: float = 7.0):
             ab = self.scheduler.alpha_bars.to(device=device)
             sigma_all = torch.sqrt((1.0 - ab) / (ab + 1e-12))
             n = int(max(1, min(n, T)))
-            if n >= T: return torch.arange(T - 1, -1, -1, device=device, dtype=torch.long)
+            if n >= T:
+                return torch.arange(T - 1, -1, -1, device=device, dtype=torch.long)
             sigma_min = float(sigma_all[0].item()); sigma_max = float(sigma_all[-1].item())
             i = torch.linspace(0, 1, n, device=device)
             sigmas = (sigma_max ** (1 / rho) + i * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
             idxs = [int(torch.argmin(torch.abs(sigma_all - s))) for s in sigmas]
             return torch.tensor(sorted(set(idxs), reverse=True), device=device, dtype=torch.long)
+
         def _cfg(pred_u, pred_c, g_scalar, mask_scale=None):
             g = g_scalar
-            if mask_scale is not None: g = 1.0 + (g - 1.0) * mask_scale
+            if mask_scale is not None:
+                g = 1.0 + (g - 1.0) * mask_scale
             guided = pred_u + g * (pred_c - pred_u)
-            if not cfg_rescale: return guided
+            if not cfg_rescale:
+                return guided
             reduce_dims = (1, 2)
             mu_c = pred_c.mean(dim=reduce_dims, keepdim=True); std_c = pred_c.std(dim=reduce_dims, keepdim=True).clamp_min(1e-6)
             mu_g = guided.mean(dim=reduce_dims, keepdim=True); std_g = guided.std(dim=reduce_dims, keepdim=True).clamp_min(1e-6)
             return (guided - mu_g) / std_g * std_c + mu_c
+
         x_t = torch.randn(B, L, D, device=device)
         sc_feat_next = torch.zeros_like(x_t) if self_cond else None
+
         if (series is not None) and (cond_summary is None):
-            cond_summary = self.context(series, pad_mask=None, ctx_diff=series_diff, entity_mask=series_mask)[0]
+            cond_summary = self.context(series, pad_mask=None, dt=series_dt, entity_mask=series_mask)[0]
+
         T = int(self.scheduler.timesteps)
         step_indices = _karras_step_indices(T, int(steps))
         ts_prev = torch.cat([step_indices[1:], step_indices.new_tensor([-1])])
+
         obs = obs_mask if obs_mask is not None else None
         if obs is not None:
             obs = obs.to(device=device, dtype=x_t.dtype)
             obs_u = obs.unsqueeze(-1)
             tar_scale = (1.0 - obs).unsqueeze(-1)
         else:
-            obs_u = None; tar_scale = None
+            obs_u = None
+            tar_scale = None
+
         if (y_obs is not None) and (obs_u is not None):
             t0_b = step_indices[0].repeat(B)
             x_T_obs, _ = self.scheduler.q_sample(y_obs.to(device=device, dtype=x_t.dtype), t0_b)
             x_t = obs_u * x_T_obs + (1.0 - obs_u) * x_t
+
         last_x0 = None
         for t_i, t_prev_i in zip(step_indices, ts_prev):
             t_b = t_i.repeat(B)
-            pred_u = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None, sc_feat=sc_feat_next if self_cond else None, entity_ids=entity_ids)
-            pred_c = self.forward(x_t, t_b, series=series, series_mask=series_mask, cond_summary=cond_summary, sc_feat=sc_feat_next if self_cond else None, entity_ids=entity_ids, series_diff=series_diff)
+            pred_u = self.forward(x_t, t_b, series=None, series_mask=None, cond_summary=None,
+                                  sc_feat=sc_feat_next if self_cond else None,
+                                  entity_ids=entity_ids, dt=dt, series_dt=series_dt, series_diff=series_diff)
+            pred_c = self.forward(x_t, t_b, series=series, series_mask=series_mask, cond_summary=cond_summary,
+                                  sc_feat=sc_feat_next if self_cond else None,
+                                  entity_ids=entity_ids, dt=dt, series_dt=series_dt, series_diff=series_diff)
             ab = _alpha_bar(t_b)
             if isinstance(guidance_strength, (tuple, list)):
                 g_min, g_max = guidance_strength
@@ -85,22 +119,28 @@ class LLapDiT(nn.Module):
             else:
                 g_scalar = torch.as_tensor(float(guidance_strength), device=device).view(1, 1, 1)
             g_scalar = g_scalar.expand(B, 1, 1)
+
             pred = _cfg(pred_u, pred_c, g_scalar, mask_scale=tar_scale)
             x0_hat = self.scheduler.to_x0(x_t, t_b, pred, param_type=self.predict_type)
             last_x0 = x0_hat
-            if self_cond: sc_feat_next = x0_hat.detach()
+            if self_cond:
+                sc_feat_next = x0_hat.detach()
+
             if int(t_prev_i) >= 0:
                 tprev_b = t_prev_i.repeat(B)
                 x_t = self.scheduler.ddim_step_from(x_t, t_b, tprev_b, pred, param_type=self.predict_type, eta=eta)
             else:
                 x_t = x0_hat
+
             if (y_obs is not None) and (obs_u is not None):
                 if int(t_prev_i) >= 0:
+                    # Re-noise the known observations to the next timestep t_prev_i
                     t_inpaint = t_prev_i.repeat(B)
                     x_obs_t, _ = self.scheduler.q_sample(y_obs.to(device=device, dtype=x_t.dtype), t_inpaint)
                     x_t = obs_u * x_obs_t + (1.0 - obs_u) * x_t
                 else:
                     x_t = obs_u * y_obs.to(device=device, dtype=x_t.dtype) + (1.0 - obs_u) * x_t
+
         return last_x0 if last_x0 is not None else x_t
 
 # class LLapDiT(nn.Module):
