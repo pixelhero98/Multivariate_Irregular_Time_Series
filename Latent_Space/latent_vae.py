@@ -32,7 +32,7 @@ class TransformerDecoder(nn.Module):
 
 class LatentVAE(nn.Module):
     def __init__(self,
-                 input_dim: int,
+                 input_dim: int = 1,
                  d_model: int,
                  n_layers_enc: int,
                  n_layers_dec: int,
@@ -108,3 +108,4 @@ class LatentVAE(nn.Module):
         # Decode (with or without cross-attention to encoder skips)
         x_hat = self.decoder(z, encoder_skips=skips)            # [B, T, input_dim]
         return x_hat, mu, logvar
+
