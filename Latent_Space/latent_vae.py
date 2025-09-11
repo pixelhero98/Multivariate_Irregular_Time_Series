@@ -123,16 +123,20 @@ class LatentVAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def forward(self, x):
-        # encode
-        encoder_hidden_states = self.encoder(x)     # list of [B, T, D]
+    def forward(self, z, encoder_skips=None):
+    """
+    z:             [B, T, Z]   sampled latent (Z = d_model of this decoder)
+    encoder_skips: list of [B, T, D] from encoder (deepest → shallowest);
+                   each skip is projected enc_dim(D) → d_model(Z) before cross-attn.
+    """
+        encoder_hidden_states = self.encoder(z)     # list of [B, T, D]
         z_last = encoder_hidden_states[-1]          # [B, T, D]
     
         # VAE bottleneck
-        mu     = self.mu_head(z_last)               # [B, T, D]
-        logvar = self.logvar_head(z_last).clamp(min=-10.0, max=10.0)         # [B, T, D]
-        z_sample = self.reparameterize(mu, logvar)  # [B, T, D]
-    
+        mu     = self.mu_head(z_last)               # [B, T, Z]  (Z = latent_channel)
+        logvar = self.logvar_head(z_last).clamp(min=-10.0, max=10.0)  # [B, T, Z]
+        z_sample = self.reparameterize(mu, logvar)  # [B, T, Z]
+
         # decode with skips (use encoder_hidden_states)
         x_hat = self.decoder(z_sample, encoder_skips=encoder_hidden_states)
         return x_hat, mu, logvar
