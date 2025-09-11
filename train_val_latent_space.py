@@ -34,7 +34,6 @@ print(f"Using device: {device}")
 #       If you added `use_encoder_skips` to LatentVAE as discussed, this will work out-of-the-box.
 #       You can make this a config flag (e.g., crypto_config.VAE_USE_ENCODER_SKIPS) if you like.
 model = LatentVAE(
-    input_dim=1,
     seq_len=crypto_config.PRED,                 # multi-y with horizon=PRED
     latent_dim=crypto_config.VAE_LATENT_DIM,
     latent_channel=crypto_config.VAE_LATENT_CHANNELS,
@@ -193,7 +192,6 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
 to_load = best_elbo_path or best_recon_path or os.path.join(model_dir, "last.pt")
 print(f"Loading checkpoint: {to_load}")
 vae = LatentVAE(
-    input_dim=1,
     seq_len=crypto_config.PRED,
     latent_dim=crypto_config.VAE_LATENT_DIM,
     latent_channel=crypto_config.VAE_LATENT_CHANNELS,
