@@ -4,17 +4,11 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-import math
-import torch
-import torch.nn as nn
-from typing import List, Optional, Tuple
-
-
 # ============================LLapDiT utils============================
 def set_torch():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    if device.type == "cuda":
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
     return device
 
@@ -138,7 +132,9 @@ class NoiseScheduler(nn.Module):
     def ddim_sigma(self, t, t_prev, eta: float):
         ab_t    = self._gather(self.alpha_bars, t)
         ab_prev = self._gather(self.alpha_bars, t_prev)
-        sigma = eta * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t)) * torch.sqrt(1.0 - ab_t / (ab_prev + 1e-12))
+        inner = (1.0 - ab_prev) / (1.0 - ab_t + 1e-12)
+        term  = 1.0 - ab_t / (ab_prev + 1e-12)
+        sigma = eta * torch.sqrt(inner.clamp_min(0.0)) * torch.sqrt(term.clamp_min(0.0))
         return sigma.view(-1)
 
     @torch.no_grad()
@@ -297,11 +293,12 @@ def compute_latent_stats(vae, dataloader, device, use_ewma: bool, ewma_lambda: f
         mu_w = (mu / s).clamp(-clip_val, clip_val)
         all_mu_w.append(mu_w.detach().cpu())
 
+    if not all_mu_w:
+    raise RuntimeError("compute_latent_stats: no valid sequences found (all masked?)")
     mu_cat = torch.cat(all_mu_w, dim=0)
     mu_mean = mu_cat.mean(dim=(0, 1)).to(device)
     mu_std  = mu_cat.std (dim=(0, 1), correction=0).clamp_min(1e-6).to(device)
     return mu_mean, mu_std
-
 
 
 @torch.no_grad()
@@ -371,7 +368,15 @@ def diffusion_loss(model, scheduler, x0_lat_norm: torch.Tensor, t: torch.Tensor,
         x_t, eps_true = reuse_xt_eps
 
     pred   = model(x_t, t, cond_summary=cond_summary, sc_feat=sc_feat)
-    target = eps_true if predict_type == "eps" else scheduler.v_from_eps(x_t, t, eps_true)
+                       
+    if   predict_type == "eps":
+        target = eps_true
+    elif predict_type == "v":
+        target = scheduler.v_from_eps(x_t, t, eps_true)
+    elif predict_type == "x0":
+        target = scheduler.to_x0(x_t, t, eps_true, param_type="eps")  # recover x0 from (x_t, eps)
+    else:
+        raise ValueError("predict_type must be one of: 'eps', 'v', 'x0'")
 
     err = (pred - target).pow(2)            # [B,H,Z]
     per_sample = err.mean(dim=1).sum(dim=1) # [B]
@@ -379,13 +384,14 @@ def diffusion_loss(model, scheduler, x0_lat_norm: torch.Tensor, t: torch.Tensor,
     if weight_scheme == 'none':
         return per_sample.mean()
     elif weight_scheme == 'weighted_min_snr':
-        abar = scheduler.alpha_bars[t]
-        snr  = abar / (1.0 - abar).clamp_min(1e-8)
-        gamma = minsnr_gamma
-        w = torch.minimum(snr, torch.as_tensor(gamma, device=snr.device, dtype=snr.dtype))
-        w = w / (snr + 1.0)
+        abar  = scheduler.alpha_bars[t]
+        snr   = abar / (1.0 - abar).clamp_min(1e-8)
+        gamma = float(minsnr_gamma)
+        w     = torch.minimum(snr, torch.as_tensor(gamma, device=snr.device, dtype=snr.dtype))
+        w     = w / (snr + 1.0)
         return (w.detach() * per_sample).mean()
-
+    else:
+        raise ValueError(f"Unknown weight_scheme: {weight_scheme!r}")
 
 
 @torch.no_grad()
