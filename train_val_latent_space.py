@@ -6,7 +6,7 @@ import torch
 import crypto_config
 from Dataset.fin_dataset import run_experiment
 
-
+# -------------------- Data --------------------
 train_dl, val_dl, test_dl, sizes = run_experiment(
     data_dir=crypto_config.DATA_DIR,
     date_batching=crypto_config.date_batching,
@@ -25,15 +25,22 @@ print("sizes:", sizes)
 print("V:", V.shape, "T:", T.shape, "y:", yb.shape)  # -> [B,N,K,F], [B,N,K,F], [B,N,H]
 print("min coverage:", float(M.float().mean(1).min().item()))
 print("frac padded:", float((~M).float().mean().item()))
+
 # -------------------- Model --------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
+
+# NOTE: expose ability to disable encoder skip connections (default False).
+#       If you added `use_encoder_skips` to LatentVAE as discussed, this will work out-of-the-box.
+#       You can make this a config flag (e.g., crypto_config.VAE_USE_ENCODER_SKIPS) if you like.
 model = LatentVAE(
-    input_dim=1, seq_len=crypto_config.PRED,  # multi-y with horizon=PRED
+    input_dim=1,
+    seq_len=crypto_config.PRED,                 # multi-y with horizon=PRED
     latent_dim=crypto_config.VAE_LATENT_DIM,
     latent_channel=crypto_config.VAE_LATENT_CHANNELS,
     enc_layers=crypto_config.VAE_LAYERS, enc_heads=crypto_config.VAE_HEADS, enc_ff=crypto_config.VAE_FF,
-    dec_layers=crypto_config.VAE_LAYERS, dec_heads=crypto_config.VAE_HEADS, dec_ff=crypto_config.VAE_FF
+    dec_layers=crypto_config.VAE_LAYERS, dec_heads=crypto_config.VAE_HEADS, dec_ff=crypto_config.VAE_FF,
+    use_encoder_skips=False                     # NOTE: default False; set True to enable cross-attn skips
 ).to(device)
 
 # ---- optimizer (WD helps rein in KL a bit) ----
@@ -62,6 +69,7 @@ print("Starting training.")
 # -------------------- Train Loop --------------------
 for epoch in range(1, crypto_config.EPOCHS + 1):
     model.train()
+    # NOTE: this `beta` is the *actual* multiplier used this epoch (respects warmup)
     beta = 0.0 if epoch <= WARMUP_EPOCHS else VAE_BETA
 
     # running sums to report per-element means
@@ -82,6 +90,7 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
 
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            # NOTE: per-call override is also available (e.g., model(y_in, use_encoder_skips=True))
             y_hat, mu, logvar = model(y_in)
 
             # ------- per-element MEAN losses (train) -------
@@ -93,14 +102,15 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer);
+        scaler.step(optimizer)
         scaler.update()
 
         # accumulate for logging as sums (to compute means later)
-        num_recon_elems = y_in.numel()  # B_eff*H*1
-        num_kl_elems = mu.numel()  # B_eff*H*Z
+        num_recon_elems = y_in.numel()           # B_eff*H*1
+        num_kl_elems = mu.numel()                # B_eff*H*Z
         train_recon_sum += recon_loss.item() * num_recon_elems
-        train_kl_sum += kl_loss.item() * num_kl_elems / mu.size(-1)  # put KL on /elem basis of (B*H), not per-dim
+        # NOTE: KL/elem is averaged over (B*H); divide by Z to align denominator with recon
+        train_kl_sum += kl_loss.item() * num_kl_elems / mu.size(-1)
         train_elems += num_recon_elems
 
     # -------------------- Validation --------------------
@@ -138,11 +148,11 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
     per_elem_val_kl = val_kl_sum / max(1, val_elems)
 
     # Report both classical (beta=1) and training (beta=β) objectives
-    beta = 0.0 if epoch <= WARMUP_EPOCHS else VAE_BETA
     val_elbo_unweighted = per_elem_val_recon + per_elem_val_kl
     train_elbo_unweighted = per_elem_train_recon + per_elem_train_kl
-    val_elbo_beta = per_elem_val_recon + VAE_BETA * per_elem_val_kl
-    train_elbo_beta = per_elem_train_recon + VAE_BETA * per_elem_train_kl
+    # NOTE: use the epoch's *actual* beta (warmup-aware) for β·ELBO
+    val_elbo_beta = per_elem_val_recon + beta * per_elem_val_kl
+    train_elbo_beta = per_elem_train_recon + beta * per_elem_train_kl
 
     print(
         f"Epoch {epoch}/{crypto_config.EPOCHS} - β={beta:.3f} | "
@@ -157,15 +167,22 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
 
     if improved_elbo:
         best_val_elbo = val_elbo_beta
-        best_elbo_path = os.path.join(model_dir, f"PRED|HDIM_{crypto_config.PRED}|{crypto_config.VAE_LATENT_CHANNELS}_elbo.pt")
+        best_elbo_path = os.path.join(
+            model_dir, f"PRED|HDIM_{crypto_config.PRED}|{crypto_config.VAE_LATENT_CHANNELS}_elbo.pt"
+        )
         torch.save(model.state_dict(), best_elbo_path)
         print("  -> Saved best β·ELBO")
 
     if improved_recon:
         best_val_recon = per_elem_val_recon
-        best_recon_path = os.path.join(model_dir, f"PRED|HDIM_{crypto_config.PRED}|{crypto_config.VAE_LATENT_CHANNELS}_recon.pt")
+        best_recon_path = os.path.join(
+            model_dir, f"PRED|HDIM_{crypto_config.PRED}|{crypto_config.VAE_LATENT_CHANNELS}_recon.pt"
+        )
         torch.save(model.state_dict(), best_recon_path)
         print("  -> Saved best Recon")
+
+    # NOTE: always save a rolling 'last.pt' to guarantee a valid fallback
+    torch.save(model.state_dict(), os.path.join(model_dir, "last.pt"))
 
     patience_counter = 0 if improved_elbo else (patience_counter + 1)
     if patience_counter >= MAX_PATIENCE:
@@ -176,11 +193,13 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
 to_load = best_elbo_path or best_recon_path or os.path.join(model_dir, "last.pt")
 print(f"Loading checkpoint: {to_load}")
 vae = LatentVAE(
-    input_dim=1, seq_len=crypto_config.PRED,
+    input_dim=1,
+    seq_len=crypto_config.PRED,
     latent_dim=crypto_config.VAE_LATENT_DIM,
     latent_channel=crypto_config.VAE_LATENT_CHANNELS,
     enc_layers=crypto_config.VAE_LAYERS, enc_heads=crypto_config.VAE_HEADS, enc_ff=crypto_config.VAE_FF,
-    dec_layers=crypto_config.VAE_LAYERS, dec_heads=crypto_config.VAE_HEADS, dec_ff=crypto_config.VAE_FF
+    dec_layers=crypto_config.VAE_LAYERS, dec_heads=crypto_config.VAE_HEADS, dec_ff=crypto_config.VAE_FF,
+    use_encoder_skips=False  # NOTE: keep consistent with training unless you *intend* to switch
 ).to(device)
 vae.load_state_dict(torch.load(to_load, map_location=device))
 vae.eval()
@@ -201,8 +220,10 @@ with torch.no_grad():
         if not m_flat.any():
             continue
         y_in = y_flat[m_flat].unsqueeze(-1)  # [B_eff, H, 1]
-        _, mu, _ = vae(y_in)  # mu: [B_eff, H, Z]
+        # NOTE: keep use_encoder_skips consistent with above for fair stats
+        _, mu, _ = vae(y_in)
         all_mu.append(mu.cpu())
+
 if all_mu:
     all_mu = torch.cat(all_mu, dim=0)  # [N_seq, H, Z]
     _normed, mu_d, std_d = normalize_and_check(all_mu, plot=True)
