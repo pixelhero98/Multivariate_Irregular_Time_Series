@@ -74,6 +74,18 @@ def evaluate_regression_raw(
 
         cond_summary = build_context(diff_model, V, T, mask_bn, device)
         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
+        # Build masked histories that align with y_in
+        B, N, K, F = T.shape
+        # Choose the same channel family as your target:
+        hist_src = T[..., 0]   # diffs; or use V[..., 0] if your target is on levels
+        t_flat  = hist_src.reshape(B * N, K)          # [B*N, K]
+        m_flat  = mask_bn.reshape(B * N)              # [B*N]
+        x_hist  = t_flat[m_flat].unsqueeze(-1).to(device)  # [Beff, K, 1]
+        
+        # Per-series scale from the last K steps (your K == crypto_config.WINDOW)
+        s_inf = ewma_std(x_hist[:, -crypto_config.WINDOW:, :],
+                         lam=crypto_config.EWMA_LAMBDA)      # [Beff, 1, 1]
+        
         if y_in is None:
             continue
         cs = cond_summary[batch_ids]
@@ -90,7 +102,7 @@ def evaluate_regression_raw(
                 cond_summary=cs, self_cond=config.SELF_COND, cfg_rescale=True
             )
             samples.append(y_hat)
-        all_samples = torch.stack(samples, dim=0)  # [S,B,H,C]
+        all_samples = torch.stack(samples, dim=0) * s_inf.unsqueeze(0)  # rescale to raw  # [S,B,H,C]
 
         # Point forecast
         if aggregation_method == "mean":
