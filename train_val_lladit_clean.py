@@ -102,82 +102,7 @@ scaler = GradScaler(enabled=(device.type == "cuda"))
 
 
 # ============================ train/val loops ============================
-# def train_one_epoch(epoch: int):
-#     diff_model.train()
-#     running_loss = 0.0;
-#     num_samples = 0
-#     global global_step
 
-#     for xb, yb, meta in train_dl:
-#         V, T = xb
-#         mask_bn = meta["entity_mask"]
-
-#         cond_summary = build_context(diff_model, V, T, mask_bn, device)
-#         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-#         if y_in is None:
-#             continue
-
-#         cond_summary_flat = cond_summary[batch_ids]  # [Beff,S,Hm]
-#         mu_norm = encode_mu_norm(
-#             vae, y_in,
-#             use_ewma=crypto_config.USE_EWMA,
-#             ewma_lambda=crypto_config.EWMA_LAMBDA,
-#             mu_mean=mu_mean, mu_std=mu_std
-#         )
-
-#         # classifier-free guidance dropout (whole-batch mask)
-#         use_cond = (torch.rand(()) >= crypto_config.DROP_COND_P)
-#         cs = cond_summary_flat if use_cond else None
-
-#         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
-#         # sample once, reuse for SC and loss
-#         noise = torch.randn_like(mu_norm)
-#         x_t, eps_true = scheduler.q_sample(mu_norm, t, noise)
-
-#         # ---- self-conditioning (optional) ----
-#         sc_feat = None
-#         if (epoch >= crypto_config.SELF_COND_START_EPOCH
-#                 and torch.rand(()) < crypto_config.SELF_COND_P) and crypto_config.SELF_COND:
-#             with torch.no_grad():
-#                 pred_ng = diff_model(x_t, t, cond_summary=cs, sc_feat=None)  # <— x_t (no grads)
-#                 sc_feat = scheduler.to_x0(x_t, t, pred_ng, crypto_config.PREDICT_TYPE).detach()
-
-#         optimizer.zero_grad(set_to_none=True)
-#         with autocast(enabled=(device.type == "cuda")):
-#             loss = diffusion_loss(
-#                 diff_model, scheduler, mu_norm, t,
-#                 cond_summary=cs, predict_type=crypto_config.PREDICT_TYPE,
-#                 weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
-#                 minsnr_gamma=crypto_config.MINSNR_GAMMA,
-#                 sc_feat=sc_feat,
-#                 reuse_xt_eps=(x_t, eps_true),
-#             )
-
-#         if not torch.isfinite(loss):
-#             print("[warn] non-finite loss detected; skipping step")
-#             optimizer.zero_grad(set_to_none=True)
-#             continue
-
-#         scaler.scale(loss).backward()
-#         scaler.unscale_(optimizer)
-#         if getattr(crypto_config, "GRAD_CLIP", 0.0) and crypto_config.GRAD_CLIP > 0:
-#             nn.utils.clip_grad_norm_(diff_model.parameters(), crypto_config.GRAD_CLIP)
-#         scaler.step(optimizer);
-#         scaler.update()
-#         if ema is not None:
-#             ema.update(diff_model)
-#         lr_sched.step()
-
-#         # global_step += 1
-#         # # light-weight pole health logging
-#         # if global_step % 500 == 0:
-#         #     log_pole_health([diff_model], lambda m, step: _print_log(m, step, csv_path=None),
-#         #                     step=global_step, tag_prefix="train/")
-
-#         running_loss += loss.item() * mu_norm.size(0)
-#         num_samples += mu_norm.size(0)
-
-#     return running_loss / max(1, num_samples)
 def train_one_epoch(epoch: int):
     diff_model.train()
     running_loss = 0.0
@@ -274,63 +199,6 @@ def train_one_epoch(epoch: int):
 
     return running_loss / max(1, num_samples)
 
-
-# @torch.no_grad()
-# def validate():
-#     diff_model.eval()
-#     total, count = 0.0, 0
-#     cond_gap_accum, cond_gap_batches = 0.0, 0
-
-#     if ema is not None:
-#         ema.store(diff_model)
-#         ema.copy_to(diff_model)
-#         # log_pole_health([diff_model], lambda m, step: _print_log(m, step, csv_path=None),
-#         #                 step=global_step, tag_prefix="val/")
-
-#     for xb, yb, meta in val_dl:
-#         V, T = xb
-#         mask_bn = meta["entity_mask"]
-
-#         cond_summary = build_context(diff_model, V, T, mask_bn, device)
-#         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-#         if y_in is None:
-#             continue
-#         cond_summary_flat = cond_summary[batch_ids]
-#         mu_norm = encode_mu_norm(
-#             vae, y_in,
-#             use_ewma=crypto_config.USE_EWMA,
-#             ewma_lambda=crypto_config.EWMA_LAMBDA,
-#             mu_mean=mu_mean, mu_std=mu_std
-#         )
-
-#         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
-#         loss = diffusion_loss(
-#             diff_model, scheduler, mu_norm, t,
-#             cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
-#         )
-#         total += loss.item() * mu_norm.size(0)
-#         count += mu_norm.size(0)
-
-#         # Conditional gap probe
-#         probe_n = min(128, mu_norm.size(0))
-#         if probe_n > 0:
-#             mu_p = mu_norm[:probe_n]
-#             cs_p = cond_summary_flat[:probe_n]
-#             t_p = sample_t_uniform(scheduler, probe_n, device)
-#             loss_cond = diffusion_loss(diff_model, scheduler, mu_p, t_p,
-#                                        cond_summary=cs_p, predict_type=crypto_config.PREDICT_TYPE).item()
-#             loss_unco = diffusion_loss(diff_model, scheduler, mu_p, t_p,
-#                                        cond_summary=None, predict_type=crypto_config.PREDICT_TYPE).item()
-#             cond_gap_accum += (loss_unco - loss_cond)
-#             cond_gap_batches += 1
-
-#     if ema is not None:
-#         ema.restore(diff_model)
-
-#     avg_val = total / max(1, count)
-#     cond_gap = (cond_gap_accum / cond_gap_batches) if cond_gap_batches > 0 else float("nan")
-
-#     return avg_val, cond_gap
 @torch.no_grad()
 def validate():
     diff_model.eval()
