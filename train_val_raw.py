@@ -85,9 +85,7 @@ def evaluate_regression_raw(
         # Per-series scale from the last K steps (your K == crypto_config.WINDOW)
         s_inf = ewma_std(x_hist[:, -crypto_config.WINDOW:, :],
                          lam=crypto_config.EWMA_LAMBDA)      # [Beff, 1, 1]
-        
-        if y_in is None:
-            continue
+     
         cs = cond_summary[batch_ids]
 
         B, Hcur, C = y_in.size()
