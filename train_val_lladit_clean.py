@@ -11,7 +11,8 @@ from Model.cond_diffusion_utils import (EMA, set_torch, encode_mu_norm,
                                         calculate_v_variance, compute_latent_stats,
                                         diffusion_loss, build_context,
                                         flatten_targets, sample_t_uniform,
-                                        decode_latents_with_vae
+                                        decode_latents_with_vae, _flatten_for_mask,
+                                        get_window_scale
                                         )
 
 # ============================ Training setup ============================
@@ -102,77 +103,6 @@ scaler = GradScaler(enabled=(device.type == "cuda"))
 
 
 # ============================ train/val loops ============================
-
-#     for xb, yb, meta in train_dl:
-#         V, T = xb
-#         mask_bn = meta["entity_mask"]
-
-#         cond_summary = build_context(diff_model, V, T, mask_bn, device)
-#         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-#         if y_in is None:
-#             continue
-
-#         cond_summary_flat = cond_summary[batch_ids]  # [Beff,S,Hm]
-#         mu_norm = encode_mu_norm(
-#             vae, y_in,
-#             use_ewma=crypto_config.USE_EWMA,
-#             ewma_lambda=crypto_config.EWMA_LAMBDA,
-#             mu_mean=mu_mean, mu_std=mu_std
-#         )
-
-#         # classifier-free guidance dropout (whole-batch mask)
-#         use_cond = (torch.rand(()) >= crypto_config.DROP_COND_P)
-#         cs = cond_summary_flat if use_cond else None
-
-#         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
-#         # sample once, reuse for SC and loss
-#         noise = torch.randn_like(mu_norm)
-#         x_t, eps_true = scheduler.q_sample(mu_norm, t, noise)
-
-#         # ---- self-conditioning (optional) ----
-#         sc_feat = None
-#         if (epoch >= crypto_config.SELF_COND_START_EPOCH
-#                 and torch.rand(()) < crypto_config.SELF_COND_P) and crypto_config.SELF_COND:
-#             with torch.no_grad():
-#                 pred_ng = diff_model(x_t, t, cond_summary=cs, sc_feat=None)  # <— x_t (no grads)
-#                 sc_feat = scheduler.to_x0(x_t, t, pred_ng, crypto_config.PREDICT_TYPE).detach()
-
-#         optimizer.zero_grad(set_to_none=True)
-#         with autocast(enabled=(device.type == "cuda")):
-#             loss = diffusion_loss(
-#                 diff_model, scheduler, mu_norm, t,
-#                 cond_summary=cs, predict_type=crypto_config.PREDICT_TYPE,
-#                 weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
-#                 minsnr_gamma=crypto_config.MINSNR_GAMMA,
-#                 sc_feat=sc_feat,
-#                 reuse_xt_eps=(x_t, eps_true),
-#             )
-
-#         if not torch.isfinite(loss):
-#             print("[warn] non-finite loss detected; skipping step")
-#             optimizer.zero_grad(set_to_none=True)
-#             continue
-
-#         scaler.scale(loss).backward()
-#         scaler.unscale_(optimizer)
-#         if getattr(crypto_config, "GRAD_CLIP", 0.0) and crypto_config.GRAD_CLIP > 0:
-#             nn.utils.clip_grad_norm_(diff_model.parameters(), crypto_config.GRAD_CLIP)
-#         scaler.step(optimizer);
-#         scaler.update()
-#         if ema is not None:
-#             ema.update(diff_model)
-#         lr_sched.step()
-
-#         # global_step += 1
-#         # # light-weight pole health logging
-#         # if global_step % 500 == 0:
-#         #     log_pole_health([diff_model], lambda m, step: _print_log(m, step, csv_path=None),
-#         #                     step=global_step, tag_prefix="train/")
-
-#         running_loss += loss.item() * mu_norm.size(0)
-#         num_samples += mu_norm.size(0)
-
-#     return running_loss / max(1, num_samples)
 def train_one_epoch(epoch: int):
     diff_model.train()
     running_loss = 0.0
@@ -270,58 +200,6 @@ def train_one_epoch(epoch: int):
     return running_loss / max(1, num_samples)
 
 
-# @torch.no_grad()
-
-#     if ema is not None:
-#         ema.store(diff_model)
-#         ema.copy_to(diff_model)
-#         # log_pole_health([diff_model], lambda m, step: _print_log(m, step, csv_path=None),
-#         #                 step=global_step, tag_prefix="val/")
-
-#     for xb, yb, meta in val_dl:
-#         V, T = xb
-#         mask_bn = meta["entity_mask"]
-
-#         cond_summary = build_context(diff_model, V, T, mask_bn, device)
-#         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-#         if y_in is None:
-#             continue
-#         cond_summary_flat = cond_summary[batch_ids]
-#         mu_norm = encode_mu_norm(
-#             vae, y_in,
-#             use_ewma=crypto_config.USE_EWMA,
-#             ewma_lambda=crypto_config.EWMA_LAMBDA,
-#             mu_mean=mu_mean, mu_std=mu_std
-#         )
-
-#         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
-#         loss = diffusion_loss(
-#             diff_model, scheduler, mu_norm, t,
-#             cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
-#         )
-#         total += loss.item() * mu_norm.size(0)
-#         count += mu_norm.size(0)
-
-#         # Conditional gap probe
-#         probe_n = min(128, mu_norm.size(0))
-#         if probe_n > 0:
-#             mu_p = mu_norm[:probe_n]
-#             cs_p = cond_summary_flat[:probe_n]
-#             t_p = sample_t_uniform(scheduler, probe_n, device)
-#             loss_cond = diffusion_loss(diff_model, scheduler, mu_p, t_p,
-#                                        cond_summary=cs_p, predict_type=crypto_config.PREDICT_TYPE).item()
-#             loss_unco = diffusion_loss(diff_model, scheduler, mu_p, t_p,
-#                                        cond_summary=None, predict_type=crypto_config.PREDICT_TYPE).item()
-#             cond_gap_accum += (loss_unco - loss_cond)
-#             cond_gap_batches += 1
-
-#     if ema is not None:
-#         ema.restore(diff_model)
-
-#     avg_val = total / max(1, count)
-#     cond_gap = (cond_gap_accum / cond_gap_batches) if cond_gap_batches > 0 else float("nan")
-
-#     return avg_val, cond_gap
 @torch.no_grad()
 def validate():
     diff_model.eval()
@@ -348,13 +226,11 @@ def validate():
             mu_mean=mu_mean, mu_std=mu_std
         )
 
-        # main validation loss (use same weighting/minSNR as train)
+        # main validation loss
         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
         loss = diffusion_loss(
             diff_model, scheduler, mu_norm, t,
-            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE,
-            weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
-            minsnr_gamma=crypto_config.MINSNR_GAMMA,
+            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
         )
         total += loss.item() * mu_norm.size(0)
         count += mu_norm.size(0)
@@ -371,17 +247,13 @@ def validate():
             loss_cond = diffusion_loss(
                 diff_model, scheduler, mu_p, t_p,
                 cond_summary=cs_p, predict_type=crypto_config.PREDICT_TYPE,
-                weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
-                minsnr_gamma=crypto_config.MINSNR_GAMMA,
-                reuse_xt_eps=(x_t_p, eps_p),
+                reuse_xt_eps=(x_t_p, eps_p)
             ).item()
 
             loss_unco = diffusion_loss(
                 diff_model, scheduler, mu_p, t_p,
                 cond_summary=None, predict_type=crypto_config.PREDICT_TYPE,
-                weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
-                minsnr_gamma=crypto_config.MINSNR_GAMMA,
-                reuse_xt_eps=(x_t_p, eps_p),
+                reuse_xt_eps=(x_t_p, eps_p)
             ).item()
 
             cond_gap_accum += (loss_unco - loss_cond)
@@ -395,7 +267,7 @@ def validate():
     return avg_val, cond_gap
 
 # ============================ run ============================
-skip_with_trained_model = "./ldt/checkpoints/epoch_292_val_0.195497_cond_0.05251141956874302.pt"
+skip_with_trained_model = "./ldt/checkpoints/epoch_138_val_0.188933_cond_0.025167269366128103.pt"
 
 if skip_with_trained_model and os.path.exists(skip_with_trained_model):
     print(f"Skipping training. Loading model from: {skip_with_trained_model}")
@@ -464,27 +336,7 @@ else:
                 print("Early stopping.")
                 break
 
-
 # ============================ Decoder finetune + regression eval ============================
-@torch.no_grad()
-def _flatten_for_mask(yb, mask_bn, device):
-    y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-    return y_in, batch_ids
-
-
-@torch.no_grad()
-def get_window_scale(vae, y_true, config):
-    """
-    Calculates the per-window standard deviation (scale) from the ground-truth target window.
-    This is a form of teacher forcing used during decoding.
-    """
-    _, mu_gt, _ = vae(y_true)  # Get latent of the true target window
-    if config.USE_EWMA:
-        s = ewma_std(mu_gt, lam=config.EWMA_LAMBDA)  # [Beff, 1, Z]
-    else:
-        s = mu_gt.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
-    return s
-
 
 def get_context_window_scale(vae, T, mask_bn, Hcur, device, config):
     """Estimate per-window scale for decoding using only *context* (no GT).
@@ -514,6 +366,7 @@ def get_context_window_scale(vae, T, mask_bn, Hcur, device, config):
         else:
             s_inf = mu_hist.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
     return s_inf
+
 
 def finetune_vae_decoder(
         vae,
@@ -799,6 +652,6 @@ if True:
         steps=crypto_config.GEN_STEPS,
         guidance_strength=crypto_config.GUIDANCE_STRENGTH,
         guidance_power=crypto_config.GUIDANCE_POWER,
-        aggregation_method='median',
+        aggregation_method='mean',
         quantiles=(0.1, 0.5, 0.9)
     )
