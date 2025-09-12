@@ -16,7 +16,7 @@ class MovingAvg(nn.Module):
         B, L, C = x.shape
         pad = (self.kernel_size - 1) // 2
         x_nc = x.permute(0, 2, 1)                          # [B,C,L]
-        x_pad = F.pad(x_nc, (pad, pad), mode="reflect")    # pad time
+        x_pad = F.pad(x_nc, (pad, pad), mode="replicate")    # pad time
         trend = F.avg_pool1d(x_pad, kernel_size=self.kernel_size, stride=1)
         return trend.permute(0, 2, 1)                      # [B,L,C]
 
