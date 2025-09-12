@@ -52,7 +52,8 @@ class ParallelLaplaceSummarizer(nn.Module):
 
         self.v_head = TVHead(feat_dim)
         self.t_head = TVHead(feat_dim)
-        self.lap = LearnableLaplacianBasis(k=lap_k, feat_dim=num_entities, mode="parallel")
+        self.lap_v = LearnableLaplacianBasis(k=lap_k, feat_dim=num_entities, mode="parallel")
+        self.lap_t = LearnableLaplacianBasis(k=lap_k, feat_dim=num_entities, mode="parallel")
 
         init_raw = math.log(math.e - 1.0)
         self.w_v_raw = nn.Parameter(torch.tensor(init_raw))
@@ -95,8 +96,8 @@ class ParallelLaplaceSummarizer(nn.Module):
             x_diff = x_diff * mN.unsqueeze(-1)
         T_sig = self.t_head(x_diff)  # [B,T,N]
 
-        L_v = self.lap(V_sig)  # [B,T,2K]
-        L_t = self.lap(T_sig)  # [B,T,2K]
+        L_v = self.lap_v(V_sig)  # [B,T,2K]
+        L_t = self.lap_t(T_sig)  # [B,T,2K]
         a = F.softplus(self.w_v_raw)
         b = F.softplus(self.w_t_raw)
         L = a * L_v + b * L_t
