@@ -16,7 +16,7 @@ def _canon_mode(mode: str) -> str:
 
 
 class TVHead(nn.Module):
-    def __init__(self, feat_dim: int, hidden: int = 32):
+    def __init__(self, feat_dim: int, hidden: int):
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(feat_dim),
@@ -35,6 +35,7 @@ class ParallelLaplaceSummarizer(nn.Module):
                  out_len: int,
                  num_heads: int = 4,
                  lap_k: int = 8,
+                 tv_dim: int = 32,
                  dropout: float = 0.0,
                  add_guidance_tokens: bool = True,
                  zero_first_step: bool = True,
@@ -50,8 +51,8 @@ class ParallelLaplaceSummarizer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_dim)
 
-        self.v_head = TVHead(feat_dim)
-        self.t_head = TVHead(feat_dim)
+        self.v_head = TVHead(feat_dim, tv_dim)
+        self.t_head = TVHead(feat_dim, tv_dim)
         self.lap_v = LearnableLaplacianBasis(k=lap_k, feat_dim=num_entities, mode="parallel")
         self.lap_t = LearnableLaplacianBasis(k=lap_k, feat_dim=num_entities, mode="parallel")
 
@@ -68,10 +69,10 @@ class ParallelLaplaceSummarizer(nn.Module):
 
     def forward(self,
                 x: torch.Tensor,                    # [B,T,N,D]
-                pad_mask: Optional[torch.Tensor] = None,  # [B,T] True=ignore
+                pad_mask: Optional[torch.Tensor] = None,  # [B,T] ignore, using entity mask
                 dt: torch.Tensor = None,            # accepted but ignored
                 ctx_diff: torch.Tensor = None,      # [B,T,N,D]
-                entity_mask: Optional[torch.Tensor] = None,
+                entity_mask: Optional[torch.Tensor] = None, # must pass
                 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         B, T, N, D = x.shape
         device = x.device
