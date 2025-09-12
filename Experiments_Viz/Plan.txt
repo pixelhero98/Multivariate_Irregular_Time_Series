@@ -43,4 +43,4 @@ TiDE — fast MLP sequence model; strong point-forecast efficiency baseline.
 
 TimeGrad (light) — diffusion forecaster; closest apples-to-apples to LLapDiT.
 
-CSDI (light) — diffusion tailored for missing/irregular coverage; great for calibration & imputation.
+ScoreGrad (light) — a score-based SDE diffusion forecaster (continuous-time) rather than a DDPM-style model like TimeGrad, a complementary diffusion approach.
