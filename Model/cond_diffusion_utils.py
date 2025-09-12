@@ -7,8 +7,8 @@ import torch.nn as nn
 # ============================LLapDiT utils============================
 def set_torch():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
     return device
 
@@ -19,11 +19,13 @@ def sample_t_uniform(scheduler, n: int, device: torch.device) -> torch.Tensor:
 
 def make_warmup_cosine(optimizer, total_steps, warmup_frac=0.05, base_lr=5e-4, min_lr=1e-6):
     warmup_steps = max(1, int(total_steps * warmup_frac))
+
     def lr_lambda(step):
         if step < warmup_steps:
             return (step + 1) / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return max(min_lr / max(base_lr, 1e-12), 0.5 * (1.0 + math.cos(math.pi * progress)))
+
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
@@ -37,12 +39,13 @@ class NoiseScheduler(nn.Module):
     Diffusion utilities with precomputed buffers and a DDIM sampler.
     Supports 'linear' or 'cosine' schedules and epsilon-/v-/x0-parameterization.
     """
+
     def __init__(
-        self,
-        timesteps: int = 1000,
-        schedule: str = "cosine",
-        beta_start: float = 1e-4,
-        beta_end: float = 2e-2,
+            self,
+            timesteps: int = 1000,
+            schedule: str = "cosine",
+            beta_start: float = 1e-4,
+            beta_end: float = 2e-2,
     ) -> None:
         super().__init__()
         self.timesteps = int(timesteps)
@@ -56,7 +59,7 @@ class NoiseScheduler(nn.Module):
             betas = betas.clamp(min=1e-8, max=0.999)
         else:
             # cosine ᾱ(t) from Nichol & Dhariwal; turn into alphas and then betas
-            ts   = torch.linspace(0, 1, self.timesteps + 1, dtype=torch.float32)
+            ts = torch.linspace(0, 1, self.timesteps + 1, dtype=torch.float32)
             abar = _cosine_alpha_bar(ts)
             abar = abar / abar[0]  # ᾱ(0) = 1
             alphas = torch.ones(self.timesteps, dtype=torch.float32)
@@ -86,70 +89,76 @@ class NoiseScheduler(nn.Module):
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None):
         if noise is None:
             noise = torch.randn_like(x0)
-        sqrt_ab   = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x0.dim()-1)))
-        sqrt_1_ab = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x0.dim()-1)))
+        sqrt_ab = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x0.dim() - 1)))
+        sqrt_1_ab = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x0.dim() - 1)))
         x_t = sqrt_ab * x0 + sqrt_1_ab * noise
         return x_t, noise
 
     def pred_x0_from_eps(self, x_t, t, eps):
-        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
-        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
+        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
+        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         return (x_t - sigma * eps) / (alpha + 1e-12)
 
     def pred_eps_from_x0(self, x_t, t, x0):
-        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
-        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
+        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
+        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         return (x_t - alpha * x0) / (sigma + 1e-12)
 
     def pred_x0_from_v(self, x_t, t, v):
-        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
-        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
+        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
+        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         return alpha * x_t - sigma * v
 
     def pred_eps_from_v(self, x_t, t, v):
-        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
-        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
+        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
+        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         return sigma * x_t + alpha * v
 
     def v_from_eps(self, x_t, t, eps):
-        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
-        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim()-1)))
+        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
+        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         return (eps - sigma * x_t) / (alpha + 1e-12)
 
     def to_x0(self, x_t, t, pred, param_type: str):
-        if     param_type == "eps": return self.pred_x0_from_eps(x_t, t, pred)
-        elif   param_type == "v":   return self.pred_x0_from_v  (x_t, t, pred)
-        elif   param_type == "x0":  return pred
-        else: raise ValueError("param_type must be 'eps', 'v', or 'x0'")
+        if param_type == "eps":
+            return self.pred_x0_from_eps(x_t, t, pred)
+        elif param_type == "v":
+            return self.pred_x0_from_v(x_t, t, pred)
+        elif param_type == "x0":
+            return pred
+        else:
+            raise ValueError("param_type must be 'eps', 'v', or 'x0'")
 
     def to_eps(self, x_t, t, pred, param_type: str):
-        if     param_type == "eps": return pred
-        elif   param_type == "v":   return self.pred_eps_from_v (x_t, t, pred)
-        elif   param_type == "x0":  return self.pred_eps_from_x0(x_t, t, pred)
-        else: raise ValueError("param_type must be 'eps', 'v', or 'x0'")
+        if param_type == "eps":
+            return pred
+        elif param_type == "v":
+            return self.pred_eps_from_v(x_t, t, pred)
+        elif param_type == "x0":
+            return self.pred_eps_from_x0(x_t, t, pred)
+        else:
+            raise ValueError("param_type must be 'eps', 'v', or 'x0'")
 
     @torch.no_grad()
     def ddim_sigma(self, t, t_prev, eta: float):
-        ab_t    = self._gather(self.alpha_bars, t)
+        ab_t = self._gather(self.alpha_bars, t)
         ab_prev = self._gather(self.alpha_bars, t_prev)
-        inner = (1.0 - ab_prev) / (1.0 - ab_t + 1e-12)
-        term  = 1.0 - ab_t / (ab_prev + 1e-12)
-        sigma = eta * torch.sqrt(inner.clamp_min(0.0)) * torch.sqrt(term.clamp_min(0.0))
+        sigma = eta * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t)) * torch.sqrt(1.0 - ab_t / (ab_prev + 1e-12))
         return sigma.view(-1)
 
     @torch.no_grad()
     def ddim_step_from(self, x_t, t, t_prev, pred, param_type: str, eta: float = 0.0, noise: torch.Tensor = None):
         if noise is None:
             noise = torch.randn_like(x_t)
-        ab_prev = self._gather(self.alpha_bars, t_prev).view(-1, *([1] * (x_t.dim()-1)))
-        sigma   = self.ddim_sigma(t, t_prev, eta).view(-1, *([1] * (x_t.dim()-1)))
+        ab_prev = self._gather(self.alpha_bars, t_prev).view(-1, *([1] * (x_t.dim() - 1)))
+        sigma = self.ddim_sigma(t, t_prev, eta).view(-1, *([1] * (x_t.dim() - 1)))
 
         x0_pred = self.to_x0(x_t, t, pred, param_type)
-        eps_pred= self.to_eps(x_t, t, pred, param_type)
+        eps_pred = self.to_eps(x_t, t, pred, param_type)
 
-        dir_coeff = torch.clamp((1.0 - ab_prev) - sigma**2, min=0.0)
+        dir_coeff = torch.clamp((1.0 - ab_prev) - sigma ** 2, min=0.0)
         dir_xt = torch.sqrt(dir_coeff) * eps_pred
-        x_prev  = torch.sqrt(ab_prev) * x0_pred + dir_xt + sigma * noise
+        x_prev = torch.sqrt(ab_prev) * x0_pred + dir_xt + sigma * noise
         return x_prev
 
 
@@ -168,7 +177,7 @@ def log_pole_health(modules: List[nn.Module], log_fn, step: int, tag_prefix: str
         for lap in iter_laplace_bases(mod):
             tau = torch.nn.functional.softplus(lap._tau) + 1e-3
             alpha = lap.s_real.clamp_min(lap.alpha_min) * tau  # [k]
-            omega = lap.s_imag * tau                            # [k]
+            omega = lap.s_imag * tau  # [k]
             alphas.append(alpha.detach().cpu())
             omegas.append(omega.detach().cpu())
     if not alphas:
@@ -187,7 +196,7 @@ def _print_log(metrics: dict, step: int, csv_path: str = None):
     if csv_path is not None:
         import csv, os
         head = ["step"] + list(metrics.keys())
-        row  = [step]  + [metrics[k] for k in metrics]
+        row = [step] + [metrics[k] for k in metrics]
         write_header = not os.path.exists(csv_path)
         with open(csv_path, "a", newline="") as f:
             w = csv.writer(f)
@@ -243,6 +252,7 @@ class EMA:
             if k in self.shadow:
                 self.shadow[k] = v.clone()
 
+
 # ============================ Latent helpers ============================
 def ewma_std(x: torch.Tensor, lam: float = 0.94, eps: float = 1e-8) -> torch.Tensor:
     B, L, D = x.shape
@@ -251,7 +261,7 @@ def ewma_std(x: torch.Tensor, lam: float = 0.94, eps: float = 1e-8) -> torch.Ten
     for t in range(L):
         xt = x[:, t, :]
         mean = lam * mean + (1 - lam) * xt
-        var  = lam * var  + (1 - lam) * (xt - mean) ** 2
+        var = lam * var + (1 - lam) * (xt - mean) ** 2
     return (var + eps).sqrt().unsqueeze(1)
 
 
@@ -263,7 +273,7 @@ def two_stage_norm(mu: torch.Tensor, use_ewma: bool, ewma_lambda: float,
     else:
         s = mu.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
     mu_mean = mu_mean.to(device=mu.device, dtype=mu.dtype)
-    mu_std  = mu_std.to(device=mu.device, dtype=mu.dtype).clamp_min(1e-6)
+    mu_std = mu_std.to(device=mu.device, dtype=mu.dtype).clamp_min(1e-6)
     mu_w = (mu / s).clamp(-clip_val, clip_val)
     mu_g = (mu_w - mu_mean) / mu_std
     return mu_g.clamp(-clip_val, clip_val)
@@ -272,7 +282,7 @@ def two_stage_norm(mu: torch.Tensor, use_ewma: bool, ewma_lambda: float,
 def normalize_cond_per_batch(cs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """z-score over (B,S) for each feature dim; keeps gradients. cs: [B,S,Hc]"""
     m = cs.mean(dim=(0, 1), keepdim=True)
-    v = cs.var (dim=(0, 1), keepdim=True, unbiased=False)
+    v = cs.var(dim=(0, 1), keepdim=True, unbiased=False)
     return (cs - m) / (v.sqrt() + eps)
 
 
@@ -293,22 +303,19 @@ def compute_latent_stats(vae, dataloader, device, use_ewma: bool, ewma_lambda: f
         mu_w = (mu / s).clamp(-clip_val, clip_val)
         all_mu_w.append(mu_w.detach().cpu())
 
-    if not all_mu_w:
-    raise RuntimeError("compute_latent_stats: no valid sequences found (all masked?)")
     mu_cat = torch.cat(all_mu_w, dim=0)
     mu_mean = mu_cat.mean(dim=(0, 1)).to(device)
-    mu_std  = mu_cat.std (dim=(0, 1), correction=0).clamp_min(1e-6).to(device)
+    mu_std = mu_cat.std(dim=(0, 1), correction=0).clamp_min(1e-6).to(device)
     return mu_mean, mu_std
 
 
 @torch.no_grad()
 def invert_two_stage_norm(x0_norm, mu_mean, mu_std, window_scale=None):
-    
     mu_mean = mu_mean.to(device=x0_norm.device, dtype=x0_norm.dtype)
-    mu_std  = mu_std.to (device=x0_norm.device, dtype=x0_norm.dtype)
+    mu_std = mu_std.to(device=x0_norm.device, dtype=x0_norm.dtype)
     mu_w = x0_norm * mu_std.view(1, 1, -1) + mu_mean.view(1, 1, -1)
     s = 1.0 if window_scale is None else window_scale
-    
+
     return mu_w * s
 
 
@@ -333,8 +340,8 @@ def build_context(model, V: torch.Tensor, T: torch.Tensor,
     """Returns normalized cond_summary: [B,S,Hm]"""
     with torch.no_grad():
         series_diff = T.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
-        series      = V.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
-        mask_bn     = mask_bn.to(device)
+        series = V.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
+        mask_bn = mask_bn.to(device)
         cond_summary, _ = model.context(x=series, ctx_diff=series_diff, entity_mask=mask_bn)
         if norm:
             cond_summary = normalize_cond_per_batch(cond_summary)
@@ -367,31 +374,21 @@ def diffusion_loss(model, scheduler, x0_lat_norm: torch.Tensor, t: torch.Tensor,
     else:
         x_t, eps_true = reuse_xt_eps
 
-    pred   = model(x_t, t, cond_summary=cond_summary, sc_feat=sc_feat)
-                       
-    if   predict_type == "eps":
-        target = eps_true
-    elif predict_type == "v":
-        target = scheduler.v_from_eps(x_t, t, eps_true)
-    elif predict_type == "x0":
-        target = scheduler.to_x0(x_t, t, eps_true, param_type="eps")  # recover x0 from (x_t, eps)
-    else:
-        raise ValueError("predict_type must be one of: 'eps', 'v', 'x0'")
+    pred = model(x_t, t, cond_summary=cond_summary, sc_feat=sc_feat)
+    target = eps_true if predict_type == "eps" else scheduler.v_from_eps(x_t, t, eps_true)
 
-    err = (pred - target).pow(2)            # [B,H,Z]
-    per_sample = err.mean(dim=1).sum(dim=1) # [B]
+    err = (pred - target).pow(2)  # [B,H,Z]
+    per_sample = err.mean(dim=1).sum(dim=1)  # [B]
 
     if weight_scheme == 'none':
         return per_sample.mean()
     elif weight_scheme == 'weighted_min_snr':
-        abar  = scheduler.alpha_bars[t]
-        snr   = abar / (1.0 - abar).clamp_min(1e-8)
-        gamma = float(minsnr_gamma)
-        w     = torch.minimum(snr, torch.as_tensor(gamma, device=snr.device, dtype=snr.dtype))
-        w     = w / (snr + 1.0)
+        abar = scheduler.alpha_bars[t]
+        snr = abar / (1.0 - abar).clamp_min(1e-8)
+        gamma = minsnr_gamma
+        w = torch.minimum(snr, torch.as_tensor(gamma, device=snr.device, dtype=snr.dtype))
+        w = w / (snr + 1.0)
         return (w.detach() * per_sample).mean()
-    else:
-        raise ValueError(f"Unknown weight_scheme: {weight_scheme!r}")
 
 
 @torch.no_grad()
@@ -445,3 +442,23 @@ def calculate_v_variance(scheduler, dataloader, vae, device, latent_stats,
     v_variance = all_v_targets_cat.var(correction=0).item()
 
     return v_variance
+
+
+@torch.no_grad()
+def _flatten_for_mask(yb, mask_bn, device):
+    y_in, batch_ids = flatten_targets(yb, mask_bn, device)
+    return y_in, batch_ids
+
+
+@torch.no_grad()
+def get_window_scale(vae, y_true, config):
+    """
+    Calculates the per-window standard deviation (scale) from the ground-truth target window.
+    This is a form of teacher forcing used during decoding.
+    """
+    _, mu_gt, _ = vae(y_true)  # Get latent of the true target window
+    if config.USE_EWMA:
+        s = ewma_std(mu_gt, lam=config.EWMA_LAMBDA)  # [Beff, 1, Z]
+    else:
+        s = mu_gt.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
+    return s
