@@ -28,10 +28,10 @@ Inference Speed: Time to generate a forecast for a single batch.
 Impact: Even if your model is not the absolute fastest, providing these numbers shows a thorough evaluation and helps position your model in the literature. If your model is more efficient than a comparable baseline, it's a significant advantage.
 
 ============ Baselines ===================
-Seasonal Naïve (SNaive) — simple, strong classical anchor to sanity-check gains.
-
 DLinear (LTSF-Linear) — tough linear baseline for long horizons; fast and stable. (over test / 1 mon = 20 steps pred, MAE = 0.6, MSE = 0.64, our best now MAE = 0.498, MSE = 0.51, 
 pinball loss (0.1, 0.5, 0.9) = 0.21, 0.24, 0.26)
+
+FEDformer (small) - seasonal–trend decomposition + frequency-domain attention (Fourier), complementary to PatchTST/iTransformer’s CI attention.
 
 N-HiTS — competitive deep forecaster; excels at multi-scale patterns.
 
