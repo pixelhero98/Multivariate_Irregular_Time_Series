@@ -383,10 +383,10 @@ def build_context(model, V: torch.Tensor, T: torch.Tensor,
 
 def encode_mu_norm(vae, y_in: torch.Tensor, *, use_ewma: bool, ewma_lambda: float,
                    mu_mean: torch.Tensor, mu_std: torch.Tensor) -> torch.Tensor:
-    """VAE encode then two-stage normalize; returns [Beff, H, Z]"""
+    """VAE encode then globally z-score; returns [Beff, H, Z]"""
     with torch.no_grad():
         _, mu, _ = vae(y_in)
-        mu_norm = two_stage_norm(mu, use_ewma=use_ewma, ewma_lambda=ewma_lambda, mu_mean=mu_mean, mu_std=mu_std)
+        mu_norm = simple_norm(mu, mu_mean, mu_std, clip_val=None)
         mu_norm = torch.nan_to_num(mu_norm, nan=0.0, posinf=0.0, neginf=0.0)
     return mu_norm
 
@@ -481,17 +481,3 @@ def calculate_v_variance(scheduler, dataloader, vae, device, latent_stats,
 def _flatten_for_mask(yb, mask_bn, device):
     y_in, batch_ids = flatten_targets(yb, mask_bn, device)
     return y_in, batch_ids
-
-
-@torch.no_grad()
-def get_window_scale(vae, y_true, config):
-    """
-    Calculates the per-window standard deviation (scale) from the ground-truth target window.
-    This is a form of teacher forcing used during decoding.
-    """
-    _, mu_gt, _ = vae(y_true)  # Get latent of the true target window
-    if config.USE_EWMA:
-        s = ewma_std(mu_gt, lam=config.EWMA_LAMBDA)  # [Beff, 1, Z]
-    else:
-        s = mu_gt.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
-    return s
