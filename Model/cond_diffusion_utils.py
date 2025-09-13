@@ -265,6 +265,31 @@ def ewma_std(x: torch.Tensor, lam: float = 0.94, eps: float = 1e-8) -> torch.Ten
     return (var + eps).sqrt().unsqueeze(1)
 
 
+# ===== Option A: Simple global z-score normalization (recommended) =====
+def simple_norm(mu: torch.Tensor, mu_mean: torch.Tensor, mu_std: torch.Tensor, clip_val: float = None) -> torch.Tensor:
+    """
+    Apply dataset-level per-dimension z-score to latent means.
+      - mu: [B,L,Z]
+      - mu_mean: [Z]
+      - mu_std: [Z]
+    Returns normalized latents with the same shape.
+    """
+    mu_mean = mu_mean.to(device=mu.device, dtype=mu.dtype).view(1,1,-1)
+    mu_std  = mu_std.to(device=mu.device, dtype=mu.dtype).clamp_min(1e-6).view(1,1,-1)
+    x = (mu - mu_mean) / mu_std
+    if clip_val is not None:
+        x = x.clamp(-clip_val, clip_val)
+    return x
+
+def invert_simple_norm(x: torch.Tensor, mu_mean: torch.Tensor, mu_std: torch.Tensor) -> torch.Tensor:
+    """
+    Inverse of simple_norm.
+      - x: [B,L,Z]
+    """
+    mu_mean = mu_mean.to(device=x.device, dtype=x.dtype).view(1,1,-1)
+    mu_std  = mu_std.to(device=x.device, dtype=x.dtype).view(1,1,-1)
+    return x * mu_std + mu_mean
+
 def two_stage_norm(mu: torch.Tensor, use_ewma: bool, ewma_lambda: float,
                    mu_mean: torch.Tensor, mu_std: torch.Tensor,
                    clip_val: float = 5.0) -> torch.Tensor:
@@ -286,36 +311,14 @@ def normalize_cond_per_batch(cs: torch.Tensor, eps: float = 1e-6) -> torch.Tenso
     return (cs - m) / (v.sqrt() + eps)
 
 
-def simple_norm(mu: torch.Tensor, mu_mean: torch.Tensor, mu_std: torch.Tensor, clip_val: float = None) -> torch.Tensor:
-    """
-    Apply dataset-level per-dimension z-score to latent means.
-      - mu: [B,L,Z]
-      - mu_mean: [Z]
-      - mu_std: [Z]
-    Returns normalized latents with the same shape.
-    """
-    mu_mean = mu_mean.to(device=mu.device, dtype=mu.dtype).view(1,1,-1)
-    mu_std  = mu_std.to(device=mu.device, dtype=mu.dtype).clamp_min(1e-6).view(1,1,-1)
-    x = (mu - mu_mean) / mu_std
-    if clip_val is not None:
-        x = x.clamp(-clip_val, clip_val)
-    return x
-
-
-def invert_simple_norm(x: torch.Tensor, mu_mean: torch.Tensor, mu_std: torch.Tensor) -> torch.Tensor:
-    """
-    Inverse of simple_norm.
-      - x: [B,L,Z]
-    """
-    mu_mean = mu_mean.to(device=x.device, dtype=x.dtype).view(1,1,-1)
-    mu_std  = mu_std.to(device=x.device, dtype=x.dtype).view(1,1,-1)
-    return x * mu_std + mu_mean
-
-
 @torch.no_grad()
 def compute_latent_stats(vae, dataloader, device, use_ewma: bool, ewma_lambda: float,
                          clip_val: float = 5.0):
-    all_mu_w = []
+    """
+    Compute dataset-level latent mean/std on *raw* μ (no per-window scaling).
+    Keeping the signature for compatibility; use_ewma/ewma_lambda are ignored here.
+    """
+    all_mu = []
     for (_, y, meta) in dataloader:
         m = meta["entity_mask"]
         B, N, H = y.shape
@@ -324,25 +327,15 @@ def compute_latent_stats(vae, dataloader, device, use_ewma: bool, ewma_lambda: f
         if not m_flat.any():
             continue
         y_in = y_flat[m_flat].to(device)
-        _, mu, _ = vae(y_in)
-        s = ewma_std(mu, lam=ewma_lambda) if use_ewma else mu.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
-        mu_w = (mu / s).clamp(-clip_val, clip_val)
-        all_mu_w.append(mu_w.detach().cpu())
+        _, mu, _ = vae(y_in)  # [Beff, L, Z]
+        all_mu.append(mu.detach().cpu())
 
-    mu_cat = torch.cat(all_mu_w, dim=0)
+    mu_cat = torch.cat(all_mu, dim=0)  # [sum(Beff), L, Z]
     mu_mean = mu_cat.mean(dim=(0, 1)).to(device)
-    mu_std = mu_cat.std(dim=(0, 1), correction=0).clamp_min(1e-6).to(device)
+    mu_std  = mu_cat.std(dim=(0, 1), correction=0).clamp_min(1e-6).to(device)
     return mu_mean, mu_std
 
 
-# @torch.no_grad()
-# def invert_two_stage_norm(x0_norm, mu_mean, mu_std, window_scale=None):
-#     mu_mean = mu_mean.to(device=x0_norm.device, dtype=x0_norm.dtype)
-#     mu_std = mu_std.to(device=x0_norm.device, dtype=x0_norm.dtype)
-#     mu_w = x0_norm * mu_std.view(1, 1, -1) + mu_mean.view(1, 1, -1)
-#     s = 1.0 if window_scale is None else window_scale
-
-#     return mu_w * s
 @torch.no_grad()
 def invert_two_stage_norm(x0_norm, mu_mean, mu_std, window_scale=None):
     """
@@ -481,3 +474,17 @@ def calculate_v_variance(scheduler, dataloader, vae, device, latent_stats,
 def _flatten_for_mask(yb, mask_bn, device):
     y_in, batch_ids = flatten_targets(yb, mask_bn, device)
     return y_in, batch_ids
+
+
+@torch.no_grad()
+def get_window_scale(vae, y_true, config):
+    """
+    Calculates the per-window standard deviation (scale) from the ground-truth target window.
+    This is a form of teacher forcing used during decoding.
+    """
+    _, mu_gt, _ = vae(y_true)  # Get latent of the true target window
+    if config.USE_EWMA:
+        s = ewma_std(mu_gt, lam=config.EWMA_LAMBDA)  # [Beff, 1, Z]
+    else:
+        s = mu_gt.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
+    return s
