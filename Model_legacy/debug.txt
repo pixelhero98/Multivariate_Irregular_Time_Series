@@ -54,6 +54,10 @@ if os.path.isfile(crypto_config.VAE_CKPT):
     vae.load_state_dict(sd, strict=False)
     print("Loaded VAE checkpoint:", crypto_config.VAE_CKPT)
 
+incomp = vae.load_state_dict(sd, strict=False)
+print("missing:", len(incomp.missing_keys), incomp.missing_keys[:20])
+print("unexpected:", len(incomp.unexpected_keys), incomp.unexpected_keys[:20])
+
 vae.eval()
 for p in vae.parameters():
     p.requires_grad = False
