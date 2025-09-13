@@ -1,6 +1,5 @@
 import math
 from typing import List, Optional, Tuple
-
 import torch
 import torch.nn as nn
 
@@ -219,7 +218,13 @@ def flatten_targets(yb: torch.Tensor, mask_bn: torch.Tensor, device: torch.devic
     return y_in, batch_ids
 
 
-# ============================ EMA (for evaluation) ============================
+@torch.no_grad()
+def _flatten_for_mask(yb, mask_bn, device):
+    y_in, batch_ids = flatten_targets(yb, mask_bn, device)
+    return y_in, batch_ids
+
+
+# ============================ EMA Weights (for evaluation) ============================
 class EMA:
     def __init__(self, model, decay=0.999):
         self.decay = decay
@@ -254,18 +259,6 @@ class EMA:
 
 
 # ============================ Latent helpers ============================
-def ewma_std(x: torch.Tensor, lam: float = 0.94, eps: float = 1e-8) -> torch.Tensor:
-    B, L, D = x.shape
-    var = x.new_zeros(B, D)
-    mean = x.new_zeros(B, D)
-    for t in range(L):
-        xt = x[:, t, :]
-        mean = lam * mean + (1 - lam) * xt
-        var = lam * var + (1 - lam) * (xt - mean) ** 2
-    return (var + eps).sqrt().unsqueeze(1)
-
-
-# ===== Option A: Simple global z-score normalization (recommended) =====
 def simple_norm(mu: torch.Tensor, mu_mean: torch.Tensor, mu_std: torch.Tensor, clip_val: float = None) -> torch.Tensor:
     """
     Apply dataset-level per-dimension z-score to latent means.
@@ -281,6 +274,7 @@ def simple_norm(mu: torch.Tensor, mu_mean: torch.Tensor, mu_std: torch.Tensor, c
         x = x.clamp(-clip_val, clip_val)
     return x
 
+
 def invert_simple_norm(x: torch.Tensor, mu_mean: torch.Tensor, mu_std: torch.Tensor) -> torch.Tensor:
     """
     Inverse of simple_norm.
@@ -289,19 +283,6 @@ def invert_simple_norm(x: torch.Tensor, mu_mean: torch.Tensor, mu_std: torch.Ten
     mu_mean = mu_mean.to(device=x.device, dtype=x.dtype).view(1,1,-1)
     mu_std  = mu_std.to(device=x.device, dtype=x.dtype).view(1,1,-1)
     return x * mu_std + mu_mean
-
-def two_stage_norm(mu: torch.Tensor, use_ewma: bool, ewma_lambda: float,
-                   mu_mean: torch.Tensor, mu_std: torch.Tensor,
-                   clip_val: float = 5.0) -> torch.Tensor:
-    if use_ewma:
-        s = ewma_std(mu, lam=ewma_lambda)
-    else:
-        s = mu.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
-    mu_mean = mu_mean.to(device=mu.device, dtype=mu.dtype)
-    mu_std = mu_std.to(device=mu.device, dtype=mu.dtype).clamp_min(1e-6)
-    mu_w = (mu / s).clamp(-clip_val, clip_val)
-    mu_g = (mu_w - mu_mean) / mu_std
-    return mu_g.clamp(-clip_val, clip_val)
 
 
 def normalize_cond_per_batch(cs: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -312,11 +293,9 @@ def normalize_cond_per_batch(cs: torch.Tensor, eps: float = 1e-6) -> torch.Tenso
 
 
 @torch.no_grad()
-def compute_latent_stats(vae, dataloader, device, use_ewma: bool, ewma_lambda: float,
-                         clip_val: float = 5.0):
+def compute_latent_stats(vae, dataloader, device):
     """
-    Compute dataset-level latent mean/std on *raw* μ (no per-window scaling).
-    Keeping the signature for compatibility; use_ewma/ewma_lambda are ignored here.
+    Compute dataset-level latent mean/std on *raw* μ.
     """
     all_mu = []
     for (_, y, meta) in dataloader:
@@ -336,33 +315,21 @@ def compute_latent_stats(vae, dataloader, device, use_ewma: bool, ewma_lambda: f
     return mu_mean, mu_std
 
 
-@torch.no_grad()
-def invert_two_stage_norm(x0_norm, mu_mean, mu_std, window_scale=None):
-    """
-    For Option A we ignore any per-window scale and apply the inverse dataset z-score only.
-    Keeping the signature for compatibility.
-    """
-    return invert_simple_norm(x0_norm, mu_mean, mu_std)
-
-
 def decode_latents_with_vae(vae, x0_norm: torch.Tensor,
-                            mu_mean: torch.Tensor, mu_std: torch.Tensor,
-                            window_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+                            mu_mean: torch.Tensor, mu_std: torch.Tensor) -> torch.Tensor:
     """
     Invert normalization and decode with the VAE decoder (no encoder skips).
       - x0_norm: [B,L,Z] normalized latent from diffusion
-      - window_scale: None, scalar, [Z] or [B,1,Z]
     Returns:
-      x_hat: [B,L,1]  (same layout your VAE was trained on)
+      x_hat: [B,L,1]  (same feature domain your VAE was trained on)
     """
-    mu_est = invert_two_stage_norm(x0_norm, mu_mean, mu_std, window_scale=window_scale)
-    # your decoder accepts z with optional skips=None
+    mu_est = invert_simple_norm(x0_norm, mu_mean, mu_std)
     x_hat = vae.decoder(mu_est, encoder_skips=None)
     return x_hat
 
 
 def build_context(model, V: torch.Tensor, T: torch.Tensor,
-                  mask_bn: torch.Tensor, device: torch.device, norm: bool = True) -> torch.Tensor:
+                  mask_bn: torch.Tensor, device: torch.device, norm: bool = False) -> torch.Tensor:
     """Returns normalized cond_summary: [B,S,Hm]"""
     with torch.no_grad():
         series_diff = T.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
@@ -374,7 +341,7 @@ def build_context(model, V: torch.Tensor, T: torch.Tensor,
     return cond_summary
 
 
-def encode_mu_norm(vae, y_in: torch.Tensor, *, use_ewma: bool, ewma_lambda: float,
+def encode_mu_norm(vae, y_in: torch.Tensor, *,
                    mu_mean: torch.Tensor, mu_std: torch.Tensor) -> torch.Tensor:
     """VAE encode then globally z-score; returns [Beff, H, Z]"""
     with torch.no_grad():
@@ -384,7 +351,6 @@ def encode_mu_norm(vae, y_in: torch.Tensor, *, use_ewma: bool, ewma_lambda: floa
     return mu_norm
 
 
-# cond_diffusion_utils.py
 def diffusion_loss(model, scheduler, x0_lat_norm: torch.Tensor, t: torch.Tensor,
                    *, cond_summary: Optional[torch.Tensor], predict_type: str = "v",
                    weight_scheme: str = "none", minsnr_gamma: float = 5.0,
@@ -418,8 +384,7 @@ def diffusion_loss(model, scheduler, x0_lat_norm: torch.Tensor, t: torch.Tensor,
 
 
 @torch.no_grad()
-def calculate_v_variance(scheduler, dataloader, vae, device, latent_stats,
-                         use_ewma, ewma_lambda):
+def calculate_v_variance(scheduler, dataloader, vae, device, latent_stats):
     """
     Calculates the variance of the v-prediction target over a given dataloader.
     """
@@ -439,8 +404,6 @@ def calculate_v_variance(scheduler, dataloader, vae, device, latent_stats,
 
         mu_norm = encode_mu_norm(
             vae, y_in,
-            use_ewma=use_ewma,
-            ewma_lambda=ewma_lambda,
             mu_mean=mu_mean,
             mu_std=mu_std
         )
@@ -468,23 +431,3 @@ def calculate_v_variance(scheduler, dataloader, vae, device, latent_stats,
     v_variance = all_v_targets_cat.var(correction=0).item()
 
     return v_variance
-
-
-@torch.no_grad()
-def _flatten_for_mask(yb, mask_bn, device):
-    y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-    return y_in, batch_ids
-
-
-@torch.no_grad()
-def get_window_scale(vae, y_true, config):
-    """
-    Calculates the per-window standard deviation (scale) from the ground-truth target window.
-    This is a form of teacher forcing used during decoding.
-    """
-    _, mu_gt, _ = vae(y_true)  # Get latent of the true target window
-    if config.USE_EWMA:
-        s = ewma_std(mu_gt, lam=config.EWMA_LAMBDA)  # [Beff, 1, Z]
-    else:
-        s = mu_gt.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
-    return s
