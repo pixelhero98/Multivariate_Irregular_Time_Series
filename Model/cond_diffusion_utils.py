@@ -286,6 +286,32 @@ def normalize_cond_per_batch(cs: torch.Tensor, eps: float = 1e-6) -> torch.Tenso
     return (cs - m) / (v.sqrt() + eps)
 
 
+def simple_norm(mu: torch.Tensor, mu_mean: torch.Tensor, mu_std: torch.Tensor, clip_val: float = None) -> torch.Tensor:
+    """
+    Apply dataset-level per-dimension z-score to latent means.
+      - mu: [B,L,Z]
+      - mu_mean: [Z]
+      - mu_std: [Z]
+    Returns normalized latents with the same shape.
+    """
+    mu_mean = mu_mean.to(device=mu.device, dtype=mu.dtype).view(1,1,-1)
+    mu_std  = mu_std.to(device=mu.device, dtype=mu.dtype).clamp_min(1e-6).view(1,1,-1)
+    x = (mu - mu_mean) / mu_std
+    if clip_val is not None:
+        x = x.clamp(-clip_val, clip_val)
+    return x
+
+
+def invert_simple_norm(x: torch.Tensor, mu_mean: torch.Tensor, mu_std: torch.Tensor) -> torch.Tensor:
+    """
+    Inverse of simple_norm.
+      - x: [B,L,Z]
+    """
+    mu_mean = mu_mean.to(device=x.device, dtype=x.dtype).view(1,1,-1)
+    mu_std  = mu_std.to(device=x.device, dtype=x.dtype).view(1,1,-1)
+    return x * mu_std + mu_mean
+
+
 @torch.no_grad()
 def compute_latent_stats(vae, dataloader, device, use_ewma: bool, ewma_lambda: float,
                          clip_val: float = 5.0):
@@ -309,14 +335,21 @@ def compute_latent_stats(vae, dataloader, device, use_ewma: bool, ewma_lambda: f
     return mu_mean, mu_std
 
 
+# @torch.no_grad()
+# def invert_two_stage_norm(x0_norm, mu_mean, mu_std, window_scale=None):
+#     mu_mean = mu_mean.to(device=x0_norm.device, dtype=x0_norm.dtype)
+#     mu_std = mu_std.to(device=x0_norm.device, dtype=x0_norm.dtype)
+#     mu_w = x0_norm * mu_std.view(1, 1, -1) + mu_mean.view(1, 1, -1)
+#     s = 1.0 if window_scale is None else window_scale
+
+#     return mu_w * s
 @torch.no_grad()
 def invert_two_stage_norm(x0_norm, mu_mean, mu_std, window_scale=None):
-    mu_mean = mu_mean.to(device=x0_norm.device, dtype=x0_norm.dtype)
-    mu_std = mu_std.to(device=x0_norm.device, dtype=x0_norm.dtype)
-    mu_w = x0_norm * mu_std.view(1, 1, -1) + mu_mean.view(1, 1, -1)
-    s = 1.0 if window_scale is None else window_scale
-
-    return mu_w * s
+    """
+    For Option A we ignore any per-window scale and apply the inverse dataset z-score only.
+    Keeping the signature for compatibility.
+    """
+    return invert_simple_norm(x0_norm, mu_mean, mu_std)
 
 
 def decode_latents_with_vae(vae, x0_norm: torch.Tensor,
