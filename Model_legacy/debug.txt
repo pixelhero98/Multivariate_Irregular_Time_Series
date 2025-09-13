@@ -1,18 +1,4 @@
-Epoch 145 | train: 0.547695 (/Z: 0.027385) | val: 2.844080 (/Z: 0.142204) | cond_gap: 0.019379
-Epochs:  10%|▉         | 145/1500 [1:26:21<13:26:59, 35.73s/it]
-Epoch 146 | train: 0.546357 (/Z: 0.027318) | val: 2.856353 (/Z: 0.142818) | cond_gap: 0.020252
-Early stopping.
-[decoder-ft(gen)] epochs=10, lr=0.0002, steps=100, guidance=2.0, power=0.3, anchor=0.1
-[decoder-ft(gen)] train@1  loss_gen=1.129563  loss_anchor=0.467976  total=1.176360
-[decoder-ft(gen)] val@1  loss_gen=0.394408  loss_anchor=0.316122  total=0.426020
-[decoder-ft(gen)] train@2  loss_gen=0.995314  loss_anchor=0.697697  total=1.065083
-[decoder-ft(gen)] val@2  loss_gen=0.377575  loss_anchor=0.321284  total=0.409704
-[decoder-ft(gen)] train@3  loss_gen=0.986587  loss_anchor=0.731868  total=1.059774
-[decoder-ft(gen)] val@3  loss_gen=0.372502  loss_anchor=0.323379  total=0.404840
-[decoder-ft(gen)] train@4  loss_gen=0.983500  loss_anchor=0.743435  total=1.057844
-[decoder-ft(gen)] val@4  loss_gen=0.370070  loss_anchor=0.323104  total=0.402380
-[decoder-ft(gen)] train@5  loss_gen=0.981765  loss_anchor=0.749969  total=1.056762
-[decoder-ft(gen)] val@5  loss_gen=0.369059  loss_anchor=0.323533  total=0.401412
+
 
 ====================== train/val script
 import os, torch
