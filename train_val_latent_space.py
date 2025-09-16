@@ -1,4 +1,4 @@
-from Latent_Space.latent_vae_utils import normalize_and_check # FIX: correct module
+from Latent_Space.latent_vae_utils import normalize_and_check
 from Latent_Space.latent_vae import LatentVAE
 import torch.nn.functional as F
 import os
@@ -158,13 +158,13 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
 
     if improved_elbo:
         best_val_elbo = val_elbo_beta
-        best_elbo_path = os.path.join(model_dir, f"PRED|CHANNEL_{crypto_config.PRED}|{crypto_config.VAE_LATENT_CHANNELS}_elbo.pt")
+        best_elbo_path = os.path.join(model_dir, f"pred-{crypto_config.PRED}_ch-{crypto_config.VAE_LATENT_CHANNELS}_elbo.pt")
         torch.save(model.state_dict(), best_elbo_path)
         print("  -> Saved best β·ELBO")
 
     if improved_recon:
         best_val_recon = per_elem_val_recon
-        best_recon_path = os.path.join(model_dir, f"PRED|CHANNEL_{crypto_config.PRED}|{crypto_config.VAE_LATENT_CHANNELS}_recon.pt")
+        best_recon_path = os.path.join(model_dir, f"pred-{crypto_config.PRED}_ch-{crypto_config.VAE_LATENT_CHANNELS}_recon.pt")
         torch.save(model.state_dict(), best_recon_path)
         print("  -> Saved best Recon")
 
@@ -176,8 +176,7 @@ for epoch in range(1, crypto_config.EPOCHS + 1):
 # --- Load the preferred checkpoint for downstream use ---
 to_load = best_elbo_path or best_recon_path or os.path.join(model_dir, "last.pt")
 print(f"Loading checkpoint: {to_load}")
-vae = LatentVAE(
-    input_dim=1, seq_len=crypto_config.PRED,
+vae = LatentVAE(seq_len=crypto_config.PRED,
     latent_dim=crypto_config.VAE_LATENT_DIM,
     latent_channel=crypto_config.VAE_LATENT_CHANNELS,
     enc_layers=crypto_config.VAE_LAYERS, enc_heads=crypto_config.VAE_HEADS, enc_ff=crypto_config.VAE_FF,
