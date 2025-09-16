@@ -251,6 +251,7 @@ def validate():
     cond_gap = (cond_gap_accum / cond_gap_batches) if cond_gap_batches > 0 else float("nan")
     return avg_val, cond_gap
 
+
 # ============================ run ============================
 skip_with_trained_model = crypto_config.TRAINED_LLapDiT
 
@@ -297,7 +298,7 @@ else:
 
             ckpt_path = os.path.join(
                 crypto_config.CKPT_DIR,
-                f"epoch_{epoch:03d}_val_{val_loss / Z:.6f}_cond_{cond_gap}.pt"
+                f"pred-{crypto_config.PRED}_ch-{crypto_config.VAE_LATENT_CHANNELS}_val_{val_loss / Z:.6f}_cond_{cond_gap}.pt"
             )
             save_payload = {
                 "epoch": epoch,
