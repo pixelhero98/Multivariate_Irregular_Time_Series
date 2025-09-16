@@ -286,8 +286,8 @@ else:
         train_loss = train_one_epoch(epoch)
         val_loss, cond_gap = validate()
         Z = crypto_config.VAE_LATENT_CHANNELS
-        print(f"Epoch {epoch:03d} | train: {train_loss:.6f} (/Z: {train_loss / Z:.6f}) "
-              f"| val: {val_loss:.6f} (/Z: {val_loss / Z:.6f}) | cond_gap: {cond_gap:.6f}")
+        print(f"Epoch {epoch:03d} | train: {train_loss:.6f}"
+              f"| val: {val_loss:.6f} | cond_gap: {cond_gap * Z:.6f}")
 
         # checkpoint best (with EMA state)
         if val_loss < best_val:
