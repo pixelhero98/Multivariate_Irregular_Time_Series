@@ -6,13 +6,11 @@ from torch.cuda.amp import GradScaler, autocast
 from Dataset.fin_dataset import run_experiment
 from Latent_Space.latent_vae import LatentVAE
 from Model.lladit import LLapDiT
-from Model.cond_diffusion_utils import (EMA, set_torch, encode_mu_norm,
-                                        make_warmup_cosine, ewma_std,
-                                        calculate_v_variance,
-                                        diffusion_loss, build_context,
-                                        flatten_targets, sample_t_uniform,
-                                        decode_latents_with_vae, _flatten_for_mask,
-                                        get_window_scale
+from Model.lladit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_mask,
+                                        make_warmup_cosine, calculate_v_variance,
+                                        compute_latent_stats, diffusion_loss,
+                                        build_context, flatten_targets,
+                                        sample_t_uniform, decode_latents_with_vae
                                         )
 
 # ============================ Training setup ============================
@@ -39,29 +37,25 @@ assert Fv == Ft, f"Expected Fv == Ft, got {Fv} vs {Ft}"
 print("V:", V0.shape, "T:", T0.shape, "y:", yb0.shape)
 
 # ---- Estimate global latent stats (uses same window-normalization) ----
-VAE_CKPT = crypto_config.VAE_CKPT
 vae = LatentVAE(
-    input_dim=1, seq_len=crypto_config.PRED,
+    seq_len=crypto_config.PRED,
     latent_dim=crypto_config.VAE_LATENT_DIM,
     latent_channel=crypto_config.VAE_LATENT_CHANNELS,
     enc_layers=crypto_config.VAE_LAYERS, enc_heads=crypto_config.VAE_HEADS, enc_ff=crypto_config.VAE_FF,
     dec_layers=crypto_config.VAE_LAYERS, dec_heads=crypto_config.VAE_HEADS, dec_ff=crypto_config.VAE_FF
 ).to(device)
-if VAE_CKPT and os.path.isfile(VAE_CKPT):
-    ckpt = torch.load(VAE_CKPT, map_location=device)
+
+if os.path.isfile(crypto_config.VAE_CKPT):
+    ckpt = torch.load(crypto_config.VAE_CKPT, map_location=device)
     sd = ckpt.get("state_dict", ckpt)
-    vae.load_state_dict(sd, strict=False)
-    print("Loaded VAE checkpoint:", VAE_CKPT)
+    vae.load_state_dict(sd)
+    print("Loaded VAE checkpoint:", crypto_config.VAE_CKPT)
 
 vae.eval()
 for p in vae.parameters():
     p.requires_grad = False
 
-mu_mean, mu_std = compute_latent_stats(
-    vae, train_dl, device,
-    use_ewma=crypto_config.USE_EWMA,
-    ewma_lambda=crypto_config.EWMA_LAMBDA
-)
+mu_mean, mu_std = compute_latent_stats(vae, train_dl, device)
 
 # ---- Conditional diffusion model ----
 diff_model = LLapDiT(
@@ -81,9 +75,7 @@ v_variance = calculate_v_variance(
     dataloader=val_dl,
     vae=vae,
     device=device,
-    latent_stats=(mu_mean, mu_std),
-    use_ewma=crypto_config.USE_EWMA,
-    ewma_lambda=crypto_config.EWMA_LAMBDA
+    latent_stats=(mu_mean, mu_std)
 )
 print(f"calculated V-Prediction Target Variance: {v_variance:.4f}")
 print("=========================================================")
@@ -94,14 +86,11 @@ scheduler = diff_model.scheduler
 optimizer = torch.optim.AdamW(diff_model.parameters(),
                               lr=crypto_config.BASE_LR,
                               weight_decay=crypto_config.WEIGHT_DECAY)
-total_steps = crypto_config.EPOCHS * max(1, len(train_dl))
-lr_sched = make_warmup_cosine(optimizer, total_steps,
+lr_sched = make_warmup_cosine(optimizer, crypto_config.EPOCHS * max(1, len(train_dl)),
                               warmup_frac=crypto_config.WARMUP_FRAC,
                               base_lr=crypto_config.BASE_LR,
                               min_lr=crypto_config.MIN_LR)
 scaler = GradScaler(enabled=(device.type == "cuda"))
-
-
 # ============================ train/val loops ============================
 def train_one_epoch(epoch: int):
     diff_model.train()
@@ -121,15 +110,13 @@ def train_one_epoch(epoch: int):
         cond_summary_flat = cond_summary[batch_ids]  # [Beff,S,Hm]
         mu_norm = encode_mu_norm(
             vae, y_in,
-            use_ewma=crypto_config.USE_EWMA,
-            ewma_lambda=crypto_config.EWMA_LAMBDA,
             mu_mean=mu_mean, mu_std=mu_std
         )
 
         # --------- per-sample classifier-free dropout mask ---------
         Beff = mu_norm.size(0)
         p_drop = float(crypto_config.DROP_COND_P)
-        m_cond = (torch.rand(Beff, device=device) >= p_drop)    # True → conditioned
+        m_cond = (torch.rand(Beff, device=device) >= p_drop)
         idx_c = m_cond.nonzero(as_tuple=False).squeeze(1)
         idx_u = (~m_cond).nonzero(as_tuple=False).squeeze(1)
 
@@ -221,8 +208,6 @@ def validate():
         cond_summary_flat = cond_summary[batch_ids]
         mu_norm = encode_mu_norm(
             vae, y_in,
-            use_ewma=crypto_config.USE_EWMA,
-            ewma_lambda=crypto_config.EWMA_LAMBDA,
             mu_mean=mu_mean, mu_std=mu_std
         )
 
@@ -267,9 +252,9 @@ def validate():
     return avg_val, cond_gap
 
 # ============================ run ============================
-skip_with_trained_model = "./ldt/checkpoints/epoch_138_val_0.188933_cond_0.025167269366128103.pt"
+skip_with_trained_model = crypto_config.TRAINED_LLapDiT
 
-if skip_with_trained_model and os.path.exists(skip_with_trained_model):
+if skip_with_trained_model and os.path.exists(skip_with_trained_model) and crypto_config.downstream:
     print(f"Skipping training. Loading model from: {skip_with_trained_model}")
     ckpt = torch.load(skip_with_trained_model, map_location=device)
 
@@ -337,6 +322,7 @@ else:
                 break
 
 # ============================ Decoder finetune + regression eval ============================
+
 def finetune_vae_decoder(
         vae,
         diff_model,
@@ -346,7 +332,7 @@ def finetune_vae_decoder(
         *,
         mu_mean,
         mu_std,
-        config,  # Pass config object for parameters
+        config,
         ema=None,
         epochs: int = 3,
         lr: float = 1e-4,
@@ -355,7 +341,6 @@ def finetune_vae_decoder(
         guidance_strength: float = 2.0,
         guidance_power: float = 0.3,
         lambda_rec_anchor: float = 0.25,
-        use_gt_window_scale: False
 ):
     """
     Fine-tune ONLY the VAE decoder to adapt to the diffusion model's generated latent x0_norm.
@@ -404,16 +389,16 @@ def finetune_vae_decoder(
 
                 # ---- Forward decoder on generated latents ----
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                s = get_window_scale(vae, y_true, config) if use_gt_window_scale else None
                 y_hat_gen = decode_latents_with_vae(
-                    vae, x0_norm_gen.detach(), mu_mean=mu_mean, mu_std=mu_std, window_scale=s
+                    vae, x0_norm_gen.detach(), mu_mean=mu_mean, mu_std=mu_std
                 )
                 loss_gen = mse(y_hat_gen, y_true)
 
                 # ---- Teacher-forced anchor loss ----
                 with torch.no_grad():
-                    _, mu_enc, _ = vae(y_true)
-                y_hat_rec = vae.decoder(mu_enc.detach(), encoder_skips=None)
+                    _, mu_enc, logvar_enc = vae(y_true)
+                    z_enc = vae.reparameterize(mu_enc, logvar_enc)
+                y_hat_rec = vae.decoder(z_enc.detach(), encoder_skips=None)
                 loss_anchor = mse(y_hat_rec, y_true)
 
                 loss = loss_gen + lambda_rec_anchor * loss_anchor
@@ -468,8 +453,6 @@ def evaluate_regression(
         dict with keys:
             crps, mae, mse, num_samples, aggregation, pinball (dict {q: loss})
     """
-    import torch
-
     if aggregation_method not in ['mean', 'median']:
         raise ValueError("aggregation_method must be either 'mean' or 'median'")
     if not all(0.0 < float(q) < 1.0 for q in quantiles):
@@ -484,7 +467,7 @@ def evaluate_regression(
     # Element-wise accumulators for pinball losses per quantile
     pinball_sums = {float(q): 0.0 for q in quantiles}
 
-    num_samples = int(getattr(config, "NUM_EVAL_SAMPLES", 32))
+    num_samples = config.NUM_EVAL_SAMPLES
     if num_samples <= 1 and aggregation_method == 'median':
         print("Warning: Median aggregation is more meaningful with num_samples > 1.")
 
@@ -508,9 +491,8 @@ def evaluate_regression(
 
         Beff, Hcur, Z = y_in.size(0), y_in.size(1), config.VAE_LATENT_CHANNELS
 
-        # ---- Generate multiple samples in latent space and decode (context-scale at eval) ----
-        # Estimate context-based per-window latent scale (no GT)
-        s_inf = get_context_window_scale(vae, T, mask_bn, Hcur, device, config)  # [Beff,1,Z]
+        # ---- Generate multiple samples in latent space and decode ----
+
         all_y_hats = []
         for _ in range(num_samples):
             x0_norm = diff_model.generate(
@@ -519,12 +501,8 @@ def evaluate_regression(
                 cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
             )
 
-            if getattr(config, "DECODE_USE_GT_SCALE", False) and not warned_no_gt_scale:
-                print("Warning: DECODE_USE_GT_SCALE is True in config, but disabled during evaluation to avoid leakage.")
-                warned_no_gt_scale = True
-
             y_hat_sample = decode_latents_with_vae(
-                vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std, window_scale=s_inf
+                vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std
             )
             all_y_hats.append(y_hat_sample)
 
@@ -554,15 +532,13 @@ def evaluate_regression(
             diffs = (all_samples.unsqueeze(0) - all_samples.unsqueeze(1)).abs()  # [M,M,B,H,C]
             iu = torch.triu_indices(M, M, offset=1, device=diffs.device)
             diffs_ij = diffs[iu[0], iu[1], ...]                                   # [M*(M-1)/2,B,H,C]
-            term2 = (2.0 / (M * (M - 1))) * diffs_ij.mean(dim=0)                  # [B,H,C]
+            term2 = diffs_ij.mean(dim=0)                # [B,H,C]
 
         batch_crps = (term1 - 0.5 * term2).mean().item()
         crps_sum += batch_crps * Beff
         n += Beff
 
         # ---- Pinball (quantile) loss ----
-        # Compute predictive quantiles from the sample set, then apply quantile loss vs y_in.
-        # y_q: [B,H,C] for each q
         for q in quantiles:
             q = float(q)
             y_q = torch.quantile(all_samples, q, dim=0, interpolation="linear")   # [B,H,C]
@@ -610,8 +586,7 @@ if True:
             gen_steps=crypto_config.GEN_STEPS,
             guidance_strength=crypto_config.GUIDANCE_STRENGTH,
             guidance_power=crypto_config.GUIDANCE_POWER,
-            lambda_rec_anchor=crypto_config.DECODER_FT_ANCHOR,
-            use_gt_window_scale=crypto_config.DECODE_USE_GT_SCALE
+            lambda_rec_anchor=crypto_config.DECODER_FT_ANCHOR
         )
 
     # Evaluate conditional regression on test set
