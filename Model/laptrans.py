@@ -1,65 +1,35 @@
-"""
-Learnable Laplace analysis + decoder stack.
-
-- LearnableLaplacianBasis:
-    Projects sequences to a 2*k-channel Laplace feature space using either
-    a parallel complex-exponential basis or a time-varying recurrent update.
-
-- LearnableInverseLaplacianBasis (decoder):
-    Learns to map Laplace features back to the original feature space.
-    This is NOT a strict mathematical inverse; it is a small MLP trained
-    end-to-end for the downstream objective. But, supports spectral_norm (sn).
-
-- LaplaceBlock:
-    Convenience wrapper combining analysis + decoder.
-
-Other comments:
-    The decoder is always used with its paired basis:
-      input_dim  = 2 * k
-      output_dim = feat_dim  (original input dim to the basis)
-    The only optional size is the decoder's hidden_dim.
-"""
 import math
 import warnings
 from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 
 
-__all__ = [
-    "LearnableLaplacianBasis",
-    "LearnableInverseLaplacianBasis"
-]
-
-# =========================================
-# Analysis: Laplace features (Real and Img)
-# =========================================
 class LearnableLaplacianBasis(nn.Module):
     """
     Learnable Laplace transform basis producing 2*k channels (cos & sin branches).
 
     Args:
-        k:         number of complex poles and frequencies (output channels = 2*k)
+        k:         number of complex poles (output channels = 2*k)
         feat_dim:  input feature dimension (last dim of x)
         mode:      'parallel' (fixed basis) or 'recurrent' (time-varying recurrence)
                    Aliases: 'static'→'parallel' (deprecated), 'tv'→'recurrent' (deprecated)
-        alpha_min: strictly positive floor for the real part (decay), ensuring stable learning.
-        omega_max: clamp for imaginary part (frequency) in 'parallel' mode, ensuring no drastic phase change.
+        alpha_min: strictly positive floor for the real part (decay)
+        omega_max: clamp for imaginary part (frequency) in 'parallel' mode
 
     Forward:
         x: [B, T, D]
 
         For mode='recurrent' you may also pass:
-          dt:        [T] or [B, T] step sizes, which supports irregular data sampling interval; None (regular) -> uniform over [0,1]
+          dt:        [T] or [B, T] step sizes; None -> uniform over [0,1]
           alpha_mod: [B, T, k] log-scale modulation of decay (multiplies alpha)
           omega_mod: [B, T, k] log-scale modulation of frequency (multiplies omega)
           tau_mod:   [B, T, 1] or [B, T, k] log-scale global timescale modulation
 
     Returns:
-        lap_feats: [B, T, 2*k]  (concat of poles and frequencies)
+        lap_feats: [B, T, 2*k]  (concat of cosine-like and sine-like channels)
     """
 
     def __init__(
@@ -196,26 +166,28 @@ class LearnableLaplacianBasis(nn.Module):
         # Step-wise decay & rotation
         rho = torch.exp(-alpha * dt_bt1)     # [B,T,k]
         theta = omega * dt_bt1               # [B,T,k]
+        cos_t, sin_t = torch.cos(theta), torch.sin(theta)
 
         # Drive (real only)
         u = self.proj(x)                     # [B,T,k]
-        
+
         # z_t = rho_t * e^{i theta_t} * z_{t-1} + u_t
-
-        Z = torch.empty(B, T, k, dtype=torch.complex64, device=device)
-        z = torch.zeros(B, k, dtype=torch.complex64, device=device)
-        
+        C = torch.empty(B, T, k, dtype=u.dtype, device=device)
+        S = torch.empty(B, T, k, dtype=u.dtype, device=device)
+        c = torch.zeros(B, k, dtype=u.dtype, device=device)
+        s = torch.zeros(B, k, dtype=u.dtype, device=device)
         for t in range(T):
-            update_factor = rho[:, t, :] * torch.exp(1j * theta[:, t, :])
-            z = update_factor * z + u[:, t, :]
-            Z[:, t, :] = z
-        
-        return torch.cat([Z.real.to(x.dtype), Z.imag.to(x.dtype)], dim=2).contiguous()
+            rt = rho[:, t, :]
+            ct = cos_t[:, t, :]
+            st = sin_t[:, t, :]
+            c, s = rt * (c * ct - s * st) + u[:, t, :], rt * (c * st + s * ct)
+            C[:, t, :], S[:, t, :] = c, s
 
+        return torch.cat([C, S], dim=2).contiguous()
 
 
 # ==============================
-# Synthesis (non-strict inverse)
+# Decoder (NOT a strict inverse)
 # ==============================
 class LearnableInverseLaplacianBasis(nn.Module):
     """
