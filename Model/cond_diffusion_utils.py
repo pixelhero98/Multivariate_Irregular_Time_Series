@@ -28,9 +28,8 @@ def make_warmup_cosine(optimizer, total_steps, warmup_frac=0.05, base_lr=5e-4, m
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def _cosine_alpha_bar(t, s=0.008):
-    """Continuous-time alpha_bar(t) from Nichol & Dhariwal (t in [0,1])."""
-    return torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
+def _cosine_alpha_bar(ts: torch.Tensor, s: float = 0.008) -> torch.Tensor:
+    return torch.cos(((ts + s) / (1.0 + s)) * math.pi * 0.5).pow(2)
 
 
 class NoiseScheduler(nn.Module):
@@ -40,11 +39,11 @@ class NoiseScheduler(nn.Module):
     """
 
     def __init__(
-            self,
-            timesteps: int = 1000,
-            schedule: str = "cosine",
-            beta_start: float = 1e-4,
-            beta_end: float = 2e-2,
+        self,
+        timesteps: int = 1000,
+        schedule: str = "cosine",
+        beta_start: float = 1e-4,
+        beta_end: float = 2e-2,
     ) -> None:
         super().__init__()
         self.timesteps = int(timesteps)
@@ -56,69 +55,96 @@ class NoiseScheduler(nn.Module):
         if schedule == "linear":
             betas = torch.linspace(beta_start, beta_end, self.timesteps, dtype=torch.float32)
             betas = betas.clamp(min=1e-8, max=0.999)
+            betas[0] = 0.0  # ensure ᾱ(0)=1 and no noise at t=0
         else:
-            # cosine ᾱ(t) from Nichol & Dhariwal; turn into alphas and then betas
-            ts = torch.linspace(0, 1, self.timesteps + 1, dtype=torch.float32)
+            # cosine ᾱ(t): normalize so ᾱ(0)=1
+            ts = torch.linspace(0.0, 1.0, self.timesteps + 1, dtype=torch.float32)
             abar = _cosine_alpha_bar(ts)
-            abar = abar / abar[0]  # ᾱ(0) = 1
+            abar = abar / abar[0].clamp_min(1e-12)
+            # Convert ᾱ to per-step α_t: α_t = ᾱ_t / ᾱ_{t-1}
             alphas = torch.ones(self.timesteps, dtype=torch.float32)
-            alphas[1:] = abar[1:self.timesteps] / abar[0:self.timesteps - 1]
-            betas = (1.0 - alphas).clone()
+            alphas[1:] = (abar[1:self.timesteps] / abar[0:self.timesteps - 1]).clamp(1e-8, 0.999999)
+            betas = (1.0 - alphas)
+            betas[0] = 0.0
             betas[1:] = betas[1:].clamp(min=1e-8, max=0.999)
 
-        betas[0] = 0.0
-        self.register_buffer("betas", betas)
-        alphas = 1.0 - betas
+        # Register buffers
+        self.register_buffer("betas", betas)                              # [T]
+        alphas = (1.0 - betas).clamp(1e-12, 1.0)                          # [T]
         self.register_buffer("alphas", alphas)
-        alpha_bars = torch.cumprod(alphas, dim=0)
+        alpha_bars = torch.cumprod(alphas, dim=0)                         # [T]
         self.register_buffer("alpha_bars", alpha_bars)
+
+        # Precompute common roots
         ab = alpha_bars.clamp(0.0, 1.0)
-        self.register_buffer("sqrt_alphas", torch.sqrt(alphas.clamp(0.0, 1.0)))
+        self.register_buffer("sqrt_alphas", torch.sqrt(alphas))
         self.register_buffer("sqrt_alpha_bars", torch.sqrt(ab))
         self.register_buffer("sqrt_one_minus_alpha_bars", torch.sqrt((1.0 - ab).clamp(0.0, 1.0)))
 
     @torch.no_grad()
-    def timesteps_desc(self):
+    def timesteps_desc(self) -> torch.Tensor:
         return torch.arange(self.timesteps - 1, -1, -1, dtype=torch.long, device=self.alpha_bars.device)
 
-    def _gather(self, buf: torch.Tensor, t: torch.Tensor):
-        t = t.clamp(min=0, max=self.timesteps - 1).to(device=buf.device, dtype=torch.long)
-        return buf.gather(0, t)
+    def _gather(self, buf: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t_idx = t.clamp(min=0, max=self.timesteps - 1).to(device=buf.device, dtype=torch.long)
+        return buf.gather(0, t_idx)
 
-    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None):
+    @torch.no_grad()
+    def alpha_bar_at(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        ᾱ(t) for possibly non-integer t in [0, T-1] via linear interpolation.
+        Matches self.alpha_bars[t] exactly when t is integer.
+        """
+        t = t.to(self.alpha_bars.device, dtype=torch.float32)
+        t0 = t.floor().clamp(0, self.timesteps - 1)
+        t1 = (t0 + 1).clamp(0, self.timesteps - 1)
+        w = (t - t0).clamp(0.0, 1.0)
+        ab0 = self.alpha_bars.index_select(0, t0.long())
+        ab1 = self.alpha_bars.index_select(0, t1.long())
+        return (1.0 - w) * ab0 + w * ab1
+
+    @torch.no_grad()
+    def snr_at(self, t: torch.Tensor) -> torch.Tensor:
+        abar = self.alpha_bar_at(t).clamp(1e-6, 1.0 - 1e-6)
+        return abar / (1.0 - abar)
+
+    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None):
         if noise is None:
             noise = torch.randn_like(x0)
         sqrt_ab = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x0.dim() - 1)))
         sqrt_1_ab = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x0.dim() - 1)))
         x_t = sqrt_ab * x0 + sqrt_1_ab * noise
-        return x_t, noise
+        return x_t, noise  # noise is ε_true
 
-    def pred_x0_from_eps(self, x_t, t, eps):
-        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
-        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
+    def pred_x0_from_eps(self, x_t: torch.Tensor, t: torch.Tensor, eps: torch.Tensor):
+        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))   # √ᾱ
+        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))  # √(1-ᾱ)
         return (x_t - sigma * eps) / (alpha + 1e-12)
 
-    def pred_eps_from_x0(self, x_t, t, x0):
+    def pred_eps_from_x0(self, x_t: torch.Tensor, t: torch.Tensor, x0: torch.Tensor):
         alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         return (x_t - alpha * x0) / (sigma + 1e-12)
 
-    def pred_x0_from_v(self, x_t, t, v):
+    def pred_x0_from_v(self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor):
+        # x0 = α x_t − σ v
         alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         return alpha * x_t - sigma * v
 
-    def pred_eps_from_v(self, x_t, t, v):
+    def pred_eps_from_v(self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor):
+        # ε = σ x_t + α v
         alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         return sigma * x_t + alpha * v
 
-    def v_from_eps(self, x_t, t, eps):
+    def v_from_eps(self, x_t: torch.Tensor, t: torch.Tensor, eps: torch.Tensor):
+        # v = (ε − σ x_t) / α
         alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
         return (eps - sigma * x_t) / (alpha + 1e-12)
 
-    def to_x0(self, x_t, t, pred, param_type: str):
+    def to_x0(self, x_t: torch.Tensor, t: torch.Tensor, pred: torch.Tensor, param_type: str):
         if param_type == "eps":
             return self.pred_x0_from_eps(x_t, t, pred)
         elif param_type == "v":
@@ -128,7 +154,7 @@ class NoiseScheduler(nn.Module):
         else:
             raise ValueError("param_type must be 'eps', 'v', or 'x0'")
 
-    def to_eps(self, x_t, t, pred, param_type: str):
+    def to_eps(self, x_t: torch.Tensor, t: torch.Tensor, pred: torch.Tensor, param_type: str):
         if param_type == "eps":
             return pred
         elif param_type == "v":
@@ -139,25 +165,35 @@ class NoiseScheduler(nn.Module):
             raise ValueError("param_type must be 'eps', 'v', or 'x0'")
 
     @torch.no_grad()
-    def ddim_sigma(self, t, t_prev, eta: float):
-        ab_t = self._gather(self.alpha_bars, t)
-        ab_prev = self._gather(self.alpha_bars, t_prev)
-        sigma = eta * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t)) * torch.sqrt(1.0 - ab_t / (ab_prev + 1e-12))
+    def ddim_sigma(self, t: torch.Tensor, t_prev: torch.Tensor, eta: float) -> torch.Tensor:
+        ab_t = self._gather(self.alpha_bars, t).clamp(1e-12, 1.0)
+        ab_prev = self._gather(self.alpha_bars, t_prev).clamp(1e-12, 1.0)
+        sigma = eta * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t)) \
+                  * torch.sqrt((1.0 - (ab_t / (ab_prev + 1e-12))).clamp_min(0.0))
         return sigma.view(-1)
 
     @torch.no_grad()
-    def ddim_step_from(self, x_t, t, t_prev, pred, param_type: str, eta: float = 0.0, noise: torch.Tensor = None):
+    def ddim_step_from(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        t_prev: torch.Tensor,
+        pred: torch.Tensor,
+        param_type: str,
+        eta: float = 0.0,
+        noise: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if noise is None:
             noise = torch.randn_like(x_t)
-        ab_prev = self._gather(self.alpha_bars, t_prev).view(-1, *([1] * (x_t.dim() - 1)))
+
+        ab_prev = self._gather(self.alpha_bars, t_prev).view(-1, *([1] * (x_t.dim() - 1))).clamp(1e-12, 1.0)
         sigma = self.ddim_sigma(t, t_prev, eta).view(-1, *([1] * (x_t.dim() - 1)))
 
         x0_pred = self.to_x0(x_t, t, pred, param_type)
         eps_pred = self.to_eps(x_t, t, pred, param_type)
 
-        dir_coeff = torch.clamp((1.0 - ab_prev) - sigma ** 2, min=0.0)
-        dir_xt = torch.sqrt(dir_coeff) * eps_pred
-        x_prev = torch.sqrt(ab_prev) * x0_pred + dir_xt + sigma * noise
+        dir_coeff = ((1.0 - ab_prev) - sigma ** 2).clamp_min(0.0)
+        x_prev = torch.sqrt(ab_prev) * x0_pred + torch.sqrt(dir_coeff) * eps_pred + sigma * noise
         return x_prev
 
 
