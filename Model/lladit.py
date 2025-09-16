@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +14,7 @@ class LLapDiT(nn.Module):
     - Uses UnifiedGlobalSummarizer for multi-entity context (mode tied to LapFormer).
     - LapFormer does per-target temporal modeling in parallel or recurrent Laplace mode.
     """
+
     def __init__(self,
                  data_dim: int,
                  hidden_dim: int,
@@ -58,7 +58,7 @@ class LLapDiT(nn.Module):
         )
 
         # main LapFormer (mode tied to summarizer)
-                     
+
         self.model = LapFormer(
             input_dim=data_dim,
             hidden_dim=hidden_dim,
@@ -77,7 +77,7 @@ class LLapDiT(nn.Module):
     # Embeddings & conditioning
     # -------------------------------
     def _time_embed(self, t: torch.Tensor) -> torch.Tensor:
-        te = timestep_embedding(t, self.time_dim)    # [B, H]
+        te = timestep_embedding(t, self.time_dim)  # [B, H]
         return F.silu(te)
 
     def _maybe_build_cond(self, series, cond_summary=None, entity_ids=None,
@@ -117,34 +117,34 @@ class LLapDiT(nn.Module):
         # Pass dt to LapFormer (only used when lap_mode='recurrent')
         raw = self.model(x_t, t_emb, cond_summary=cond_summary, sc_feat=sc_feat, dt=dt)
         return raw
-                    
+
     # -------------------------------
     # Sampling
     # -------------------------------
-    
+
     @torch.no_grad()
     def generate(
-        self,
-        shape,
-        steps: int = 36,
-        guidance_strength=2.0,
-        guidance_power: float = 0.3,
-        eta: float = 0.0,
-        *,
-        series=None,
-        series_mask=None,
-        cond_summary=None,
-        entity_ids=None,
-        y_obs: torch.Tensor = None,
-        obs_mask: torch.Tensor = None,
-        dt: Optional[torch.Tensor] = None,
-        series_dt: Optional[torch.Tensor] = None,
-        series_diff: Optional[torch.Tensor] = None,
-        cfg_rescale: bool = True,
-        self_cond: bool = False,
-        rho: float = 7.0,
-        dynamic_thresh_p: float = 0.0,
-        dynamic_thresh_max: float = 1.0,
+            self,
+            shape,
+            steps: int = 36,
+            guidance_strength=2.0,
+            guidance_power: float = 2.0,
+            eta: float = 0.0,
+            *,
+            series=None,
+            series_mask=None,
+            cond_summary=None,
+            entity_ids=None,
+            y_obs: torch.Tensor = None,
+            obs_mask: torch.Tensor = None,
+            dt: Optional[torch.Tensor] = None,
+            series_dt: Optional[torch.Tensor] = None,
+            series_diff: Optional[torch.Tensor] = None,
+            cfg_rescale: bool = True,
+            self_cond: bool = False,
+            rho: float = 7.5,
+            dynamic_thresh_p: float = 0,
+            dynamic_thresh_max: float = 1.0,
     ):
         """
         Efficient DDIM sampler with Karras time selection and optional CFG rescale.
@@ -153,13 +153,13 @@ class LLapDiT(nn.Module):
         device = next(self.parameters()).device
         B, L, D = shape
         T = int(self.scheduler.timesteps)
-    
+
         # ---- build context once (dt/mask/diff aware) ----
         if (series is not None) and (cond_summary is None):
             cond_summary, _ = self.context(
                 series, pad_mask=None, dt=series_dt, ctx_diff=series_diff, entity_mask=series_mask
             )
-    
+
         # ---- vectorized Karras step indices (descending) ----
         ab = self.scheduler.alpha_bars.to(device)
         sigmas = torch.sqrt((1.0 - ab) / (ab + 1e-12))  # monotonically increasing w.r.t. t
@@ -175,13 +175,13 @@ class LLapDiT(nn.Module):
             pick_lower = (torch.abs(sigmas[idxm] - target) <= torch.abs(sigmas[idx] - target))
             idx = torch.where(pick_lower, idxm, idx)
             step_indices = torch.flip(torch.unique(idx, sorted=True), dims=[0])
-    
+
         ts_prev = torch.cat([step_indices[1:], step_indices.new_tensor([-1])])
-    
+
         # ---- helpers ----
         def _alpha_bar_batched(t_b: torch.Tensor) -> torch.Tensor:
             return self.scheduler._gather(self.scheduler.alpha_bars, t_b).view(B, 1, 1)
-    
+
         def _cfg(pred_u: torch.Tensor, pred_c: torch.Tensor, g_scalar: torch.Tensor, mask_scale=None) -> torch.Tensor:
             guided = pred_u + g_scalar * (pred_c - pred_u)
             if not cfg_rescale:
@@ -196,34 +196,34 @@ class LLapDiT(nn.Module):
                 # Smoothly reduce over-guidance on observed tokens
                 guided = pred_u + (1.0 + (g_scalar - 1.0) * mask_scale) * (pred_c - pred_u)
             return guided
-    
+
         def _dynamic_threshold(x0: torch.Tensor, p: float, max_val: float) -> torch.Tensor:
             if p <= 0.0:
                 return x0
             s = torch.quantile(x0.reshape(B, -1).abs(), q=p, dim=1).clamp_min(1.0).view(B, 1, 1)
             return (x0 / s).clamp_(-max_val, max_val)
-    
+
         # ---- init state (+ optional inpainting obs at t=T) ----
         x_t = torch.randn(B, L, D, device=device)
         sc_feat_next = torch.zeros_like(x_t) if self_cond else None
-    
+
         obs_u = None
         tar_scale = None
         if obs_mask is not None:
             obs = obs_mask.to(device=device, dtype=x_t.dtype)
             obs_u = obs.unsqueeze(-1)
             tar_scale = (1.0 - obs).unsqueeze(-1)
-    
+
         if (y_obs is not None) and (obs_u is not None):
             t0_b = step_indices[0].expand(B)
             x_T_obs, _ = self.scheduler.q_sample(y_obs.to(device=device, dtype=x_t.dtype), t0_b)
             x_t = obs_u * x_T_obs + (1.0 - obs_u) * x_t
-    
+
         # ---- main loop ----
         last_x0 = None
         for t_i, t_prev_i in zip(step_indices, ts_prev):
             t_b = torch.full((B,), int(t_i.item()), device=device, dtype=torch.long)
-    
+
             # unconditional / conditional passes
             pred_u = self.forward(
                 x_t, t_b,
@@ -237,7 +237,7 @@ class LLapDiT(nn.Module):
                 sc_feat=sc_feat_next if self_cond else None,
                 entity_ids=entity_ids, dt=dt, series_dt=series_dt, series_diff=series_diff
             )
-    
+
             # classifier-free guidance (optionally scheduled)
             if isinstance(guidance_strength, (tuple, list)):
                 g_min, g_max = guidance_strength
@@ -245,26 +245,26 @@ class LLapDiT(nn.Module):
                 g_scalar = g_min + (g_max - g_min) * (1.0 - ab) ** guidance_power
             else:
                 g_scalar = torch.as_tensor(float(guidance_strength), device=device).view(1, 1, 1).expand(B, 1, 1)
-    
+
             pred = _cfg(pred_u, pred_c, g_scalar, mask_scale=tar_scale)
-    
+
             # predict x0
             x0_hat = self.scheduler.to_x0(x_t, t_b, pred, param_type=self.predict_type)
-    
+
             # optional dynamic thresholding (disabled by default)
             x0_hat = _dynamic_threshold(x0_hat, dynamic_thresh_p, dynamic_thresh_max)
-    
+
             last_x0 = x0_hat
             if self_cond:
                 sc_feat_next = x0_hat.detach()
-    
+
             # time update
             if int(t_prev_i) >= 0:
                 tprev_b = torch.full((B,), int(t_prev_i.item()), device=device, dtype=torch.long)
                 x_t = self.scheduler.ddim_step_from(x_t, t_b, tprev_b, pred, param_type=self.predict_type, eta=eta)
             else:
                 x_t = x0_hat
-    
+
             # keep observed values consistent across steps
             if (y_obs is not None) and (obs_u is not None):
                 if int(t_prev_i) >= 0:
@@ -272,6 +272,5 @@ class LLapDiT(nn.Module):
                     x_t = obs_u * x_obs_t + (1.0 - obs_u) * x_t
                 else:
                     x_t = obs_u * y_obs.to(device=device, dtype=x_t.dtype) + (1.0 - obs_u) * x_t
-    
-        return last_x0 if last_x0 is not None else x_t
 
+        return last_x0 if last_x0 is not None else x_t
