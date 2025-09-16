@@ -350,8 +350,11 @@ def finetune_vae_decoder(
           f"guidance={guidance_strength}, power={guidance_power}, anchor={lambda_rec_anchor}")
 
     # --- Freeze encoder; train decoder only ---
-    for p in vae.parameters(): p.requires_grad = False
+    for p in vae.encoder.parameters(): p.requires_grad = False
     for p in vae.decoder.parameters(): p.requires_grad = True
+    for p in vae.mu_head.parameters(): p.requires_grad = False
+    for p in vae.logvar_head.parameters(): p.requires_grad = False
+
     vae.train()
 
     # --- Prepare diffusion model (teacher) ---
