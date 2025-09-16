@@ -353,36 +353,99 @@ def encode_mu_norm(vae, y_in: torch.Tensor, *,
     return mu_norm
 
 
-def diffusion_loss(model, scheduler, x0_lat_norm: torch.Tensor, t: torch.Tensor,
-                   *, cond_summary: Optional[torch.Tensor], predict_type: str = "v",
-                   weight_scheme: str = "none", minsnr_gamma: float = 5.0,
-                   sc_feat: Optional[torch.Tensor] = None,
-                   reuse_xt_eps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> torch.Tensor:
+from typing import Optional, Tuple
+import torch
+
+def diffusion_loss(
+    model,
+    scheduler,
+    x0_lat_norm: torch.Tensor,
+    t: torch.Tensor,
+    *,
+    cond_summary: Optional[torch.Tensor],
+    predict_type: str = "v",                 # "v" or "eps"
+    weight_scheme: str = "none",             # "none" or "weighted_min_snr"
+    minsnr_gamma: float = 5.0,
+    sc_feat: Optional[torch.Tensor] = None,
+    reuse_xt_eps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+) -> torch.Tensor:
     """
     MSE on v/eps with optional MinSNR weighting.
-    If reuse_xt_eps=(x_t, eps_true) is provided, use that instead of re-sampling.
+
+    Args:
+        model: callable(x_t, t, cond_summary=..., sc_feat=...) -> pred
+        scheduler: must provide q_sample(x0, t, noise) and v_from_eps(x_t, t, eps).
+                   For MinSNR weighting, either:
+                     - attribute `.alpha_bars` (1D tensor over discrete timesteps), or
+                     - method `.alpha_bar_at(t)` for continuous/discrete `t`.
+        x0_lat_norm: [B, ...] clean latents (normalized)
+        t: [B] timesteps (int or float tensor)
+        cond_summary: optional conditioning tensor
+        predict_type: "v" (default) or "eps"
+        weight_scheme: "none" (default) or "weighted_min_snr"
+        minsnr_gamma: gamma for MinSNR
+        sc_feat: optional side-channel features
+        reuse_xt_eps: (x_t, eps_true) to skip resampling
+
+    Returns:
+        Scalar loss tensor.
     """
+    # --- Forward diffusion (or reuse) ---
     if reuse_xt_eps is None:
         noise = torch.randn_like(x0_lat_norm)
         x_t, eps_true = scheduler.q_sample(x0_lat_norm, t, noise)
     else:
         x_t, eps_true = reuse_xt_eps
 
+    # --- Prediction target ---
     pred = model(x_t, t, cond_summary=cond_summary, sc_feat=sc_feat)
-    target = eps_true if predict_type == "eps" else scheduler.v_from_eps(x_t, t, eps_true)
+    if predict_type == "eps":
+        target = eps_true
+    elif predict_type == "v":
+        target = scheduler.v_from_eps(x_t, t, eps_true)
+    else:
+        raise ValueError(f"Unknown predict_type '{predict_type}'. Use 'v' or 'eps'.")
 
-    err = (pred - target).pow(2)  # [B,H,Z]
-    per_sample = err.mean(dim=1).sum(dim=1)  # [B]
+    # --- Per-sample MSE with full-mean reduction (resolution-invariant) ---
+    err = (pred - target).pow(2)                        # [B, ...]
+    reduce_dims = tuple(range(1, err.ndim))             # all non-batch dims
+    per_sample = err.mean(dim=reduce_dims)              # [B]
 
-    if weight_scheme == 'none':
+    if weight_scheme == "none":
         return per_sample.mean()
-    elif weight_scheme == 'weighted_min_snr':
-        abar = scheduler.alpha_bars[t]
-        snr = abar / (1.0 - abar).clamp_min(1e-8)
-        gamma = minsnr_gamma
-        w = torch.minimum(snr, torch.as_tensor(gamma, device=snr.device, dtype=snr.dtype))
-        w = w / (snr + 1.0)
-        return (w.detach() * per_sample).mean()
+
+    elif weight_scheme == "weighted_min_snr":
+        # --- Compute alpha_bar for each sample ---
+        # Prefer a scheduler method if available (supports continuous t)
+        if hasattr(scheduler, "alpha_bar_at") and callable(getattr(scheduler, "alpha_bar_at")):
+            abar = scheduler.alpha_bar_at(t)            # [B]
+        elif hasattr(scheduler, "alpha_bars"):
+            # Discrete timetable: gather per-sample by index
+            # Ensure integer indices
+            t_idx = t.long()
+            alpha_bars = scheduler.alpha_bars           # [T] tensor
+            if not torch.is_tensor(alpha_bars):
+                raise TypeError("scheduler.alpha_bars must be a tensor for discrete indexing.")
+            if t_idx.min() < 0 or t_idx.max() >= alpha_bars.numel():
+                raise IndexError("t has indices outside the range of scheduler.alpha_bars.")
+            abar = alpha_bars.to(x_t.device, x_t.dtype).index_select(0, t_idx)  # [B]
+        else:
+            raise AttributeError("Scheduler must provide alpha_bar_at(t) or alpha_bars.")
+
+        # --- SNR and MinSNR weight ---
+        abar = abar.clamp(1e-6, 1.0 - 1e-6)            # numerical stability
+        snr = abar / (1.0 - abar)                       # [B]
+        gamma = torch.as_tensor(minsnr_gamma, device=snr.device, dtype=snr.dtype)
+
+        w = torch.minimum(snr, gamma) / (snr + 1.0)     # [B]
+        w = w.detach()                                   # do not backprop through weights
+
+        # --- Weight-normalized loss to keep scale stable across gamma choices ---
+        w_mean = w.mean().clamp_min(1e-8)
+        return (w * per_sample).mean() / w_mean
+
+    else:
+        raise ValueError(f"Unknown weight_scheme '{weight_scheme}'. Use 'none' or 'weighted_min_snr'.")
 
 
 @torch.no_grad()
