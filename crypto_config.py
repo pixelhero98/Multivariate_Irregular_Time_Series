@@ -1,6 +1,9 @@
 
 # ============================ Data & Preprocessing ============================
 DATA_DIR = "/home/pyh/Documents/school/projects/yzn_ts/ldt/LLapDiT_Data/CRYPTO_130_data_ca"
+
+
+# --- Data Parameters ---
 WINDOW = 200           # Input sequence length (K)
 PRED = 5             # Target sequence length to predict (H)
 COVERAGE = 0.8
@@ -12,17 +15,15 @@ train_ratio=0.7
 val_ratio=0.1
 test_ratio=0.2
 
-# ============================ VAE (Encoder/Decoder) ============================
-VAE_DIR = './ldt/saved_model'
-VAE_CKPT = "./ldt/saved_model/PRED|CHANNEL_5|36_elbo.pt"
-
 # ======================= VAE Architecture =======================
-VAE_LATENT_CHANNELS = 36 # compress N (e.g., 130, 150, 200) to C (e.g., 16, 20, 24, 36)
-VAE_LATENT_DIM = 64       # d_model of Transformer-backbone vae
+VAE_LATENT_CHANNELS = 24 # compress N (e.g., 130, 150, 200) to C (e.g., 16, 20, 24, 36)
+VAE_LATENT_DIM = 128       # d_model of Transformer-backbone vae
 VAE_LAYERS = 3
 VAE_HEADS = 4
 VAE_FF = 256              # feed-forward dim of the Transformers
 VAE_DROPOUT = 0.0
+VAE_DIR = './ldt/saved_model'
+VAE_CKPT = f"./ldt/saved_model/pred-{PRED}_ch-{VAE_LATENT_CHANNELS}_elbo.pt"
 # --- VAE Fine-Tuning (Optional, after diffusion training) ---
 # Set DECODER_FT_EPOCHS = 0 to disable this step.
 VAE_LEARNING_RATE = 2e-4
@@ -64,7 +65,7 @@ MIN_LR = 0.9e-4
 WARMUP_FRAC = 0.06
 WEIGHT_DECAY = 9e-4
 GRAD_CLIP = 1.0
-EARLY_STOP = 100
+EARLY_STOP = 200
 
 # --- Regularization & Conditioning ---
 DROPOUT       = 0.1
