@@ -1,13 +1,12 @@
-# train_eval_dlinear.py
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F_nn
 from torch.cuda.amp import GradScaler, autocast
 
 import crypto_config
 from Dataset.fin_dataset import run_experiment
-from models.dlinear import DLinear
+from Baselines.dlinear import DLinear
 
 def device_of():
     if torch.cuda.is_available():
@@ -81,7 +80,7 @@ def run_epoch(dl, train: bool):
 
         with autocast(enabled=(device.type == "cuda")):
             y_hat = model(x_hist)                         # [Beff,H,1]
-            loss = F.mse_loss(y_hat, y_true)
+            loss = F_nn.mse_loss(y_hat, y_true)
 
         bs = y_true.size(0)
         if train:
