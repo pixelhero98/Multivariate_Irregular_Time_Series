@@ -1,18 +1,4 @@
 """
-Storage-light cache + ratio-split only dataloading.
-
-What this file changes vs your current module:
-- **No gigantic `train_X.npy`/`val_X.npy`/`test_X.npy` files.**
-- Caches only per-ticker feature matrices (float16) + small window indexes.
-- Keeps **only** ratio-based chronological splitting for loaders.
-- Windows are materialized **on the fly** from compact per-ticker arrays.
-- Optional date-aware batching kept (works off stored end-times).
-
-Disk impact (rule of thumb):
-    Old memmaps  : O(#windows * K * F * 4 bytes)
-    New indexcache: O(∑_tickers T * F * 2 bytes) + O(#windows * ~16 bytes)
-Typically this is ~K× smaller (often 50–100×).
-
 Drop-in path names (under data_dir):
     cache_ratio_index/
       ├── features_fp16/<asset_id>.npy        # [T,F] float16
@@ -22,30 +8,6 @@ Drop-in path names (under data_dir):
       ├── windows/end_times.npy               # [M]   datetime64[ns] (end-of-context)
       ├── meta.json                           # schema + feature cols + etc
       └── norm_stats.json                     # per-ticker mean/std for X & Y
-
-Usage (example):
-    from fin_data_prep_ratio_indexcache import (
-        FeatureConfig, CalendarConfig,
-        prepare_features_and_index_cache,
-        load_dataloaders_with_ratio_split,
-    )
-
-    # Once (build compact cache)
-    prepare_features_and_index_cache(
-        tickers=["AAPL","MSFT","AMZN"],
-        start="2012-01-01", end="2025-01-01",
-        window=64, horizon=5, data_dir="./data",
-        feature_cfg=FeatureConfig(...),
-        keep_time_meta="end",                # "none"|"end"|"full"
-        normalize_per_ticker=True,
-        clamp_sigma=5.0,
-    )
-
-    # Every run (ratio split)
-    train_dl, val_dl, test_dl, lengths = load_dataloaders_with_ratio_split(
-        data_dir="./data", batch_size=128, train_ratio=0.55, val_ratio=0.05, test_ratio=0.40,
-        n_entities=8, coverage_per_window=0.0, dates_per_batch=4,
-    )
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
