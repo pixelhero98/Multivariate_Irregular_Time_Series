@@ -5,8 +5,8 @@ from tqdm import tqdm
 from torch.cuda.amp import GradScaler, autocast
 from Dataset.fin_dataset import run_experiment
 from Latent_Space.latent_vae import LatentVAE
-from Model.lladit import LLapDiT
-from Model.lladit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_mask,
+from Model.llapdit import LLapDiT
+from Model.llapdit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_mask,
                                         make_warmup_cosine, calculate_v_variance,
                                         compute_latent_stats, diffusion_loss,
                                         build_context, flatten_targets,
