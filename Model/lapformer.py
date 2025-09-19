@@ -144,7 +144,10 @@ class LapFormer(nn.Module):
         self.hidden_dim = hidden_dim
         self.self_conditioning = self_conditioning
         self.lap_mode = _canon_mode(lap_mode)
-
+                     
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads for multi-head attention")
+            
         ks = [laplace_k] * num_layers if isinstance(laplace_k, int) else laplace_k
         assert len(ks) == num_layers, "laplace_k list must match num_layers"
 
@@ -165,10 +168,10 @@ class LapFormer(nn.Module):
         self.head_proj = nn.Linear(input_dim, input_dim)
         nn.init.zeros_(self.head_proj.weight); nn.init.zeros_(self.head_proj.bias)
 
-    def _pos(self, L: int, B: int, device: torch.device) -> torch.Tensor:
+    def _pos(self, L: int, B: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if self.pos_cache.shape[1] < L:
-            self.pos_cache = get_sinusoidal_pos_emb(L, self.hidden_dim, device=self.pos_cache.device)
-        return self.pos_cache[:, :L, :].to(device).expand(B, -1, -1)
+            self.pos_cache = get_sinusoidal_pos_emb(L, self.hidden_dim, device=self.pos_cache.device).to(dtype=self.pos_cache.dtype)
+        return self.pos_cache[:, :L, :].to(device=device, dtype=dtype).expand(B, -1, -1)
 
     def forward(self, x_tokens: torch.Tensor, t_vec: torch.Tensor,
                 cond_summary: Optional[torch.Tensor] = None,
@@ -176,12 +179,18 @@ class LapFormer(nn.Module):
                 dt: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, D = x_tokens.shape
         device = x_tokens.device
-        pos = self._pos(L, B, device)
+        if t_vec.dim() != 2 or t_vec.shape[0] != B or t_vec.shape[1] != self.hidden_dim:
+            raise ValueError(f"t_vec must be [B, hidden_dim]={B,self.hidden_dim}; got {tuple(t_vec.shape)}")
+        pos = self._pos(L, B, device, x_tokens.dtype)
 
         sc_add_H = self.self_cond_proj(sc_feat) if (self.self_conditioning and sc_feat is not None) else None
 
         kvs: List[Optional[torch.Tensor]] = [None] * len(self.blocks)
         if cond_summary is not None:
+            if cond_summary.dim() != 3 or cond_summary.shape[0] != B or cond_summary.shape[2] != self.hidden_dim:
+                raise ValueError(
+                    f"cond_summary must be [B, S, hidden_dim] with hidden_dim={self.hidden_dim}; got {tuple(cond_summary.shape)}"
+                )
             for i, k in enumerate(self.summary2lap):
                 s_lap = k(cond_summary)
                 kvs[i] = self.summary2hid[i](s_lap)
