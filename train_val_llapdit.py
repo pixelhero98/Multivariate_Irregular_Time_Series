@@ -5,14 +5,13 @@ from tqdm import tqdm
 from torch.cuda.amp import GradScaler, autocast
 from Dataset.fin_dataset import run_experiment
 from Latent_Space.latent_vae import LatentVAE
-from Model.lladit import LLapDiT
-from Model.cond_diffusion_utils import (EMA, set_torch, encode_mu_norm,
-                                        make_warmup_cosine, ewma_std,
-                                        calculate_v_variance, compute_latent_stats,
-                                        diffusion_loss, build_context,
-                                        flatten_targets, sample_t_uniform,
-                                        decode_latents_with_vae
-                                        )
+from Model.llapdit import LLapDiT
+from Model.llapdit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_mask,
+                                 make_warmup_cosine, calculate_v_variance,
+                                 compute_latent_stats, diffusion_loss,
+                                 build_context, flatten_targets,
+                                 sample_t_uniform, decode_latents_with_vae
+                                 )
 
 # ============================ Training setup ============================
 
@@ -38,29 +37,25 @@ assert Fv == Ft, f"Expected Fv == Ft, got {Fv} vs {Ft}"
 print("V:", V0.shape, "T:", T0.shape, "y:", yb0.shape)
 
 # ---- Estimate global latent stats (uses same window-normalization) ----
-VAE_CKPT = crypto_config.VAE_CKPT
 vae = LatentVAE(
-    input_dim=1, seq_len=crypto_config.PRED,
+    seq_len=crypto_config.PRED,
     latent_dim=crypto_config.VAE_LATENT_DIM,
     latent_channel=crypto_config.VAE_LATENT_CHANNELS,
     enc_layers=crypto_config.VAE_LAYERS, enc_heads=crypto_config.VAE_HEADS, enc_ff=crypto_config.VAE_FF,
     dec_layers=crypto_config.VAE_LAYERS, dec_heads=crypto_config.VAE_HEADS, dec_ff=crypto_config.VAE_FF
 ).to(device)
-if VAE_CKPT and os.path.isfile(VAE_CKPT):
-    ckpt = torch.load(VAE_CKPT, map_location=device)
+
+if os.path.isfile(crypto_config.VAE_CKPT):
+    ckpt = torch.load(crypto_config.VAE_CKPT, map_location=device)
     sd = ckpt.get("state_dict", ckpt)
-    vae.load_state_dict(sd, strict=False)
-    print("Loaded VAE checkpoint:", VAE_CKPT)
+    vae.load_state_dict(sd)
+    print("Loaded VAE checkpoint:", crypto_config.VAE_CKPT)
 
 vae.eval()
 for p in vae.parameters():
     p.requires_grad = False
 
-mu_mean, mu_std = compute_latent_stats(
-    vae, train_dl, device,
-    use_ewma=crypto_config.USE_EWMA,
-    ewma_lambda=crypto_config.EWMA_LAMBDA
-)
+mu_mean, mu_std = compute_latent_stats(vae, train_dl, device)
 
 # ---- Conditional diffusion model ----
 diff_model = LLapDiT(
@@ -80,9 +75,7 @@ v_variance = calculate_v_variance(
     dataloader=val_dl,
     vae=vae,
     device=device,
-    latent_stats=(mu_mean, mu_std),
-    use_ewma=crypto_config.USE_EWMA,
-    ewma_lambda=crypto_config.EWMA_LAMBDA
+    latent_stats=(mu_mean, mu_std)
 )
 print(f"calculated V-Prediction Target Variance: {v_variance:.4f}")
 print("=========================================================")
@@ -93,91 +86,12 @@ scheduler = diff_model.scheduler
 optimizer = torch.optim.AdamW(diff_model.parameters(),
                               lr=crypto_config.BASE_LR,
                               weight_decay=crypto_config.WEIGHT_DECAY)
-total_steps = crypto_config.EPOCHS * max(1, len(train_dl))
-lr_sched = make_warmup_cosine(optimizer, total_steps,
+lr_sched = make_warmup_cosine(optimizer, crypto_config.EPOCHS * max(1, len(train_dl)),
                               warmup_frac=crypto_config.WARMUP_FRAC,
                               base_lr=crypto_config.BASE_LR,
                               min_lr=crypto_config.MIN_LR)
 scaler = GradScaler(enabled=(device.type == "cuda"))
-
-
 # ============================ train/val loops ============================
-# def train_one_epoch(epoch: int):
-#     diff_model.train()
-#     running_loss = 0.0;
-#     num_samples = 0
-#     global global_step
-
-#     for xb, yb, meta in train_dl:
-#         V, T = xb
-#         mask_bn = meta["entity_mask"]
-
-#         cond_summary = build_context(diff_model, V, T, mask_bn, device)
-#         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-#         if y_in is None:
-#             continue
-
-#         cond_summary_flat = cond_summary[batch_ids]  # [Beff,S,Hm]
-#         mu_norm = encode_mu_norm(
-#             vae, y_in,
-#             use_ewma=crypto_config.USE_EWMA,
-#             ewma_lambda=crypto_config.EWMA_LAMBDA,
-#             mu_mean=mu_mean, mu_std=mu_std
-#         )
-
-#         # classifier-free guidance dropout (whole-batch mask)
-#         use_cond = (torch.rand(()) >= crypto_config.DROP_COND_P)
-#         cs = cond_summary_flat if use_cond else None
-
-#         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
-#         # sample once, reuse for SC and loss
-#         noise = torch.randn_like(mu_norm)
-#         x_t, eps_true = scheduler.q_sample(mu_norm, t, noise)
-
-#         # ---- self-conditioning (optional) ----
-#         sc_feat = None
-#         if (epoch >= crypto_config.SELF_COND_START_EPOCH
-#                 and torch.rand(()) < crypto_config.SELF_COND_P) and crypto_config.SELF_COND:
-#             with torch.no_grad():
-#                 pred_ng = diff_model(x_t, t, cond_summary=cs, sc_feat=None)  # <— x_t (no grads)
-#                 sc_feat = scheduler.to_x0(x_t, t, pred_ng, crypto_config.PREDICT_TYPE).detach()
-
-#         optimizer.zero_grad(set_to_none=True)
-#         with autocast(enabled=(device.type == "cuda")):
-#             loss = diffusion_loss(
-#                 diff_model, scheduler, mu_norm, t,
-#                 cond_summary=cs, predict_type=crypto_config.PREDICT_TYPE,
-#                 weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
-#                 minsnr_gamma=crypto_config.MINSNR_GAMMA,
-#                 sc_feat=sc_feat,
-#                 reuse_xt_eps=(x_t, eps_true),
-#             )
-
-#         if not torch.isfinite(loss):
-#             print("[warn] non-finite loss detected; skipping step")
-#             optimizer.zero_grad(set_to_none=True)
-#             continue
-
-#         scaler.scale(loss).backward()
-#         scaler.unscale_(optimizer)
-#         if getattr(crypto_config, "GRAD_CLIP", 0.0) and crypto_config.GRAD_CLIP > 0:
-#             nn.utils.clip_grad_norm_(diff_model.parameters(), crypto_config.GRAD_CLIP)
-#         scaler.step(optimizer);
-#         scaler.update()
-#         if ema is not None:
-#             ema.update(diff_model)
-#         lr_sched.step()
-
-#         # global_step += 1
-#         # # light-weight pole health logging
-#         # if global_step % 500 == 0:
-#         #     log_pole_health([diff_model], lambda m, step: _print_log(m, step, csv_path=None),
-#         #                     step=global_step, tag_prefix="train/")
-
-#         running_loss += loss.item() * mu_norm.size(0)
-#         num_samples += mu_norm.size(0)
-
-#     return running_loss / max(1, num_samples)
 def train_one_epoch(epoch: int):
     diff_model.train()
     running_loss = 0.0
@@ -196,15 +110,13 @@ def train_one_epoch(epoch: int):
         cond_summary_flat = cond_summary[batch_ids]  # [Beff,S,Hm]
         mu_norm = encode_mu_norm(
             vae, y_in,
-            use_ewma=crypto_config.USE_EWMA,
-            ewma_lambda=crypto_config.EWMA_LAMBDA,
             mu_mean=mu_mean, mu_std=mu_std
         )
 
         # --------- per-sample classifier-free dropout mask ---------
         Beff = mu_norm.size(0)
         p_drop = float(crypto_config.DROP_COND_P)
-        m_cond = (torch.rand(Beff, device=device) >= p_drop)    # True → conditioned
+        m_cond = (torch.rand(Beff, device=device) >= p_drop)
         idx_c = m_cond.nonzero(as_tuple=False).squeeze(1)
         idx_u = (~m_cond).nonzero(as_tuple=False).squeeze(1)
 
@@ -275,62 +187,6 @@ def train_one_epoch(epoch: int):
     return running_loss / max(1, num_samples)
 
 
-# @torch.no_grad()
-# def validate():
-#     diff_model.eval()
-#     total, count = 0.0, 0
-#     cond_gap_accum, cond_gap_batches = 0.0, 0
-
-#     if ema is not None:
-#         ema.store(diff_model)
-#         ema.copy_to(diff_model)
-#         # log_pole_health([diff_model], lambda m, step: _print_log(m, step, csv_path=None),
-#         #                 step=global_step, tag_prefix="val/")
-
-#     for xb, yb, meta in val_dl:
-#         V, T = xb
-#         mask_bn = meta["entity_mask"]
-
-#         cond_summary = build_context(diff_model, V, T, mask_bn, device)
-#         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-#         if y_in is None:
-#             continue
-#         cond_summary_flat = cond_summary[batch_ids]
-#         mu_norm = encode_mu_norm(
-#             vae, y_in,
-#             use_ewma=crypto_config.USE_EWMA,
-#             ewma_lambda=crypto_config.EWMA_LAMBDA,
-#             mu_mean=mu_mean, mu_std=mu_std
-#         )
-
-#         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
-#         loss = diffusion_loss(
-#             diff_model, scheduler, mu_norm, t,
-#             cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
-#         )
-#         total += loss.item() * mu_norm.size(0)
-#         count += mu_norm.size(0)
-
-#         # Conditional gap probe
-#         probe_n = min(128, mu_norm.size(0))
-#         if probe_n > 0:
-#             mu_p = mu_norm[:probe_n]
-#             cs_p = cond_summary_flat[:probe_n]
-#             t_p = sample_t_uniform(scheduler, probe_n, device)
-#             loss_cond = diffusion_loss(diff_model, scheduler, mu_p, t_p,
-#                                        cond_summary=cs_p, predict_type=crypto_config.PREDICT_TYPE).item()
-#             loss_unco = diffusion_loss(diff_model, scheduler, mu_p, t_p,
-#                                        cond_summary=None, predict_type=crypto_config.PREDICT_TYPE).item()
-#             cond_gap_accum += (loss_unco - loss_cond)
-#             cond_gap_batches += 1
-
-#     if ema is not None:
-#         ema.restore(diff_model)
-
-#     avg_val = total / max(1, count)
-#     cond_gap = (cond_gap_accum / cond_gap_batches) if cond_gap_batches > 0 else float("nan")
-
-#     return avg_val, cond_gap
 @torch.no_grad()
 def validate():
     diff_model.eval()
@@ -352,18 +208,14 @@ def validate():
         cond_summary_flat = cond_summary[batch_ids]
         mu_norm = encode_mu_norm(
             vae, y_in,
-            use_ewma=crypto_config.USE_EWMA,
-            ewma_lambda=crypto_config.EWMA_LAMBDA,
             mu_mean=mu_mean, mu_std=mu_std
         )
 
-        # main validation loss (use same weighting/minSNR as train)
+        # main validation loss
         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
         loss = diffusion_loss(
             diff_model, scheduler, mu_norm, t,
-            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE,
-            weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
-            minsnr_gamma=crypto_config.MINSNR_GAMMA,
+            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
         )
         total += loss.item() * mu_norm.size(0)
         count += mu_norm.size(0)
@@ -380,17 +232,13 @@ def validate():
             loss_cond = diffusion_loss(
                 diff_model, scheduler, mu_p, t_p,
                 cond_summary=cs_p, predict_type=crypto_config.PREDICT_TYPE,
-                weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
-                minsnr_gamma=crypto_config.MINSNR_GAMMA,
-                reuse_xt_eps=(x_t_p, eps_p),
+                reuse_xt_eps=(x_t_p, eps_p)
             ).item()
 
             loss_unco = diffusion_loss(
                 diff_model, scheduler, mu_p, t_p,
                 cond_summary=None, predict_type=crypto_config.PREDICT_TYPE,
-                weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
-                minsnr_gamma=crypto_config.MINSNR_GAMMA,
-                reuse_xt_eps=(x_t_p, eps_p),
+                reuse_xt_eps=(x_t_p, eps_p)
             ).item()
 
             cond_gap_accum += (loss_unco - loss_cond)
@@ -403,10 +251,11 @@ def validate():
     cond_gap = (cond_gap_accum / cond_gap_batches) if cond_gap_batches > 0 else float("nan")
     return avg_val, cond_gap
 
-# ============================ run ============================
-skip_with_trained_model = "./ldt/checkpoints/epoch_292_val_0.195497_cond_0.05251141956874302.pt"
 
-if skip_with_trained_model and os.path.exists(skip_with_trained_model):
+# ============================ run ============================
+skip_with_trained_model = crypto_config.TRAINED_LLapDiT
+
+if skip_with_trained_model and os.path.exists(skip_with_trained_model) and crypto_config.downstream:
     print(f"Skipping training. Loading model from: {skip_with_trained_model}")
     ckpt = torch.load(skip_with_trained_model, map_location=device)
 
@@ -428,6 +277,17 @@ else:
     if skip_with_trained_model:
         print(f"Model path not found: {skip_with_trained_model}. Starting training from scratch.")
 
+    # ckpt = torch.load(skip_with_trained_model, map_location=device)
+    #
+    # # Load model weights
+    # diff_model.load_state_dict(ckpt["model_state"])
+    # print("Loaded model state.")
+    #
+    # # Load EMA weights if they exist in the checkpoint and are enabled
+    # if ema is not None and "ema_state" in ckpt:
+    #     ema.load_state_dict(ckpt["ema_state"])
+    #     print("Loaded EMA state.")
+
     best_val = float("inf")
     patience = 0
     current_best_path = None
@@ -437,8 +297,8 @@ else:
         train_loss = train_one_epoch(epoch)
         val_loss, cond_gap = validate()
         Z = crypto_config.VAE_LATENT_CHANNELS
-        print(f"Epoch {epoch:03d} | train: {train_loss:.6f} (/Z: {train_loss / Z:.6f}) "
-              f"| val: {val_loss:.6f} (/Z: {val_loss / Z:.6f}) | cond_gap: {cond_gap:.6f}")
+        print(f"Epoch {epoch:03d} | train: {train_loss:.6f} "
+              f"| val: {val_loss:.6f} | cond_gap: {cond_gap * Z:.6f}")
 
         # checkpoint best (with EMA state)
         if val_loss < best_val:
@@ -449,7 +309,7 @@ else:
 
             ckpt_path = os.path.join(
                 crypto_config.CKPT_DIR,
-                f"epoch_{epoch:03d}_val_{val_loss / Z:.6f}_cond_{cond_gap}.pt"
+                f"mode-{crypto_config.LAP_MODE}-pred-{crypto_config.PRED}_ch-{crypto_config.VAE_LATENT_CHANNELS}_val_{val_loss:.6f}_cond_{cond_gap * Z}.pt"
             )
             save_payload = {
                 "epoch": epoch,
@@ -473,27 +333,7 @@ else:
                 print("Early stopping.")
                 break
 
-
 # ============================ Decoder finetune + regression eval ============================
-@torch.no_grad()
-def _flatten_for_mask(yb, mask_bn, device):
-    y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-    return y_in, batch_ids
-
-
-@torch.no_grad()
-def get_window_scale(vae, y_true, config):
-    """
-    Calculates the per-window standard deviation (scale) from the ground-truth target window.
-    This is a form of teacher forcing used during decoding.
-    """
-    _, mu_gt, _ = vae(y_true)  # Get latent of the true target window
-    if config.USE_EWMA:
-        s = ewma_std(mu_gt, lam=config.EWMA_LAMBDA)  # [Beff, 1, Z]
-    else:
-        s = mu_gt.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)
-    return s
-
 
 def finetune_vae_decoder(
         vae,
@@ -504,7 +344,7 @@ def finetune_vae_decoder(
         *,
         mu_mean,
         mu_std,
-        config,  # Pass config object for parameters
+        config,
         ema=None,
         epochs: int = 3,
         lr: float = 1e-4,
@@ -513,7 +353,6 @@ def finetune_vae_decoder(
         guidance_strength: float = 2.0,
         guidance_power: float = 0.3,
         lambda_rec_anchor: float = 0.25,
-        use_gt_window_scale: False
 ):
     """
     Fine-tune ONLY the VAE decoder to adapt to the diffusion model's generated latent x0_norm.
@@ -522,8 +361,10 @@ def finetune_vae_decoder(
           f"guidance={guidance_strength}, power={guidance_power}, anchor={lambda_rec_anchor}")
 
     # --- Freeze encoder; train decoder only ---
-    for p in vae.parameters(): p.requires_grad = False
+    for p in vae.encoder.parameters(): p.requires_grad = False
     for p in vae.decoder.parameters(): p.requires_grad = True
+    for p in vae.mu_head.parameters(): p.requires_grad = False
+    for p in vae.logvar_head.parameters(): p.requires_grad = False
     vae.train()
 
     # --- Prepare diffusion model (teacher) ---
@@ -562,16 +403,16 @@ def finetune_vae_decoder(
 
                 # ---- Forward decoder on generated latents ----
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                s = get_window_scale(vae, y_true, config) if use_gt_window_scale else None
                 y_hat_gen = decode_latents_with_vae(
-                    vae, x0_norm_gen.detach(), mu_mean=mu_mean, mu_std=mu_std, window_scale=s
+                    vae, x0_norm_gen.detach(), mu_mean=mu_mean, mu_std=mu_std
                 )
                 loss_gen = mse(y_hat_gen, y_true)
 
                 # ---- Teacher-forced anchor loss ----
                 with torch.no_grad():
-                    _, mu_enc, _ = vae(y_true)
-                y_hat_rec = vae.decoder(mu_enc.detach(), encoder_skips=None)
+                    _, mu_enc, logvar_enc = vae(y_true)
+                    z_enc = vae.reparameterize(mu_enc, logvar_enc)
+                y_hat_rec = vae.decoder(z_enc.detach(), encoder_skips=None)
                 loss_anchor = mse(y_hat_rec, y_true)
 
                 loss = loss_gen + lambda_rec_anchor * loss_anchor
@@ -626,8 +467,6 @@ def evaluate_regression(
         dict with keys:
             crps, mae, mse, num_samples, aggregation, pinball (dict {q: loss})
     """
-    import torch
-
     if aggregation_method not in ['mean', 'median']:
         raise ValueError("aggregation_method must be either 'mean' or 'median'")
     if not all(0.0 < float(q) < 1.0 for q in quantiles):
@@ -642,7 +481,7 @@ def evaluate_regression(
     # Element-wise accumulators for pinball losses per quantile
     pinball_sums = {float(q): 0.0 for q in quantiles}
 
-    num_samples = int(getattr(config, "NUM_EVAL_SAMPLES", 1))
+    num_samples = config.NUM_EVAL_SAMPLES
     if num_samples <= 1 and aggregation_method == 'median':
         print("Warning: Median aggregation is more meaningful with num_samples > 1.")
 
@@ -666,7 +505,8 @@ def evaluate_regression(
 
         Beff, Hcur, Z = y_in.size(0), y_in.size(1), config.VAE_LATENT_CHANNELS
 
-        # ---- Generate multiple samples in latent space and decode (no GT-scale at eval) ----
+        # ---- Generate multiple samples in latent space and decode ----
+
         all_y_hats = []
         for _ in range(num_samples):
             x0_norm = diff_model.generate(
@@ -675,12 +515,8 @@ def evaluate_regression(
                 cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
             )
 
-            if getattr(config, "DECODE_USE_GT_SCALE", False) and not warned_no_gt_scale:
-                print("Warning: DECODE_USE_GT_SCALE is True in config, but disabled during evaluation to avoid leakage.")
-                warned_no_gt_scale = True
-
             y_hat_sample = decode_latents_with_vae(
-                vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std, window_scale=None
+                vae, x0_norm, mu_mean=mu_mean, mu_std=mu_std
             )
             all_y_hats.append(y_hat_sample)
 
@@ -710,15 +546,13 @@ def evaluate_regression(
             diffs = (all_samples.unsqueeze(0) - all_samples.unsqueeze(1)).abs()  # [M,M,B,H,C]
             iu = torch.triu_indices(M, M, offset=1, device=diffs.device)
             diffs_ij = diffs[iu[0], iu[1], ...]                                   # [M*(M-1)/2,B,H,C]
-            term2 = (2.0 / (M * (M - 1))) * diffs_ij.mean(dim=0)                  # [B,H,C]
+            term2 = diffs_ij.mean(dim=0)                # [B,H,C]
 
         batch_crps = (term1 - 0.5 * term2).mean().item()
         crps_sum += batch_crps * Beff
         n += Beff
 
         # ---- Pinball (quantile) loss ----
-        # Compute predictive quantiles from the sample set, then apply quantile loss vs y_in.
-        # y_q: [B,H,C] for each q
         for q in quantiles:
             q = float(q)
             y_q = torch.quantile(all_samples, q, dim=0, interpolation="linear")   # [B,H,C]
@@ -766,8 +600,7 @@ if True:
             gen_steps=crypto_config.GEN_STEPS,
             guidance_strength=crypto_config.GUIDANCE_STRENGTH,
             guidance_power=crypto_config.GUIDANCE_POWER,
-            lambda_rec_anchor=crypto_config.DECODER_FT_ANCHOR,
-            use_gt_window_scale=crypto_config.DECODE_USE_GT_SCALE
+            lambda_rec_anchor=crypto_config.DECODER_FT_ANCHOR
         )
 
     # Evaluate conditional regression on test set
@@ -777,6 +610,6 @@ if True:
         steps=crypto_config.GEN_STEPS,
         guidance_strength=crypto_config.GUIDANCE_STRENGTH,
         guidance_power=crypto_config.GUIDANCE_POWER,
-        aggregation_method='median',
+        aggregation_method='mean',
         quantiles=(0.1, 0.5, 0.9)
     )
