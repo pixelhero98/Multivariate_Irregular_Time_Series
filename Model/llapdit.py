@@ -183,19 +183,22 @@ class LLapDiT(nn.Module):
             return self.scheduler._gather(self.scheduler.alpha_bars, t_b).view(B, 1, 1)
 
         def _cfg(pred_u: torch.Tensor, pred_c: torch.Tensor, g_scalar: torch.Tensor, mask_scale=None) -> torch.Tensor:
-            guided = pred_u + g_scalar * (pred_c - pred_u)
+            if mask_scale is not None:
+                g_eff = (1.0 + (g_scalar - 1.0) * mask_scale).to(pred_u.dtype)
+            else:
+                g_eff = g_scalar.to(pred_u.dtype)
+            guided = pred_u + g_eff * (pred_c - pred_u)
+            
             if not cfg_rescale:
                 return guided
             reduce_dims = (1, 2)
+            
             mu_c = pred_c.mean(dim=reduce_dims, keepdim=True)
             std_c = pred_c.std(dim=reduce_dims, keepdim=True).clamp_min(1e-6)
             mu_g = guided.mean(dim=reduce_dims, keepdim=True)
             std_g = guided.std(dim=reduce_dims, keepdim=True).clamp_min(1e-6)
-            guided = (guided - mu_g) / std_g * std_c + mu_c
-            if mask_scale is not None:
-                # Smoothly reduce over-guidance on observed tokens
-                guided = pred_u + (1.0 + (g_scalar - 1.0) * mask_scale) * (pred_c - pred_u)
-            return guided
+
+            return (guided - mu_g) / std_g * std_c + mu_c
 
         def _dynamic_threshold(x0: torch.Tensor, p: float, max_val: float) -> torch.Tensor:
             if p <= 0.0:
