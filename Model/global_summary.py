@@ -17,7 +17,7 @@ def _canon_mode(mode: str) -> str:
 
 
 class TVHead(nn.Module):
-    def __init__(self, feat_dim: int, hidden: int):
+    def __init__(self, feat_dim: int, hidden: int = 32):
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(feat_dim),
@@ -125,7 +125,8 @@ class ParallelLaplaceSummarizer(nn.Module):
         Q = self.queries.unsqueeze(0).expand(B, -1, -1)
         summary, attn_weights = self.mha(Q, memory, values,
                                          key_padding_mask=key_padding_mask,
-                                         average_attn_weights=False)  # Get per-head weights
+                                         attn_mask=attn_bias,
+                                         average_attn_weights=False)
 
         summary = self.norm(self.dropout(summary) + Q)
 
