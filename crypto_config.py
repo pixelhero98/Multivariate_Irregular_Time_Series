@@ -1,16 +1,15 @@
-
 # ============================ Data & Preprocessing ============================
-DATA_DIR = "/home/pyh/Documents/school/projects/yzn_ts/ldt/LLapDiT_Data/CRYPTO_130_data_ca"
-
+DATA_DIR = "/home/pyh/Documents/school/projects/yzn_ts/ldt/LLapDiT_Data/NAS+NYS_200_data"
+MKT = DATA_DIR[60:-5]
 
 # --- Data Parameters ---
-WINDOW = 200           # Input sequence length (K)
 PRED = 5             # Target sequence length to predict (H)
+WINDOW = 200           # Conditional input sequence length (K)
 COVERAGE = 0.8
 date_batching=True
 
 # --- Dataloader Parameters ---
-BATCH_SIZE = 5
+BATCH_SIZE = 15
 train_ratio=0.7
 val_ratio=0.1
 test_ratio=0.2
@@ -22,8 +21,8 @@ VAE_LAYERS = 3
 VAE_HEADS = 4
 VAE_FF = 256              # feed-forward dim of the Transformers
 VAE_DROPOUT = 0.0
-VAE_DIR = './ldt/saved_model'
-VAE_CKPT = f"./ldt/saved_model/pred-{PRED}_ch-{VAE_LATENT_CHANNELS}_elbo.pt"
+VAE_DIR = './ldt/saved_model/' + MKT
+VAE_CKPT = "./ldt/saved_model/" + MKT + f"/pred-{PRED}_ch-{VAE_LATENT_CHANNELS}_elbo.pt"
 # --- VAE Fine-Tuning (Optional, after diffusion training) ---
 # Set DECODER_FT_EPOCHS = 0 to disable this step.
 VAE_LEARNING_RATE = 2e-4
@@ -35,19 +34,19 @@ DECODER_FT_EPOCHS = 20
 DECODER_FT_LR = 2e-4
 
 # ============================ Diffusion Model (LLapDiT) ============================
-CKPT_DIR = "./ldt/checkpoints"
+CKPT_DIR = "./ldt/checkpoints/" + MKT
 
 # --- Diffusion Process ---
 TIMESTEPS     = 1200
 # Recommended to try "cosine", as it pairs well with v-prediction.
-SCHEDULE      = "linear"     # ["cosine", "linear"]
+SCHEDULE      = "cosine"     # ["cosine", "linear"]
 PREDICT_TYPE  = "v"          # ["v", "eps"]
 
 # --- Loss Function ---
 # 'weighted_min_snr' is highly recommended. Set to 'none' to disable.
 LOSS_WEIGHT_SCHEME = 'weighted_min_snr'
 # The gamma parameter for min-SNR weighting. A value of 5.0 is a common starting point.
-MINSNR_GAMMA = 5.0
+MINSNR_GAMMA = 5.5
 
 # --- LLapDiT Architecture ---
 MODEL_WIDTH   = 256
@@ -56,7 +55,7 @@ NUM_HEADS     = 4
 LAPLACE_K     = 64
 GLOBAL_K      = 256
 CONTEXT_LEN   = 2 * PRED if PRED <= 100 else 200 # Learned summary tokens
-LAP_MODE      = 'parallel'    # or 'recurrent'
+LAP_MODE      = 'recurrent'   # 'parallel' or 'recurrent (support irregular sampling interval, with time-varying Lap basis updates)'
 
 # ============================ Training Hyperparameters ============================
 EPOCHS = 1500
@@ -68,10 +67,10 @@ GRAD_CLIP = 1.0
 EARLY_STOP = 200
 
 # --- Regularization & Conditioning ---
-DROPOUT       = 0.1
-ATTN_DROPOUT  = 0.1
+DROPOUT       = 0.05
+ATTN_DROPOUT  = 0.05
 # Probability of dropping conditioning for Classifier-Free Guidance.
-DROP_COND_P   = 0.11
+DROP_COND_P   = 0.12
 
 # --- Self-Conditioning ---
 SELF_COND     = False
