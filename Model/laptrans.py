@@ -172,8 +172,8 @@ class LearnableLaplacianBasis(nn.Module):
         u = self.proj(x)                     # [B,T,k]
 
         # z_t = rho_t * e^{i theta_t} * z_{t-1} + u_t
-        C = torch.empty(B, T, k, dtype=u.dtype, device=device)
-        S = torch.empty(B, T, k, dtype=u.dtype, device=device)
+        c_hist = []
+        s_hist = []
         c = torch.zeros(B, k, dtype=u.dtype, device=device)
         s = torch.zeros(B, k, dtype=u.dtype, device=device)
         for t in range(T):
@@ -181,7 +181,11 @@ class LearnableLaplacianBasis(nn.Module):
             ct = cos_t[:, t, :]
             st = sin_t[:, t, :]
             c, s = rt * (c * ct - s * st) + u[:, t, :], rt * (c * st + s * ct)
-            C[:, t, :], S[:, t, :] = c, s
+            c_hist.append(c)
+            s_hist.append(s)
+
+        C = torch.stack(c_hist, dim=1)
+        S = torch.stack(s_hist, dim=1)
 
         return torch.cat([C, S], dim=2).contiguous()
 
