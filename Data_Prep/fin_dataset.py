@@ -86,10 +86,19 @@ class FeatureConfig:
     include_gap: bool = False
     include_hl_range: bool = False
     target_field: str = "Close"     # used for Y
-    if_calendar: Optional[bool] = True
-    calendar: CalendarConfig = field(default_factory=CalendarConfig) if if_calendar else None
+    if_calendar: bool = True
+    calendar: Optional[CalendarConfig] = None
     include_entity_id_feature: bool = False
 
+
+def __post_init__(self) -> None:
+        """Ensure calendar configuration respects the calendar toggle."""
+        if self.if_calendar:
+            if self.calendar is None:
+                self.calendar = CalendarConfig()
+        else:
+            self.calendar = None
+            
 # --------------------- Lightweight stores ---------------------
 
 def _indexcache_dir(data_dir: str) -> str:
@@ -292,8 +301,9 @@ def prepare_features_and_index_cache(
         if proxy_ret is not None:
             feat['MKT'] = proxy_ret.reindex(df.index)
         out = pd.DataFrame(feat)
-        cal = build_calendar_frame(out.index, feature_cfg.calendar)
-        out = pd.concat([out, cal], axis=1)
+        if feature_cfg.if_calendar and feature_cfg.calendar is not None:
+            cal = build_calendar_frame(out.index, feature_cfg.calendar)
+            out = pd.concat([out, cal], axis=1)
         out = out.dropna()
         # enforce float32 now, will save to float16 later
         for c in out.columns:
