@@ -52,14 +52,13 @@ class FeatureConfig:
     calendar: Optional[CalendarConfig] = None
     include_entity_id_feature: bool = False
 
-
-def __post_init__(self) -> None:
-        """Ensure calendar configuration respects the calendar toggle."""
-        if self.if_calendar:
-            if self.calendar is None:
-                self.calendar = CalendarConfig()
-        else:
-            self.calendar = None
+    def __post_init__(self) -> None:
+            """Ensure calendar configuration respects the calendar toggle."""
+            if self.if_calendar:
+                if self.calendar is None:
+                    self.calendar = CalendarConfig()
+            else:
+                self.calendar = None
             
 # --------------------- Lightweight stores ---------------------
 
