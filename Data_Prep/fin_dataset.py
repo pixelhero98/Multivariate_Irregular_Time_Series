@@ -1001,6 +1001,21 @@ def load_dataloaders_with_ratio_split(
     tr_pairs = pairs[assign == 0]
     va_pairs = pairs[assign == 1]
     te_pairs = pairs[assign == 2]
+
+    # ---- Train-only normalization (optional) ----
+    if isinstance(norm_scope, str) and norm_scope.lower() == "train_only":
+        per_ticker_flag = bool(norm_stats.get('per_ticker', meta.get('normalize_per_ticker', True)))
+        feature_dim = len(meta.get('feature_cols', []))
+        tr_norm = _compute_train_only_norm_stats(
+            data_dir=data_dir,
+            assets=assets,
+            tr_pairs=tr_pairs,
+            window=window,
+            per_ticker=per_ticker_flag,
+            feature_dim=feature_dim,
+        )
+        if tr_norm is not None:
+            norm_stats = tr_norm
     
     ds_tr = _IndexBackedDataset(tr_pairs, assets, data_dir, window, horizon, regression,
                                 keep_time_meta, norm_stats, clamp_sigma=float(meta.get('clamp_sigma', 5.0)))
@@ -1108,4 +1123,5 @@ def run_experiment(
         window=K,
         horizon=H,
     )
+
     return train_dl, val_dl, test_dl, lengths
