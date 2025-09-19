@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 def _canon_mode(mode: str) -> str:
     m = mode.lower()
     if m in {"parallel"}:
@@ -23,6 +24,7 @@ class TVHead(nn.Module):
             nn.Linear(feat_dim, hidden), nn.GELU(),
             nn.Linear(hidden, 1)
         )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x).squeeze(-1)
 
@@ -68,11 +70,11 @@ class ParallelLaplaceSummarizer(nn.Module):
                                          dropout=dropout, batch_first=True)
 
     def forward(self,
-                x: torch.Tensor,                    # [B,T,N,D]
+                x: torch.Tensor,  # [B,T,N,D]
                 pad_mask: Optional[torch.Tensor] = None,  # [B,T] ignore, using entity mask
-                dt: torch.Tensor = None,            # accepted but ignored
-                ctx_diff: torch.Tensor = None,      # [B,T,N,D]
-                entity_mask: Optional[torch.Tensor] = None, # must pass
+                dt: torch.Tensor = None,  # accepted but ignored
+                ctx_diff: torch.Tensor = None,  # [B,T,N,D]
+                entity_mask: Optional[torch.Tensor] = None,  # must pass
                 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         B, T, N, D = x.shape
         device = x.device
@@ -103,12 +105,14 @@ class ParallelLaplaceSummarizer(nn.Module):
         b = F.softplus(self.w_t_raw)
         L = a * L_v + b * L_t
         if self.zero_first_step:
-            L = L.clone(); L[:, :1, :] = 0
+            L = L.clone();
+            L[:, :1, :] = 0
 
         if self.add_guidance_tokens:
             lap_tokens = self.lap_token_proj(L)  # [B,T,H]
             if self.zero_first_step:
-                lap_tokens = lap_tokens.clone(); lap_tokens[:, :1, :] = 0
+                lap_tokens = lap_tokens.clone();
+                lap_tokens[:, :1, :] = 0
             memory = torch.cat([K, lap_tokens], dim=1)
             values = memory
             key_padding_mask = (None if pad_mask is None else
@@ -121,18 +125,18 @@ class ParallelLaplaceSummarizer(nn.Module):
         Q = self.queries.unsqueeze(0).expand(B, -1, -1)
         summary, attn_weights = self.mha(Q, memory, values,
                                          key_padding_mask=key_padding_mask,
-                                         average_attn_weights=False) # Get per-head weights
-                                         
+                                         average_attn_weights=False)  # Get per-head weights
+
         summary = self.norm(self.dropout(summary) + Q)
 
         # Store all useful intermediate tensors for visualization and debugging
         aux = {
-            "V_sig": V_sig,              # Raw value signal (pre-Laplace)
-            "T_sig": T_sig,              # Raw temporal signal (pre-Laplace)
-            "lap_guidance": L,           # Final combined Laplace features
-            "w_v": a.detach(),           # Learned weight for the value signal
-            "w_t": b.detach(),           # Learned weight for the temporal signal
-            "attn_weights": attn_weights   # Per-head attention weights [B, H, Lq, T_memory]
+            "V_sig": V_sig,  # Raw value signal (pre-Laplace)
+            "T_sig": T_sig,  # Raw temporal signal (pre-Laplace)
+            "lap_guidance": L,  # Final combined Laplace features
+            "w_v": a.detach(),  # Learned weight for the value signal
+            "w_t": b.detach(),  # Learned weight for the temporal signal
+            "attn_weights": attn_weights  # Per-head attention weights [B, H, Lq, T_memory]
         }
         return summary, aux
 
@@ -147,7 +151,7 @@ class PolewiseDiff(nn.Module):
         if physics_tied:
             self.register_buffer("alpha0", torch.ones(k))
             self.register_buffer("omega0", torch.zeros(k))
-            self.register_buffer("tau0",   torch.ones(1))
+            self.register_buffer("tau0", torch.ones(1))
             self.residual = nn.Parameter(torch.zeros(k, 2, 2))
             nn.init.normal_(self.residual, std=residual_scale)
         else:
@@ -209,8 +213,8 @@ class SecondOrderLaplaceCombinerPolewise(nn.Module):
 
         self.num_head = nn.Sequential(
             nn.LayerNorm(4),
-            nn.Linear(4, 8), nn.GELU(),
-            nn.Linear(8, 4)
+            nn.Linear(4, 16), nn.GELU(),
+            nn.Linear(16, 4)
         )
 
     @staticmethod
@@ -321,6 +325,7 @@ class RecurrentLaplaceSummarizer(nn.Module):
                  out_len: int,
                  num_heads: int = 4,
                  lap_k: int = 8,
+                 tv_dim: int = 32,
                  dropout: float = 0.0,
                  add_guidance_tokens: bool = True,
                  physics_tied_derivative: bool = True,
@@ -337,8 +342,8 @@ class RecurrentLaplaceSummarizer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_dim)
 
-        self.v_head = TVHead(feat_dim)
-        self.t_head = TVHead(feat_dim)
+        self.v_head = TVHead(feat_dim, tv_dim)
+        self.t_head = TVHead(feat_dim, tv_dim)
 
         self.ode_lap = SecondOrderLaplaceCombinerPolewise(
             num_entities=num_entities, k=lap_k,
@@ -360,12 +365,12 @@ class RecurrentLaplaceSummarizer(nn.Module):
         return torch.diff(x, dim=1, prepend=x[:, :1])
 
     def forward(self,
-            x: torch.Tensor,  # [B,T,N,D]
-            pad_mask: Optional[torch.Tensor] = None,
-            dt: torch.Tensor = None,
-            ctx_diff: torch.Tensor = None,
-            entity_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+                x: torch.Tensor,  # [B,T,N,D]
+                pad_mask: Optional[torch.Tensor] = None,
+                dt: torch.Tensor = None,
+                ctx_diff: torch.Tensor = None,
+                entity_mask: Optional[torch.Tensor] = None,
+                ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
         B, T, N, D = x.shape
         device = x.device
@@ -392,7 +397,7 @@ class RecurrentLaplaceSummarizer(nn.Module):
             else:
                 Tfeat = Tfeat * mN
         T_sig = self.t_head(Tfeat)
-        
+
         L, lap_aux = self.ode_lap(T_sig, V_sig, dt=dt, entity_mask=mN)
 
         if self.zero_first_step:
@@ -401,7 +406,8 @@ class RecurrentLaplaceSummarizer(nn.Module):
         film = self.lap_to_film(L)
         gamma, beta = torch.chunk(film, 2, dim=-1)
         if self.zero_first_step:
-            gamma = gamma.clone(); beta = beta.clone()
+            gamma = gamma.clone();
+            beta = beta.clone()
             gamma[:, :1, :] = 0
             beta[:, :1, :] = 0
         K = (1.0 + gamma) * K + beta
@@ -409,7 +415,8 @@ class RecurrentLaplaceSummarizer(nn.Module):
 
         bias_ht = self.lap_to_bias(L)
         if self.zero_first_step:
-            bias_ht = bias_ht.clone(); bias_ht[:, :1, :] = 0
+            bias_ht = bias_ht.clone();
+            bias_ht[:, :1, :] = 0
         Lq = self.queries.shape[0]
         attn_bias = bias_ht.permute(0, 2, 1).unsqueeze(2).expand(B, self.num_heads, Lq, T)
         attn_bias = attn_bias.reshape(B * self.num_heads, Lq, T).to(K.dtype)
@@ -432,19 +439,19 @@ class RecurrentLaplaceSummarizer(nn.Module):
             key_padding_mask = None if pad_mask is None else pad_mask.to(torch.bool)
 
         Q = self.queries.unsqueeze(0).expand(B, -1, -1)
-        summary, _ = self.mha(Q, memory, values,
+        summary, attn_weights = self.mha(Q, memory, values,
                               key_padding_mask=key_padding_mask,
                               attn_mask=attn_bias,
                               average_attn_weights=False)
         summary = self.norm(self.dropout(summary) + Q)
 
         aux = {
-            "T_sig": T_sig,              # Raw temporal signal (pre-Laplace)
-            "V_sig": V_sig,              # Raw value signal (pre-Laplace)
-            "lap_guidance": L,           # Final combined Laplace features
-            "attn_bias": bias_ht,        # Learned attention bias from Laplace features
-            "attn_weights": attn_weights, # Per-head attention weights [B, H, Lq, T_memory]
-            **lap_aux                    # Includes LT, LV, LdT, LdV, and ODE coefficients
+            "T_sig": T_sig,  # Raw temporal signal (pre-Laplace)
+            "V_sig": V_sig,  # Raw value signal (pre-Laplace)
+            "lap_guidance": L,  # Final combined Laplace features
+            "attn_bias": bias_ht,  # Learned attention bias from Laplace features
+            "attn_weights": attn_weights,  # Per-head attention weights [B, H, Lq, T_memory]
+            **lap_aux  # Includes LT, LV, LdT, LdV, and ODE coefficients
         }
         return summary, aux
 
