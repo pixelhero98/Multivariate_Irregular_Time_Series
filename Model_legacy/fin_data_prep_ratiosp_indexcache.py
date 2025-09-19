@@ -754,26 +754,33 @@ def _compute_train_only_norm_stats(
     assets: List[str],
     tr_pairs: np.ndarray,    # [Nt,2] (aid, start)
     window: int,
+    horizon: int,
     per_ticker: bool,
     feature_dim: int,
 ) -> dict | None:
     """
     Compute mean/std for X and Y using ONLY rows that can appear in TRAIN contexts.
-    For asset a: use prefix up to max_train_end_idx[a] = max(start + window - 1) across train windows.
+    For asset a: use feature prefixes up to max(start + window - 1) and targets up to
+    max(start + window + horizon - 1) across train windows.
     Returns a dict like norm_stats.json or None if no train rows exist.
     """
     import numpy as _np
     import os as _os
 
-    last_end = _np.full(len(assets), -1, dtype=_np.int64)
+    last_ctx_end = _np.full(len(assets), -1, dtype=_np.int64)
+    last_label_end = _np.full(len(assets), -1, dtype=_np.int64)
+    eff_horizon = int(max(horizon, 0))
     if tr_pairs.size > 0:
         aids = tr_pairs[:, 0].astype(_np.int64)
         ends = tr_pairs[:, 1].astype(_np.int64) + (window - 1)
-        for a, e in zip(aids, ends):
-            if e > last_end[a]:
-                last_end[a] = e
+        for a, ctx_end in zip(aids, ends):
+            if ctx_end > last_ctx_end[a]:
+                last_ctx_end[a] = ctx_end
+            label_end = ctx_end if eff_horizon == 0 else ctx_end + eff_horizon
+            if label_end > last_label_end[a]:
+                last_label_end[a] = label_end
 
-    has_train = last_end >= 0
+    has_train = last_ctx_end >= 0
 
     if per_ticker:
         mean_x, std_x, mean_y, std_y = [], [], [], []
@@ -781,6 +788,7 @@ def _compute_train_only_norm_stats(
         g_count = 0
         g_sum = _np.zeros((feature_dim,), dtype=_np.float64)
         g_sumsq = _np.zeros((feature_dim,), dtype=_np.float64)
+        g_y_count = 0
         g_y_sum = 0.0
         g_y_sumsq = 0.0
 
@@ -796,15 +804,18 @@ def _compute_train_only_norm_stats(
             if has_train[aid]:
                 Xf = _np.load(fp, mmap_mode='r').astype(_np.float32)
                 Yf = _np.load(yp, mmap_mode='r').astype(_np.float32)
-                upto = int(last_end[aid]) + 1
-                Xp = Xf[:upto, :]
-                Yp = Yf[:upto]
+                upto_x = int(last_ctx_end[aid]) + 1
+                upto_y = int(last_label_end[aid]) + 1 if last_label_end[aid] >= 0 else 0
+                upto_y = min(upto_y, Yf.shape[0])
+                Xp = Xf[:upto_x, :]
+                Yp = Yf[:upto_y]
 
                 mx = Xp.mean(axis=0, keepdims=True)[None, ...]
                 vx = Xp.var(axis=0, keepdims=True, ddof=0)[None, ...]
                 sx = _np.sqrt(_np.maximum(vx, 1e-12)); sx[sx == 0] = 1.0
-                my = float(Yp.mean())
-                sy = float(Yp.std()); sy = (1.0 if sy == 0 else sy)
+                my = float(Yp.mean()) if Yp.size else 0.0
+                sy = float(Yp.std()) if Yp.size else 1.0
+                sy = (1.0 if sy == 0 else sy)
 
                 mean_x.append(mx.tolist()); std_x.append(sx.tolist())
                 mean_y.append(my);         std_y.append(sy)
@@ -812,6 +823,7 @@ def _compute_train_only_norm_stats(
                 g_count += Xp.shape[0]
                 g_sum   += Xp.sum(axis=0, dtype=_np.float64)
                 g_sumsq += (Xp.astype(_np.float64) ** 2).sum(axis=0)
+                g_y_count += Yp.shape[0]
                 g_y_sum   += float(Yp.sum())
                 g_y_sumsq += float((Yp.astype(_np.float64) ** 2).sum())
             else:
@@ -823,9 +835,13 @@ def _compute_train_only_norm_stats(
             g_vx = (g_sumsq / g_count) - (g_mx.astype(_np.float64) ** 2)
             g_vx = _np.maximum(g_vx, 1e-12)
             g_sx = _np.sqrt(g_vx).astype(_np.float32); g_sx[g_sx == 0] = 1.0
-            g_my = float(g_y_sum / g_count)
-            g_vy = max((g_y_sumsq / g_count) - (g_my ** 2), 1e-12)
-            g_sy = float(_np.sqrt(g_vy)); g_sy = (1.0 if g_sy == 0 else g_sy)
+            if g_y_count > 0:
+                g_my = float(g_y_sum / g_y_count)
+                g_vy = max((g_y_sumsq / g_y_count) - (g_my ** 2), 1e-12)
+                g_sy = float(_np.sqrt(g_vy)); g_sy = (1.0 if g_sy == 0 else g_sy)
+            else:
+                g_my = 0.0
+                g_sy = 1.0
 
             for aid in range(len(assets)):
                 if mean_x[aid] is None:
@@ -845,6 +861,7 @@ def _compute_train_only_norm_stats(
     g_count = 0
     g_sum = _np.zeros((feature_dim,), dtype=_np.float64)
     g_sumsq = _np.zeros((feature_dim,), dtype=_np.float64)
+    g_y_count = 0
     g_y_sum = 0.0
     g_y_sumsq = 0.0
 
@@ -853,12 +870,15 @@ def _compute_train_only_norm_stats(
             continue
         Xf = _np.load(_os.path.join(_features_dir(data_dir), f"{aid}.npy"), mmap_mode='r').astype(_np.float32)
         Yf = _np.load(_os.path.join(_targets_dir(data_dir),  f"{aid}.npy"), mmap_mode='r').astype(_np.float32)
-        upto = int(last_end[aid]) + 1
-        Xp = Xf[:upto, :]
-        Yp = Yf[:upto]
+        upto_x = int(last_ctx_end[aid]) + 1
+        upto_y = int(last_label_end[aid]) + 1 if last_label_end[aid] >= 0 else 0
+        upto_y = min(upto_y, Yf.shape[0])
+        Xp = Xf[:upto_x, :]
+        Yp = Yf[:upto_y]
         g_count += Xp.shape[0]
         g_sum   += Xp.sum(axis=0, dtype=_np.float64)
         g_sumsq += (Xp.astype(_np.float64) ** 2).sum(axis=0)
+        g_y_count += Yp.shape[0]
         g_y_sum   += float(Yp.sum())
         g_y_sumsq += float((Yp.astype(_np.float64) ** 2).sum())
 
@@ -869,9 +889,13 @@ def _compute_train_only_norm_stats(
     g_vx = (g_sumsq / g_count) - (g_mx.astype(_np.float64) ** 2)
     g_vx = _np.maximum(g_vx, 1e-12)
     g_sx = _np.sqrt(g_vx).astype(_np.float32); g_sx[g_sx == 0] = 1.0
-    g_my = float(g_y_sum / g_count)
-    g_vy = max((g_y_sumsq / g_count) - (g_my ** 2), 1e-12)
-    g_sy = float(_np.sqrt(g_vy)); g_sy = (1.0 if g_sy == 0 else g_sy)
+    if g_y_count > 0:
+        g_my = float(g_y_sum / g_y_count)
+        g_vy = max((g_y_sumsq / g_y_count) - (g_my ** 2), 1e-12)
+        g_sy = float(_np.sqrt(g_vy)); g_sy = (1.0 if g_sy == 0 else g_sy)
+    else:
+        g_my = 0.0
+        g_sy = 1.0
 
     return {
         'per_ticker': False,
@@ -981,6 +1005,7 @@ def load_dataloaders_with_ratio_split(
             assets=assets,
             tr_pairs=tr_pairs,
             window=window,
+            horizon=horizon,
             per_ticker=per_ticker_flag,
             feature_dim=F,
         )

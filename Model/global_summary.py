@@ -16,7 +16,7 @@ def _canon_mode(mode: str) -> str:
 
 
 class TVHead(nn.Module):
-    def __init__(self, feat_dim: int, hidden: int):
+    def __init__(self, feat_dim: int, hidden: int = 32):
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(feat_dim),
@@ -432,10 +432,10 @@ class RecurrentLaplaceSummarizer(nn.Module):
             key_padding_mask = None if pad_mask is None else pad_mask.to(torch.bool)
 
         Q = self.queries.unsqueeze(0).expand(B, -1, -1)
-        summary, _ = self.mha(Q, memory, values,
-                              key_padding_mask=key_padding_mask,
-                              attn_mask=attn_bias,
-                              average_attn_weights=False)
+        summary, attn_weights = self.mha(Q, memory, values,
+                                         key_padding_mask=key_padding_mask,
+                                         attn_mask=attn_bias,
+                                         average_attn_weights=False)
         summary = self.norm(self.dropout(summary) + Q)
 
         aux = {
