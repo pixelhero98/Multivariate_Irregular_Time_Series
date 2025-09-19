@@ -62,11 +62,14 @@ class NoiseScheduler(nn.Module):
             abar = _cosine_alpha_bar(ts)
             abar = abar / abar[0].clamp_min(1e-12)
             # Convert ᾱ to per-step α_t: α_t = ᾱ_t / ᾱ_{t-1}
+            ratios = (abar[1:] / abar[:-1]).clamp(1e-8, 0.999999)
             alphas = torch.ones(self.timesteps, dtype=torch.float32)
-            alphas[1:] = (abar[1:self.timesteps] / abar[0:self.timesteps - 1]).clamp(1e-8, 0.999999)
+            if self.timesteps > 1:
+                alphas[1:] = ratios[: self.timesteps - 1]
             betas = (1.0 - alphas)
             betas[0] = 0.0
-            betas[1:] = betas[1:].clamp(min=1e-8, max=0.999)
+            if self.timesteps > 1:
+                betas[1:] = betas[1:].clamp(min=1e-8, max=0.999)
 
         # Register buffers
         self.register_buffer("betas", betas)                              # [T]
@@ -388,9 +391,6 @@ def encode_mu_norm(vae, y_in: torch.Tensor, *,
         mu_norm = torch.nan_to_num(mu_norm, nan=0.0, posinf=0.0, neginf=0.0)
     return mu_norm
 
-
-from typing import Optional, Tuple
-import torch
 
 def diffusion_loss(
     model,
