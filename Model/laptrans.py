@@ -123,6 +123,7 @@ class LearnableLaplacianBasis(nn.Module):
         tau = F.softplus(self._tau) + 1e-3
         alpha0 = self.s_real * tau                 # [k]
         omega0 = self.s_imag * tau                 # [k]
+        omega0 = omega0.clamp(-self.omega_max, self.omega_max)  # mirror parallel behavior
 
         # dt -> [B, T, 1]
         if dt is None:
