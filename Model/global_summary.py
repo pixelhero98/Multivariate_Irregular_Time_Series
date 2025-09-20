@@ -125,7 +125,6 @@ class ParallelLaplaceSummarizer(nn.Module):
         Q = self.queries.unsqueeze(0).expand(B, -1, -1)
         summary, attn_weights = self.mha(Q, memory, values,
                                          key_padding_mask=key_padding_mask,
-                                         attn_mask=attn_bias,
                                          average_attn_weights=False)
 
         summary = self.norm(self.dropout(summary) + Q)
