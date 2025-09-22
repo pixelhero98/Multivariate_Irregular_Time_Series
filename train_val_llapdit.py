@@ -3,7 +3,7 @@ import crypto_config
 from torch import nn
 from tqdm import tqdm
 from torch.cuda.amp import GradScaler, autocast
-from Dataset.fin_dataset import run_experiment
+from Dataset.data_gen import run_experiment
 from Latent_Space.latent_vae import LatentVAE
 from Model.llapdit import LLapDiT
 from Model.llapdit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_mask,
@@ -66,7 +66,9 @@ diff_model = LLapDiT(
     dropout=crypto_config.DROPOUT, attn_dropout=crypto_config.ATTN_DROPOUT,
     self_conditioning=crypto_config.SELF_COND,
     context_dim=Fv, num_entities=N0, context_len=crypto_config.CONTEXT_LEN,
-    lap_mode=crypto_config.LAP_MODE
+    lap_mode_main=crypto_config.LAP_MODE,
+    zero_first_step=crypto_config.zero_first_step,
+    add_guidance_tokens=crypto_config.add_guidance_tokens
 ).to(device)
 
 # ---- Calculate the variance of the v-prediction target ----
@@ -275,18 +277,23 @@ if skip_with_trained_model and os.path.exists(skip_with_trained_model) and crypt
 else:
     # --- TRAINING LOOP ---
     if skip_with_trained_model:
+        lr_sched = make_warmup_cosine(optimizer, crypto_config.EPOCHS * max(1, len(train_dl)),
+                                      warmup_frac=crypto_config.FT_WARMUP_FRAC,
+                                      base_lr=crypto_config.FT_BASE_LR,
+                                      min_lr=crypto_config.FT_MIN_LR)
+        ckpt = torch.load(skip_with_trained_model, map_location=device)
+
+        # Load model weights
+        diff_model.load_state_dict(ckpt["model_state"])
+        print("Loaded model state.")
+
+        # Load EMA weights if they exist in the checkpoint and are enabled
+        if ema is not None and "ema_state" in ckpt:
+            ema.load_state_dict(ckpt["ema_state"])
+            print("Loaded EMA state.")
+    else:
         print(f"Model path not found: {skip_with_trained_model}. Starting training from scratch.")
 
-    # ckpt = torch.load(skip_with_trained_model, map_location=device)
-    #
-    # # Load model weights
-    # diff_model.load_state_dict(ckpt["model_state"])
-    # print("Loaded model state.")
-    #
-    # # Load EMA weights if they exist in the checkpoint and are enabled
-    # if ema is not None and "ema_state" in ckpt:
-    #     ema.load_state_dict(ckpt["ema_state"])
-    #     print("Loaded EMA state.")
 
     best_val = float("inf")
     patience = 0
@@ -309,7 +316,7 @@ else:
 
             ckpt_path = os.path.join(
                 crypto_config.CKPT_DIR,
-                f"mode-{crypto_config.LAP_MODE}-pred-{crypto_config.PRED}_ch-{crypto_config.VAE_LATENT_CHANNELS}_val_{val_loss:.6f}_cond_{cond_gap * Z}.pt"
+                f"mode-{crypto_config.LAP_MODE}-pred-{crypto_config.PRED}_ch-{crypto_config.VAE_LATENT_CHANNELS}_val_{val_loss:.6f}_cond_{cond_gap * Z:.6f}.pt"
             )
             save_payload = {
                 "epoch": epoch,
