@@ -1,15 +1,16 @@
+
 # ============================ Data & Preprocessing ============================
-DATA_DIR = "/home/pyh/Documents/school/projects/yzn_ts/ldt/LLapDiT_Data/NAS+NYS_200_data"
+DATA_DIR = "/home/pyh/Documents/school/projects/yzn_ts/ldt/LLapDiT_Data/CRYPTO_130_data"
 MKT = DATA_DIR[60:-5]
 
 # --- Data Parameters ---
-PRED = 5             # Target sequence length to predict (H)
+PRED = 20             # Target sequence length to predict (H)
 WINDOW = 200           # Conditional input sequence length (K)
 COVERAGE = 0.8
 date_batching=True
 
 # --- Dataloader Parameters ---
-BATCH_SIZE = 15
+BATCH_SIZE = 20
 train_ratio=0.7
 val_ratio=0.1
 test_ratio=0.2
@@ -46,7 +47,7 @@ PREDICT_TYPE  = "v"          # ["v", "eps"]
 # 'weighted_min_snr' is highly recommended. Set to 'none' to disable.
 LOSS_WEIGHT_SCHEME = 'weighted_min_snr'
 # The gamma parameter for min-SNR weighting. A value of 5.0 is a common starting point.
-MINSNR_GAMMA = 5.5
+MINSNR_GAMMA = 5.0
 
 # --- LLapDiT Architecture ---
 MODEL_WIDTH   = 256
@@ -54,36 +55,33 @@ NUM_LAYERS    = 5
 NUM_HEADS     = 4
 LAPLACE_K     = 64
 GLOBAL_K      = 256
-CONTEXT_LEN   = 2 * PRED if PRED <= 100 else 200 # Learned summary tokens
 LAP_MODE      = 'recurrent'   # 'parallel' or 'recurrent (support irregular sampling interval, with time-varying Lap basis updates)'
-
+zero_first_step = False
+add_guidance_tokens = True
+CONTEXT_LEN   = GLOBAL_K // 2 if add_guidance_tokens else GLOBAL_K # Learned summary tokens length
 # ============================ Training Hyperparameters ============================
-EPOCHS = 1500
-BASE_LR = 6e-4
-MIN_LR = 0.9e-4
-WARMUP_FRAC = 0.06
-WEIGHT_DECAY = 9e-4
+EPOCHS = 900
+BASE_LR = 8e-4
+MIN_LR = 8e-6
+WARMUP_FRAC = 0.095
+WEIGHT_DECAY = 5e-4
 GRAD_CLIP = 1.0
-EARLY_STOP = 200
-
-# --- Regularization & Conditioning ---
-DROPOUT       = 0.05
-ATTN_DROPOUT  = 0.05
-# Probability of dropping conditioning for Classifier-Free Guidance.
-DROP_COND_P   = 0.12
+EARLY_STOP = 100
+DROPOUT       = 0.07
+ATTN_DROPOUT  = 0.07
+DROP_COND_P   = 0.16
 
 # --- Self-Conditioning ---
 SELF_COND     = False
 SELF_COND_P   = 0.5
 # Recommended to lower this to see benefits earlier in training.
 SELF_COND_START_EPOCH = 210
-TRAINED_LLapDiT = ""
+TRAINED_LLapDiT = "/home/pyh/Documents/school/projects/yzn_ts/ldt/checkpoints/CRYPTO_130/mode-recurrent-pred-20_ch-24_val_0.190331_cond_0.268251.pt"
 downstream = False
 # --- Latent Normalization ---
-# Currently all disabled, no need to consider
-USE_EWMA      = False
-EWMA_LAMBDA   = 0.99
-DECODE_USE_GT_SCALE = False
+FT_WARMUP_FRAC=0.035
+FT_BASE_LR=1e-4
+FT_MIN_LR=5e-6
 # ============================ Evaluation & Sampling ============================
 # Use Exponential Moving Average of model weights for evaluation.
 USE_EMA_EVAL = True
