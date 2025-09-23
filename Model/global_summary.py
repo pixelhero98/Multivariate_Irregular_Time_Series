@@ -476,14 +476,14 @@ class UnifiedGlobalSummarizer(nn.Module):
                  zero_first_step: bool = True):
         super().__init__()
         lap_mode = _canon_mode(lap_mode)
-        if mode == "eff":
+        if mode == "EFF":
             self.impl = EfficientSummarizer(
                 num_entities=num_entities, feat_dim=feat_dim, hidden_dim=hidden_dim,
                 out_len=out_len, num_heads=num_heads, lap_k=lap_k, dropout=dropout,
                 add_guidance_tokens=add_guidance_tokens,
                 zero_first_step=zero_first_step,
             )
-        else:
+        elif mode == "ODE":
             self.impl = ODESummarizer(
                 num_entities=num_entities, feat_dim=feat_dim, hidden_dim=hidden_dim,
                 out_len=out_len, num_heads=num_heads, lap_k=lap_k, dropout=dropout,
