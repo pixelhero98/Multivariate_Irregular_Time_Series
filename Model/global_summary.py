@@ -29,7 +29,7 @@ class TVHead(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-class ParallelSummarizer(nn.Module):
+class EfficientSummarizer(nn.Module):
     def __init__(self,
                  num_entities: int,
                  feat_dim: int,
@@ -461,7 +461,8 @@ class ODESummarizer(nn.Module):
 
 class UnifiedGlobalSummarizer(nn.Module):
     def __init__(self,
-                 lap_mode: str,
+                 mode: str,
+                 lap_mode: str
                  num_entities: int,
                  feat_dim: int,
                  hidden_dim: int,
@@ -474,9 +475,9 @@ class UnifiedGlobalSummarizer(nn.Module):
                  residual_scale: float = 0.05,
                  zero_first_step: bool = True):
         super().__init__()
-        mode = _canon_mode(lap_mode)
-        if mode == "parallel":
-            self.impl = ParallelSummarizer(
+        lap_mode = _canon_mode(lap_mode)
+        if mode == "eff":
+            self.impl = EfficientSummarizer(
                 num_entities=num_entities, feat_dim=feat_dim, hidden_dim=hidden_dim,
                 out_len=out_len, num_heads=num_heads, lap_k=lap_k, dropout=dropout,
                 add_guidance_tokens=add_guidance_tokens,
@@ -489,7 +490,7 @@ class UnifiedGlobalSummarizer(nn.Module):
                 add_guidance_tokens=add_guidance_tokens,
                 physics_tied_derivative=physics_tied_derivative, residual_scale=residual_scale,
                 zero_first_step=zero_first_step,
-                lap_mode='parallel' 
+                lap_mode=lap_mode 
             )
 
     def forward(self, *args, **kwargs):
