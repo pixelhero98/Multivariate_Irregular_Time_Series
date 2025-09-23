@@ -462,7 +462,7 @@ class ODESummarizer(nn.Module):
 class UnifiedGlobalSummarizer(nn.Module):
     def __init__(self,
                  mode: str,
-                 lap_mode: str
+                 lap_mode: str,
                  num_entities: int,
                  feat_dim: int,
                  hidden_dim: int,
