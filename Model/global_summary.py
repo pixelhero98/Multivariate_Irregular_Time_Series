@@ -29,7 +29,7 @@ class TVHead(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-class ParallelLaplaceSummarizer(nn.Module):
+class ParallelSummarizer(nn.Module):
     def __init__(self,
                  num_entities: int,
                  feat_dim: int,
@@ -202,9 +202,10 @@ class PolewiseDiff(nn.Module):
 class SecondOrderLaplaceCombinerPolewise(nn.Module):
     def __init__(self, num_entities: int, k: int,
                  physics_tied: bool = True, residual_scale: float = 0.05,
-                 renorm_by_fill: bool = True):
+                 renorm_by_fill: bool = True,
+                 lap_mode: str = "recurrent"):
         super().__init__()
-        self.lap = LearnableLaplacianBasis(k=k, feat_dim=num_entities, mode="recurrent")
+        self.lap = LearnableLaplacianBasis(k=k, feat_dim=num_entities, mode=lap_mode)
         self.diff = PolewiseDiff(k, physics_tied=physics_tied, residual_scale=residual_scale)
         self.num_entities = num_entities
         self.renorm_by_fill = renorm_by_fill
@@ -317,7 +318,7 @@ class SecondOrderLaplaceCombinerPolewise(nn.Module):
         return L, aux
 
 
-class RecurrentLaplaceSummarizer(nn.Module):
+class ODESummarizer(nn.Module):
     def __init__(self,
                  num_entities: int,
                  feat_dim: int,
@@ -330,7 +331,8 @@ class RecurrentLaplaceSummarizer(nn.Module):
                  add_guidance_tokens: bool = True,
                  physics_tied_derivative: bool = True,
                  residual_scale: float = 0.05,
-                 zero_first_step: bool = True):
+                 zero_first_step: bool = True,
+                 lap_mode: str = "recurrent"):
         super().__init__()
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
         self.N, self.D, self.H = num_entities, feat_dim, hidden_dim
@@ -347,7 +349,8 @@ class RecurrentLaplaceSummarizer(nn.Module):
 
         self.ode_lap = SecondOrderLaplaceCombinerPolewise(
             num_entities=num_entities, k=lap_k,
-            physics_tied=physics_tied_derivative, residual_scale=residual_scale
+            physics_tied=physics_tied_derivative, residual_scale=residual_scale,
+            lap_mode=lap_mode
         )
 
         self.lap_to_film = nn.Linear(2 * lap_k, 2 * hidden_dim)
@@ -473,19 +476,20 @@ class UnifiedGlobalSummarizer(nn.Module):
         super().__init__()
         mode = _canon_mode(lap_mode)
         if mode == "parallel":
-            self.impl = ParallelLaplaceSummarizer(
+            self.impl = ParallelSummarizer(
                 num_entities=num_entities, feat_dim=feat_dim, hidden_dim=hidden_dim,
                 out_len=out_len, num_heads=num_heads, lap_k=lap_k, dropout=dropout,
                 add_guidance_tokens=add_guidance_tokens,
                 zero_first_step=zero_first_step,
             )
         else:
-            self.impl = RecurrentLaplaceSummarizer(
+            self.impl = ODESummarizer(
                 num_entities=num_entities, feat_dim=feat_dim, hidden_dim=hidden_dim,
                 out_len=out_len, num_heads=num_heads, lap_k=lap_k, dropout=dropout,
                 add_guidance_tokens=add_guidance_tokens,
                 physics_tied_derivative=physics_tied_derivative, residual_scale=residual_scale,
                 zero_first_step=zero_first_step,
+                lap_mode='parallel' 
             )
 
     def forward(self, *args, **kwargs):
