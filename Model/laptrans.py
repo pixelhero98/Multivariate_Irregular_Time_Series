@@ -54,7 +54,9 @@ class LearnableLaplacianBasis(nn.Module):
 
         # Learned projection feat_dim -> k (shared across modes)
         self.proj = spectral_norm(nn.Linear(self.feat_dim, k, bias=True), n_power_iterations=1, eps=1e-6)
-
+        # inverse softplus of 1.0 ≈ log(exp(1)-1) ≈ 0.5413
+        init_val = math.log(math.e - 1.0)   # ~0.5413
+        self.b_param = nn.Parameter(torch.full((1,1,k), init_val))
         self.reset_parameters()
 
     @staticmethod
@@ -169,25 +171,27 @@ class LearnableLaplacianBasis(nn.Module):
         theta = omega * dt_bt1               # [B,T,k]
         cos_t, sin_t = torch.cos(theta), torch.sin(theta)
 
-        # Drive (real only)
-        u = self.proj(x)                     # [B,T,k]
-
-        # z_t = rho_t * e^{i theta_t} * z_{t-1} + u_t
-        c_hist = []
-        s_hist = []
+        den = (alpha**2 + omega**2).clamp_min(1e-6)          # [B,T,K]
+        psi_c = (-omega + rho * (alpha * sin_t + omega * cos_t)) / den
+        psi_s = ( alpha - rho * (alpha * cos_t - omega * sin_t)) / den
+        
+        b = F.softplus(self.b_param) + 1e-8     # [1,1,k], >= 1e-8
+        u_eff = u * b                                         # [B,T,K]
+        
+        c_hist, s_hist = [], []
         c = torch.zeros(B, k, dtype=u.dtype, device=device)
         s = torch.zeros(B, k, dtype=u.dtype, device=device)
         for t in range(T):
-            rt = rho[:, t, :]
-            ct = cos_t[:, t, :]
-            st = sin_t[:, t, :]
-            c, s = rt * (c * ct - s * st) + u[:, t, :], rt * (c * st + s * ct)
-            c_hist.append(c)
-            s_hist.append(s)
-
-        C = torch.stack(c_hist, dim=1)
-        S = torch.stack(s_hist, dim=1)
-
+            rt = rho[:, t, :]; ct = cos_t[:, t, :]; st = sin_t[:, t, :]
+            # drift
+            c_new = rt * (c * ct - s * st)
+            s_new = rt * (c * st + s * ct)
+            # exact ZOH input
+            c = c_new + psi_c[:, t, :] * u_eff[:, t, :]
+            s = s_new + psi_s[:, t, :] * u_eff[:, t, :]
+            c_hist.append(c); s_hist.append(s)
+        
+        C = torch.stack(c_hist, dim=1); S = torch.stack(s_hist, dim=1)
         return torch.cat([C, S], dim=2).contiguous()
 
 
