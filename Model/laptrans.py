@@ -100,33 +100,31 @@ class LearnableLaplacianBasis(nn.Module):
         alpha_mod: Optional[torch.Tensor] = None,
         omega_mod: Optional[torch.Tensor] = None,
         tau_mod: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        ) -> torch.Tensor:
         assert x.dim() == 3 and x.size(-1) == self.feat_dim, f"x must be [B, T, {self.feat_dim}]"
         B, T, _ = x.shape
         device, dtype = x.device, x.dtype
         k = self.k
-
+        
         if self.mode == "parallel":
             # Complex exponential basis (fast path)
-            alpha = self.s_real
-            beta = self.s_imag.clamp(-self.omega_max, self.omega_max)
-
-            t_idx = torch.arange(T, device=device, dtype=torch.float32).unsqueeze(1)  # [T,1]
-            s = torch.complex(-alpha.float(), beta.float())                            # [k]
-            expo = torch.exp(t_idx * s.unsqueeze(0))                                   # [T,k] complex
-            re_basis, im_basis = expo.real.to(dtype), expo.imag.to(dtype)             # [T,k] each
-
-            proj_feats = self.proj(x)                              # [B,T,k]
-            real_proj = proj_feats * re_basis.unsqueeze(0)         # [B,T,k]
-            imag_proj = proj_feats * im_basis.unsqueeze(0)         # [B,T,k]
-            return torch.cat([real_proj, imag_proj], dim=2).contiguous()
-
-        # Recurrent (time-varying) path
+            alpha = self.s_real.to(dtype)  # [k]
+            beta  = self.s_imag.clamp(-self.omega_max, self.omega_max).to(dtype)  # [k]
+            t_idx = torch.arange(T, device=device, dtype=dtype).unsqueeze(1)      # [T,1] match dtype
+            s = torch.complex((-alpha).float(), beta.float())                     # [k] complex
+            expo = torch.exp(t_idx.float() * s.unsqueeze(0))                      # [T,k] complex
+            re_basis, im_basis = expo.real.to(dtype), expo.imag.to(dtype)         # [T,k]
+            proj_feats = self.proj(x)                                             # [B,T,k]
+            return torch.cat([proj_feats * re_basis.unsqueeze(0),
+                              proj_feats * im_basis.unsqueeze(0)], dim=2).contiguous()
+        
+        # ----- recurrent (time-varying) path -----
+        # global time-scale (optional)
         tau = F.softplus(self._tau) + 1e-3
         alpha0 = self.s_real * tau                 # [k]
         omega0 = self.s_imag * tau                 # [k]
-        omega0 = omega0.clamp(-self.omega_max, self.omega_max)  # mirror parallel behavior
-
+        omega0 = omega0.clamp(-self.omega_max, self.omega_max)
+        
         # dt -> [B, T, 1]
         if dt is None:
             base = (1.0 / max(T - 1, 1)) if T > 1 else 1.0
@@ -135,64 +133,72 @@ class LearnableLaplacianBasis(nn.Module):
             if dt.dim() == 1:
                 if dt.numel() != T:
                     raise ValueError(f"dt shape {tuple(dt.shape)} incompatible with T={T}.")
-                dt_bt1 = dt.view(1, T, 1).to(dtype=x.dtype, device=device).expand(B, T, 1)
+                dt_bt1 = dt.view(1, T, 1).to(dtype=dtype, device=device).expand(B, T, 1)
             elif dt.dim() == 2:
                 if dt.shape != (B, T):
                     raise ValueError(f"dt must be [B, T]={B,T} if 2D; got {tuple(dt.shape)}.")
-                dt_bt1 = dt.unsqueeze(-1).to(dtype=x.dtype, device=device)
+                dt_bt1 = dt.unsqueeze(-1).to(dtype=dtype, device=device)
             else:
                 raise ValueError("dt must be [T] or [B, T] if provided")
-
+        
         # Expand poles to [B, T, k] and apply optional log-space modulation
-        alpha = alpha0.view(1, 1, k).expand(B, T, k)
-        omega = omega0.view(1, 1, k).expand(B, T, k)
-
+        alpha = alpha0.view(1, 1, k).expand(B, T, k).to(dtype)
+        omega = omega0.view(1, 1, k).expand(B, T, k).to(dtype)
+        
         if alpha_mod is not None:
             if alpha_mod.shape != (B, T, k):
                 raise ValueError(f"alpha_mod must be [B, T, k]={B,T,k}; got {tuple(alpha_mod.shape)}.")
-            alpha = alpha * alpha_mod.to(dtype=x.dtype, device=device).exp()
-
+            alpha = alpha * alpha_mod.to(dtype=dtype, device=device).exp()
+        
         if omega_mod is not None:
             if omega_mod.shape != (B, T, k):
                 raise ValueError(f"omega_mod must be [B, T, k]={B,T,k}; got {tuple(omega_mod.shape)}.")
-            omega = omega * omega_mod.to(dtype=x.dtype, device=device).exp()
-
+            omega = omega * omega_mod.to(dtype=dtype, device=device).exp()
+        
         if tau_mod is not None:
             if tau_mod.shape[:2] != (B, T) or tau_mod.shape[-1] not in (1, k):
                 raise ValueError(f"tau_mod must be [B, T, 1] or [B, T, k]; got {tuple(tau_mod.shape)}.")
-            scale = tau_mod.to(dtype=x.dtype, device=device).exp()
+            scale = tau_mod.to(dtype=dtype, device=device).exp()
             if scale.shape[-1] == 1:
                 scale = scale.expand(B, T, k)
             alpha = alpha * scale
             omega = omega * scale
-
+        
+        # Projection to per-mode scalar drive (define BEFORE using it)
+        u = self.proj(x)                             # [B,T,k]
+        
         # Step-wise decay & rotation
-        rho = torch.exp(-alpha * dt_bt1)     # [B,T,k]
-        theta = omega * dt_bt1               # [B,T,k]
+        rho   = torch.exp(-alpha * dt_bt1)           # [B,T,k]
+        theta = omega * dt_bt1                        # [B,T,k]
         cos_t, sin_t = torch.cos(theta), torch.sin(theta)
-
-        den = (alpha**2 + omega**2).clamp_min(1e-6)          # [B,T,K]
-        psi_c = (-omega + rho * (alpha * sin_t + omega * cos_t)) / den
-        psi_s = ( alpha - rho * (alpha * cos_t - omega * sin_t)) / den
         
-        b = F.softplus(self.b_param) + 1e-8     # [1,1,k], >= 1e-8
-        u_eff = u * b                                         # [B,T,K]
+        # Exact ZOH input map Psi(Δ) for B=[0,1]^T (2×1)
+        den   = (alpha**2 + omega**2).clamp_min(1e-6)                     # [B,T,k]
+        psi_c = (-omega + rho * (alpha * sin_t + omega * cos_t)) / den    # [B,T,k]
+        psi_s = ( alpha - rho * (alpha * cos_t - omega * sin_t)) / den    # [B,T,k]
         
+        # Per-mode nonnegative input gain
+        b = F.softplus(self.b_param).to(dtype=dtype, device=device) + 1e-8  # [1,1,k]
+        u_eff = u * b                                                        # [B,T,k]
+        
+        # Recurrent rollout
         c_hist, s_hist = [], []
-        c = torch.zeros(B, k, dtype=u.dtype, device=device)
-        s = torch.zeros(B, k, dtype=u.dtype, device=device)
+        c = torch.zeros(B, k, dtype=dtype, device=device)
+        s = torch.zeros(B, k, dtype=dtype, device=device)
         for t in range(T):
-            rt = rho[:, t, :]; ct = cos_t[:, t, :]; st = sin_t[:, t, :]
-            # drift
+            rt, ct, st = rho[:, t, :], cos_t[:, t, :], sin_t[:, t, :]
+            # drift using previous (c,s)
             c_new = rt * (c * ct - s * st)
             s_new = rt * (c * st + s * ct)
             # exact ZOH input
             c = c_new + psi_c[:, t, :] * u_eff[:, t, :]
             s = s_new + psi_s[:, t, :] * u_eff[:, t, :]
-            c_hist.append(c); s_hist.append(s)
+            c_hist.append(c)
+            s_hist.append(s)
         
-        C = torch.stack(c_hist, dim=1); S = torch.stack(s_hist, dim=1)
-        return torch.cat([C, S], dim=2).contiguous()
+        C = torch.stack(c_hist, dim=1)  # [B,T,k]
+        S = torch.stack(s_hist, dim=1)  # [B,T,k]
+        return torch.cat([C, S], dim=2).contiguous()  # [B,T,2k]
 
 
 # ==============================
