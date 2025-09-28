@@ -9,24 +9,18 @@ from torch.nn.utils import spectral_norm
 
 class LearnableLaplacianBasis(nn.Module):
     """
-    Learnable Laplace transform basis producing 2*k channels (cos & sin branches).
+    Learnable Laplace transform basis producing 2*k channels (cos & sin).
 
     Args:
         k:         number of complex poles (output channels = 2*k)
         feat_dim:  input feature dimension (last dim of x)
-        mode:      'parallel' (fixed basis) or 'recurrent' (time-varying recurrence)
-                   Aliases: 'static'→'parallel' (deprecated), 'tv'→'recurrent' (deprecated)
-        alpha_min: strictly positive floor for the real part (decay)
-        omega_max: clamp for imaginary part (frequency) in 'parallel' mode
+        mode:      'parallel' (fixed basis) or 'recurrent' (irregular-step recurrence)
+        alpha_min: strictly positive floor added to softplus(real part)
+        omega_max: clamp for imaginary part in 'parallel' mode
 
     Forward:
-        x: [B, T, D]
-
-        For mode='recurrent' you may also pass:
-          dt:        [T] or [B, T] step sizes; None -> uniform over [0,1]
-          alpha_mod: [B, T, k] log-scale modulation of decay (multiplies alpha)
-          omega_mod: [B, T, k] log-scale modulation of frequency (multiplies omega)
-          tau_mod:   [B, T, 1] or [B, T, k] log-scale global timescale modulation
+        x:  [B, T, D]
+        dt: [T] or [B, T] step sizes; None -> uniform over [0,1]
 
     Returns:
         lap_feats: [B, T, 2*k]  (concat of cosine-like and sine-like channels)
@@ -50,13 +44,17 @@ class LearnableLaplacianBasis(nn.Module):
         # Trainable pole parameters
         self._s_real_raw = nn.Parameter(torch.empty(k))  # mapped via softplus -> positive
         self.s_imag = nn.Parameter(torch.empty(k))       # frequency
-        self._tau = nn.Parameter(torch.tensor(0.0))      # global timescale (recurrent)
 
-        # Learned projection feat_dim -> k (shared across modes)
-        self.proj = spectral_norm(nn.Linear(self.feat_dim, k, bias=True), n_power_iterations=1, eps=1e-6)
-        # inverse softplus of 1.0 ≈ log(exp(1)-1) ≈ 0.5413
-        init_val = math.log(math.e - 1.0)   # ~0.5413
-        self.b_param = nn.Parameter(torch.full((1,1,k), init_val))
+        # Learned projection feat_dim -> k (shared)
+        self.proj = spectral_norm(
+            nn.Linear(self.feat_dim, k, bias=True),
+            n_power_iterations=1,
+            eps=1e-6,
+        )
+
+        # Per-mode positive input gain shared across cos/sin (exp -> >= 0)
+        self.b_log = nn.Parameter(torch.zeros(1, 1, k))
+
         self.reset_parameters()
 
     @staticmethod
@@ -67,10 +65,12 @@ class LearnableLaplacianBasis(nn.Module):
         if m in {"recurrent"}:
             return "recurrent"
         if m in {"static"}:
-            warnings.warn("mode='static' is deprecated; use 'parallel'.", DeprecationWarning, stacklevel=3)
+            warnings.warn("mode='static' is deprecated; use 'parallel'.",
+                          DeprecationWarning, stacklevel=3)
             return "parallel"
         if m in {"tv", "timevarying", "time-varying"}:
-            warnings.warn("mode='tv' is deprecated; use 'recurrent'.", DeprecationWarning, stacklevel=3)
+            warnings.warn("mode='tv' is deprecated; use 'recurrent'.",
+                          DeprecationWarning, stacklevel=3)
             return "recurrent"
         raise ValueError("mode must be one of {'parallel','recurrent'} (or deprecated {'static','tv'}).")
 
@@ -81,50 +81,54 @@ class LearnableLaplacianBasis(nn.Module):
 
     def reset_parameters(self) -> None:
         with torch.no_grad():
+            # Imag part in [-pi, pi]
             nn.init.uniform_(self.s_imag, -math.pi, math.pi)
 
+            # Real part softplus target in [0.01, 0.2] plus alpha_min
             target_alpha = torch.empty_like(self._s_real_raw).uniform_(0.01, 0.2)
             y = (target_alpha - self.alpha_min).clamp_min(1e-8)  # softplus target
             self._s_real_raw.copy_(torch.log(torch.expm1(y)))    # softplus^{-1}(y)
 
+            # Projection init
             w = getattr(self.proj, "weight_orig", self.proj.weight)
             nn.init.kaiming_uniform_(w, a=math.sqrt(5))
             if self.proj.bias is not None:
                 bound = 1 / math.sqrt(self.proj.in_features)
                 nn.init.uniform_(self.proj.bias, -bound, bound)
 
+            # Input gain b=exp(0)=1
+            self.b_log.zero_()
+
     def forward(
         self,
         x: torch.Tensor,
         dt: Optional[torch.Tensor] = None,
-        alpha_mod: Optional[torch.Tensor] = None,
-        omega_mod: Optional[torch.Tensor] = None,
-        tau_mod: Optional[torch.Tensor] = None,
-        ) -> torch.Tensor:
+    ) -> torch.Tensor:
         assert x.dim() == 3 and x.size(-1) == self.feat_dim, f"x must be [B, T, {self.feat_dim}]"
         B, T, _ = x.shape
         device, dtype = x.device, x.dtype
         k = self.k
-        
+
         if self.mode == "parallel":
-            # Complex exponential basis (fast path)
-            alpha = self.s_real.to(dtype)  # [k]
+            # Complex exponential basis (fast path), dtype-safe for AMP
+            alpha = self.s_real.to(dtype)                                   # [k]
             beta  = self.s_imag.clamp(-self.omega_max, self.omega_max).to(dtype)  # [k]
-            t_idx = torch.arange(T, device=device, dtype=dtype).unsqueeze(1)      # [T,1] match dtype
+            t_idx = torch.arange(T, device=device, dtype=dtype).unsqueeze(1)      # [T,1]
+            # Complex exponent requires float32; cast minimally then back to dtype
             s = torch.complex((-alpha).float(), beta.float())                     # [k] complex
             expo = torch.exp(t_idx.float() * s.unsqueeze(0))                      # [T,k] complex
             re_basis, im_basis = expo.real.to(dtype), expo.imag.to(dtype)         # [T,k]
+
             proj_feats = self.proj(x)                                             # [B,T,k]
-            return torch.cat([proj_feats * re_basis.unsqueeze(0),
-                              proj_feats * im_basis.unsqueeze(0)], dim=2).contiguous()
-        
-        # ----- recurrent (time-varying) path -----
-        # global time-scale (optional)
-        tau = F.softplus(self._tau) + 1e-3
-        alpha0 = self.s_real * tau                 # [k]
-        omega0 = self.s_imag * tau                 # [k]
-        omega0 = omega0.clamp(-self.omega_max, self.omega_max)
-        
+            out_re = proj_feats * re_basis.unsqueeze(0)                           # [B,T,k]
+            out_im = proj_feats * im_basis.unsqueeze(0)                           # [B,T,k]
+            return torch.cat([out_re, out_im], dim=2).contiguous()                # [B,T,2k]
+
+        # ----- recurrent (irregular-step) path -----
+
+        alpha0 = self.s_real.to(dtype)                                            # [k]
+        omega0 = self.s_imag.clamp(-self.omega_max, self.omega_max).to(dtype)     # [k]
+
         # dt -> [B, T, 1]
         if dt is None:
             base = (1.0 / max(T - 1, 1)) if T > 1 else 1.0
@@ -140,65 +144,48 @@ class LearnableLaplacianBasis(nn.Module):
                 dt_bt1 = dt.unsqueeze(-1).to(dtype=dtype, device=device)
             else:
                 raise ValueError("dt must be [T] or [B, T] if provided")
-        
-        # Expand poles to [B, T, k] and apply optional log-space modulation
-        alpha = alpha0.view(1, 1, k).expand(B, T, k).to(dtype)
-        omega = omega0.view(1, 1, k).expand(B, T, k).to(dtype)
-        
-        if alpha_mod is not None:
-            if alpha_mod.shape != (B, T, k):
-                raise ValueError(f"alpha_mod must be [B, T, k]={B,T,k}; got {tuple(alpha_mod.shape)}.")
-            alpha = alpha * alpha_mod.to(dtype=dtype, device=device).exp()
-        
-        if omega_mod is not None:
-            if omega_mod.shape != (B, T, k):
-                raise ValueError(f"omega_mod must be [B, T, k]={B,T,k}; got {tuple(omega_mod.shape)}.")
-            omega = omega * omega_mod.to(dtype=dtype, device=device).exp()
-        
-        if tau_mod is not None:
-            if tau_mod.shape[:2] != (B, T) or tau_mod.shape[-1] not in (1, k):
-                raise ValueError(f"tau_mod must be [B, T, 1] or [B, T, k]; got {tuple(tau_mod.shape)}.")
-            scale = tau_mod.to(dtype=dtype, device=device).exp()
-            if scale.shape[-1] == 1:
-                scale = scale.expand(B, T, k)
-            alpha = alpha * scale
-            omega = omega * scale
-        
-        # Projection to per-mode scalar drive (define BEFORE using it)
-        u = self.proj(x)                             # [B,T,k]
-        
-        # Step-wise decay & rotation
+
+        # Expand poles to [B, T, k]
+        alpha = alpha0.view(1, 1, k).expand(B, T, k)
+        omega = omega0.view(1, 1, k).expand(B, T, k)
+
+        # Per-step decay & rotation (for Phi)
         rho   = torch.exp(-alpha * dt_bt1)           # [B,T,k]
-        theta = omega * dt_bt1                        # [B,T,k]
+        theta = omega * dt_bt1                       # [B,T,k]
         cos_t, sin_t = torch.cos(theta), torch.sin(theta)
-        
-        # Exact ZOH input map Psi(Δ) for B=[0,1]^T (2×1)
-        den   = (alpha**2 + omega**2).clamp_min(1e-6)                     # [B,T,k]
-        psi_c = (-omega + rho * (alpha * sin_t + omega * cos_t)) / den    # [B,T,k]
-        psi_s = ( alpha - rho * (alpha * cos_t - omega * sin_t)) / den    # [B,T,k]
-        
-        # Per-mode nonnegative input gain
-        b = F.softplus(self.b_param).to(dtype=dtype, device=device) + 1e-8  # [1,1,k]
-        u_eff = u * b                                                        # [B,T,k]
-        
-        # Recurrent rollout
-        c_hist, s_hist = [], []
+
+        # Projection to per-mode scalar drive
+        u = self.proj(x)  # [B,T,k]
+
+        # Per-mode positive input gain (shared across cos/sin)
+        b = torch.exp(self.b_log).to(dtype=dtype, device=device)  # [1,1,k]
+
+        # Preallocate rollout tensors
+        C = torch.empty(B, T, k, dtype=dtype, device=device)
+        S = torch.empty(B, T, k, dtype=dtype, device=device)
         c = torch.zeros(B, k, dtype=dtype, device=device)
         s = torch.zeros(B, k, dtype=dtype, device=device)
+
+        # Time loop
         for t in range(T):
-            rt, ct, st = rho[:, t, :], cos_t[:, t, :], sin_t[:, t, :]
-            # drift using previous (c,s)
+            rt = rho[:, t, :]
+            ct = cos_t[:, t, :]
+            st = sin_t[:, t, :]
+
+            # Drift (rotation+decay)
             c_new = rt * (c * ct - s * st)
             s_new = rt * (c * st + s * ct)
-            # exact ZOH input
-            c = c_new + psi_c[:, t, :] * u_eff[:, t, :]
-            s = s_new + psi_s[:, t, :] * u_eff[:, t, :]
-            c_hist.append(c)
-            s_hist.append(s)
-        
-        C = torch.stack(c_hist, dim=1)  # [B,T,k]
-        S = torch.stack(s_hist, dim=1)  # [B,T,k]
-        return torch.cat([C, S], dim=2).contiguous()  # [B,T,2k]
+
+            # Ultra-cheap, gap-aware injection to both channels
+            inj = (1.0 - rt) * (b * u[:, t, :])  # [B,k]
+
+            c = c_new + inj
+            s = s_new + inj
+
+            C[:, t, :], S[:, t, :] = c, s
+
+        lap_feats = torch.cat([C, S], dim=2).contiguous()  # [B,T,2k]
+        return lap_feats
 
 
 # ==============================
