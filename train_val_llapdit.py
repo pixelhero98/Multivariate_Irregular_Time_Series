@@ -66,9 +66,11 @@ diff_model = LLapDiT(
     dropout=crypto_config.DROPOUT, attn_dropout=crypto_config.ATTN_DROPOUT,
     self_conditioning=crypto_config.SELF_COND,
     context_dim=Fv, num_entities=N0, context_len=crypto_config.CONTEXT_LEN,
-    lap_mode_main=crypto_config.LAP_MODE,
+    lap_mode_main=crypto_config.LAP_MODE_main,
+    lap_mode_cond=crypto_config.LAP_MODE_cond,
     zero_first_step=crypto_config.zero_first_step,
-    add_guidance_tokens=crypto_config.add_guidance_tokens
+    add_guidance_tokens=crypto_config.add_guidance_tokens,
+    summery_mode='EFF'
 ).to(device)
 
 # ---- Calculate the variance of the v-prediction target ----
@@ -316,7 +318,7 @@ else:
 
             ckpt_path = os.path.join(
                 crypto_config.CKPT_DIR,
-                f"mode-{crypto_config.LAP_MODE}-pred-{crypto_config.PRED}_ch-{crypto_config.VAE_LATENT_CHANNELS}_val_{val_loss:.6f}_cond_{cond_gap * Z:.6f}.pt"
+                f"mode-{crypto_config.LAP_MODE_main}-pred-{crypto_config.PRED}_ch-{crypto_config.VAE_LATENT_CHANNELS}_val_{val_loss:.6f}_cond_{cond_gap * Z:.6f}.pt"
             )
             save_payload = {
                 "epoch": epoch,
