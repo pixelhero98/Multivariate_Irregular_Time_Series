@@ -101,16 +101,28 @@ class CrossAttnBlock(nn.Module):
 class LaplaceSandwichBlock(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, num_heads: int, k: int,
                  lap_mode: str = "parallel",
-                 dropout: float = 0.0, attn_dropout: float = 0.0):
+                 dropout: float = 0.0, attn_dropout: float = 0.0,
+                 cross_first: bool = True):
         super().__init__()
         self.mode = _canon_mode(lap_mode)
+        self.cross_first = cross_first
+
         self.analysis  = LearnableLaplacianBasis(k=k, feat_dim=input_dim, mode=self.mode)
         self.synthesis = LearnableInverseLaplacianBasis(self.analysis)
+
         self.lap2hid = nn.Linear(2 * k, hidden_dim)
         self.hid2lap = nn.Linear(hidden_dim, 2 * k)
-        self.self_blk  = TransformerBlock(hidden_dim, num_heads, mlp_ratio=4.0, dropout=dropout, attn_dropout=attn_dropout)
-        self.cross_blk = CrossAttnBlock(hidden_dim, num_heads, dropout=dropout, attn_dropout=attn_dropout)
-        nn.init.zeros_(self.hid2lap.weight); nn.init.zeros_(self.hid2lap.bias)
+        nn.init.zeros_(self.hid2lap.weight)
+        nn.init.zeros_(self.hid2lap.bias)
+
+        self.self_blk  = TransformerBlock(
+            hidden_dim, num_heads, mlp_ratio=4.0,
+            dropout=dropout, attn_dropout=attn_dropout
+        )
+        self.cross_blk = CrossAttnBlock(
+            hidden_dim, num_heads,
+            dropout=dropout, attn_dropout=attn_dropout
+        )
 
     def forward(self,
                 x_time: torch.Tensor,
@@ -120,17 +132,34 @@ class LaplaceSandwichBlock(nn.Module):
                 summary_kv_H: Optional[torch.Tensor] = None,
                 sc_add_H: Optional[torch.Tensor] = None,
                 dt: Optional[torch.Tensor] = None) -> torch.Tensor:
-                    
+
+        # Laplace analysis (parallel ignores dt)
         z = self.analysis(x_time, dt=dt) if self.mode == "recurrent" else self.analysis(x_time)
+
+        # Token embedding + time/pos + additive context (FiLM-style adds can be done before this if desired)
         h = self.lap2hid(z) + pos_emb + t_vec.unsqueeze(1)
         if sc_add_H is not None:
             h = h + sc_add_H
-        h = self.self_blk(h, attn_mask=None, key_padding_mask=None, attn_bias=attn_bias, t_vec=t_vec)
-        if summary_kv_H is not None:
-            h = self.cross_blk(h, summary_kv_H, t_vec=t_vec)
+
+        def cross(h: torch.Tensor) -> torch.Tensor:
+            if summary_kv_H is None:
+                return h
+            return self.cross_blk(h, summary_kv_H, t_vec=t_vec)
+
+        if self.cross_first:
+            # use context first, then mix locally
+            h = cross(h)
+            h = self.self_blk(h, attn_mask=None, key_padding_mask=None,
+                              attn_bias=attn_bias, t_vec=t_vec)
+        else:
+            # mix locally first, then consult context
+            h = self.self_blk(h, attn_mask=None, key_padding_mask=None,
+                              attn_bias=attn_bias, t_vec=t_vec)
+            h = cross(h)
+
+        # Update Laplace features and synthesize back to time
         z_upd  = z + self.hid2lap(h)
         y_time = self.synthesis(z_upd)
-                    
         return y_time
 
 
