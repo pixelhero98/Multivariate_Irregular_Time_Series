@@ -16,6 +16,7 @@ from Model.llapdit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_ma
 # ============================ Training setup ============================
 
 device = set_torch()
+context_grad_checked = False
 
 train_dl, val_dl, test_dl, sizes = run_experiment(
     data_dir=crypto_config.DATA_DIR,
@@ -101,7 +102,8 @@ def train_one_epoch(epoch: int):
     running_loss = 0.0
     num_samples = 0
     global global_step
-
+    global context_grad_checked
+  
     for xb, yb, meta in train_dl:
         V, T = xb
         mask_bn = meta["entity_mask"]
@@ -177,6 +179,15 @@ def train_one_epoch(epoch: int):
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
+      
+        if idx_c.numel() > 0 and not context_grad_checked:
+            has_context_grad = any(p.grad is not None for p in diff_model.context.parameters())
+            if not has_context_grad:
+                raise RuntimeError(
+                    "Context parameters did not receive gradients despite being used for conditioning."
+                )
+            context_grad_checked = True
+          
         if getattr(crypto_config, "GRAD_CLIP", 0.0) and crypto_config.GRAD_CLIP > 0:
             nn.utils.clip_grad_norm_(diff_model.parameters(), crypto_config.GRAD_CLIP)
         scaler.step(optimizer)
