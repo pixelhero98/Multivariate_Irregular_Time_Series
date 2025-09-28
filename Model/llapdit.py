@@ -32,7 +32,11 @@ class LLapDiT(nn.Module):
                  context_dim: Optional[int] = None,
                  num_entities: int = None,
                  context_len: int = 16,
-                 lap_mode: str = 'parallel'):
+                 lap_mode_main: Optional[str] = 'recurrent,
+                 lap_mode_cond: Optional[str] = 'parallel',
+                 summary_mode: str = 'EFF',
+                 add_guidance_tokens: bool = True,
+                 zero_first_step: bool = True):):
         super().__init__()
         assert predict_type in ('eps', 'v')
         if num_entities is None:
