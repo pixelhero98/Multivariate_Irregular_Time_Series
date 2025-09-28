@@ -369,18 +369,17 @@ def decode_latents_with_vae(vae, x0_norm: torch.Tensor,
     return x_hat
 
 
-def build_context(model, V: torch.Tensor, T: torch.Tensor,
-                  mask_bn: torch.Tensor, device: torch.device, norm: bool = True) -> torch.Tensor:
+def build_context(model, V, T, mask_bn, device, *, norm: bool = True, requires_grad: bool = True):
     """Returns normalized cond_summary: [B,S,Hm]"""
-    with torch.no_grad():
+    # enable/disable autograd depending on caller
+    with torch.set_grad_enabled(requires_grad):
         series_diff = T.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
-        series = V.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
-        mask_bn = mask_bn.to(device)
+        series      = V.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
+        mask_bn     = mask_bn.to(device)
         cond_summary, _ = model.context(x=series, ctx_diff=series_diff, entity_mask=mask_bn)
         if norm:
             cond_summary = normalize_cond_per_batch(cond_summary)
     return cond_summary
-
 
 def encode_mu_norm(vae, y_in: torch.Tensor, *,
                    mu_mean: torch.Tensor, mu_std: torch.Tensor) -> torch.Tensor:
