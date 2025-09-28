@@ -202,9 +202,9 @@ class NoiseScheduler(nn.Module):
 
 # ============================ Laplace pole logging ============================
 def iter_laplace_bases(module):
-    from Model.laptrans import LearnableLaplacianBasis
+    from Model.laptrans import LearnableLaplaceBasis
     for m in module.modules():
-        if isinstance(m, LearnableLaplacianBasis):
+        if isinstance(m, LearnableLaplaceBasis):
             yield m
 
 
@@ -387,6 +387,7 @@ def build_context(model, V, T, mask_bn, device, *, norm: bool = True, requires_g
             "Context summary does not require gradients; ensure the context module participates in autograd."
         )
     return cond_summary
+
 
 def encode_mu_norm(vae, y_in: torch.Tensor, *,
                    mu_mean: torch.Tensor, mu_std: torch.Tensor) -> torch.Tensor:

@@ -1,6 +1,6 @@
 import math
 from typing import Optional, Dict, Tuple
-from Model.laptrans import LearnableLaplacianBasis
+from Model.laptrans import LearnableLaplaceBasis
 from Model.pos_time_emb import get_sinusoidal_pos_emb as _pos_emb
 import torch
 import torch.nn as nn
@@ -55,8 +55,8 @@ class EfficientSummarizer(nn.Module):
 
         self.v_head = TVHead(feat_dim, tv_dim)
         self.t_head = TVHead(feat_dim, tv_dim)
-        self.lap_v = LearnableLaplacianBasis(k=lap_k, feat_dim=num_entities, mode="parallel")
-        self.lap_t = LearnableLaplacianBasis(k=lap_k, feat_dim=num_entities, mode="parallel")
+        self.lap_v = LearnableLaplaceBasis(k=lap_k, feat_dim=num_entities, mode="parallel")
+        self.lap_t = LearnableLaplaceBasis(k=lap_k, feat_dim=num_entities, mode="parallel")
 
         init_raw = math.log(math.e - 1.0)
         self.w_v_raw = nn.Parameter(torch.tensor(init_raw))
@@ -205,7 +205,7 @@ class SecondOrderLaplaceCombinerPolewise(nn.Module):
                  renorm_by_fill: bool = True,
                  lap_mode: str = "recurrent"):
         super().__init__()
-        self.lap = LearnableLaplacianBasis(k=k, feat_dim=num_entities, mode=lap_mode)
+        self.lap = LearnableLaplaceBasis(k=k, feat_dim=num_entities, mode=lap_mode)
         self.diff = PolewiseDiff(k, physics_tied=physics_tied, residual_scale=residual_scale)
         self.num_entities = num_entities
         self.renorm_by_fill = renorm_by_fill
@@ -490,7 +490,7 @@ class UnifiedGlobalSummarizer(nn.Module):
                 add_guidance_tokens=add_guidance_tokens,
                 physics_tied_derivative=physics_tied_derivative, residual_scale=residual_scale,
                 zero_first_step=zero_first_step,
-                lap_mode=lap_mode 
+                lap_mode=lap_mode
             )
 
     def forward(self, *args, **kwargs):

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from typing import Optional, Union, List
-from Model.laptrans import LearnableLaplacianBasis, LearnableInverseLaplacianBasis
+from Model.laptrans import LearnableLaplaceBasis, LearnablepesudoInverse
 from Model.pos_time_emb import get_sinusoidal_pos_emb
 
 
@@ -19,13 +19,13 @@ class AdaLayerNorm(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(normalized_shape, elementwise_affine=False)
         self.to_ss = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 2 * normalized_shape))
-        nn.init.zeros_((self.to_ss[-1]).weight); nn.init.zeros_(self.to_ss[-1].bias)
+        nn.init.zeros_((self.to_ss[-1]).weight);
+        nn.init.zeros_(self.to_ss[-1].bias)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-
         h = self.norm(x)
         s, b = self.to_ss(c).chunk(2, dim=-1)
-        
+
         return (1 + s).unsqueeze(1) * h + b.unsqueeze(1)
 
 
@@ -33,7 +33,8 @@ class TransformerBlock(nn.Module):
     def __init__(self, hidden_dim: int, num_heads: int, mlp_ratio: float = 4.0,
                  dropout: float = 0.0, attn_dropout: float = 0.0):
         super().__init__()
-        self.hidden_dim = hidden_dim; self.num_heads = num_heads
+        self.hidden_dim = hidden_dim;
+        self.num_heads = num_heads
         self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
         self.proj = nn.Linear(hidden_dim, hidden_dim)
         self.norm1 = AdaLayerNorm(hidden_dim, hidden_dim)
@@ -49,19 +50,19 @@ class TransformerBlock(nn.Module):
                 key_padding_mask: Optional[torch.Tensor] = None,
                 attn_bias: Optional[torch.Tensor] = None,
                 t_vec: Optional[torch.Tensor] = None) -> torch.Tensor:
-                    
+
         B, L, H = x.shape
         h = self.norm1(x, t_vec)
         qkv = self.qkv(h).reshape(B, L, 3, self.num_heads, H // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (k.shape[-1] ** 0.5)
-                    
+
         if attn_mask is not None: attn_scores = attn_scores + attn_mask
         if attn_bias is not None: attn_scores = attn_scores + attn_bias
         if key_padding_mask is not None:
             big_neg = torch.finfo(attn_scores.dtype).min
             attn_scores = attn_scores.masked_fill(key_padding_mask[:, None, None, :], big_neg)
-            
+
         attn = torch.softmax(attn_scores, dim=-1)
         attn = self.attn_dropout(attn)
         attn_out = torch.matmul(attn, v).transpose(1, 2).reshape(B, L, H)
@@ -84,17 +85,18 @@ class CrossAttnBlock(nn.Module):
         self.resid_dropout = nn.Dropout(dropout)
 
     def forward(self, x_q: torch.Tensor, x_kv: torch.Tensor, t_vec: Optional[torch.Tensor] = None) -> torch.Tensor:
-        
         B, L, H = x_q.shape
-        xq = self.norm_q(x_q, t_vec); xkv = self.norm_kv(x_kv, t_vec)
+        xq = self.norm_q(x_q, t_vec);
+        xkv = self.norm_kv(x_kv, t_vec)
         q = self.q(xq).reshape(B, L, self.num_heads, H // self.num_heads).transpose(1, 2)
         kv = self.kv(xkv).reshape(B, x_kv.shape[1], 2, self.num_heads, H // self.num_heads)
-        k = kv[:, :, 0].transpose(1, 2); v = kv[:, :, 1].transpose(1, 2)
+        k = kv[:, :, 0].transpose(1, 2);
+        v = kv[:, :, 1].transpose(1, 2)
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (k.shape[-1] ** 0.5)
         attn = torch.softmax(attn_scores, dim=-1)
         attn = self.attn_dropout(attn)
         out = torch.matmul(attn, v).transpose(1, 2).reshape(B, L, H)
-        
+
         return x_q + self.resid_dropout(self.proj(out))
 
 
@@ -107,8 +109,8 @@ class LaplaceSandwichBlock(nn.Module):
         self.mode = _canon_mode(lap_mode)
         self.cross_first = cross_first
 
-        self.analysis  = LearnableLaplacianBasis(k=k, feat_dim=input_dim, mode=self.mode)
-        self.synthesis = LearnableInverseLaplacianBasis(self.analysis)
+        self.analysis  = LearnableLaplaceBasis(k=k, feat_dim=input_dim, mode=self.mode)
+        self.synthesis = LearnablepesudoInverse(self.analysis)
 
         self.lap2hid = nn.Linear(2 * k, hidden_dim)
         self.hid2lap = nn.Linear(hidden_dim, 2 * k)
@@ -173,14 +175,15 @@ class LapFormer(nn.Module):
         self.hidden_dim = hidden_dim
         self.self_conditioning = self_conditioning
         self.lap_mode = _canon_mode(lap_mode)
-                     
+
         if hidden_dim % num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads for multi-head attention")
-            
+
         ks = [laplace_k] * num_layers if isinstance(laplace_k, int) else laplace_k
         assert len(ks) == num_layers, "laplace_k list must match num_layers"
 
-        self.register_buffer("pos_cache", get_sinusoidal_pos_emb(L=1024, dim=hidden_dim, device=torch.device("cpu")), persistent=False)
+        self.register_buffer("pos_cache", get_sinusoidal_pos_emb(L=1024, dim=hidden_dim, device=torch.device("cpu")),
+                             persistent=False)
 
         self.summary2lap = nn.ModuleList([nn.Linear(hidden_dim, 2 * k) for k in ks])
         self.summary2hid = nn.ModuleList([nn.Linear(2 * k, hidden_dim) for k in ks])
@@ -195,11 +198,13 @@ class LapFormer(nn.Module):
 
         self.head_norm = nn.LayerNorm(input_dim)
         self.head_proj = nn.Linear(input_dim, input_dim)
-        nn.init.zeros_(self.head_proj.weight); nn.init.zeros_(self.head_proj.bias)
+        nn.init.zeros_(self.head_proj.weight);
+        nn.init.zeros_(self.head_proj.bias)
 
     def _pos(self, L: int, B: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if self.pos_cache.shape[1] < L:
-            self.pos_cache = get_sinusoidal_pos_emb(L, self.hidden_dim, device=self.pos_cache.device).to(dtype=self.pos_cache.dtype)
+            self.pos_cache = get_sinusoidal_pos_emb(L, self.hidden_dim, device=self.pos_cache.device).to(
+                dtype=self.pos_cache.dtype)
         return self.pos_cache[:, :L, :].to(device=device, dtype=dtype).expand(B, -1, -1)
 
     def forward(self, x_tokens: torch.Tensor, t_vec: torch.Tensor,
@@ -209,7 +214,7 @@ class LapFormer(nn.Module):
         B, L, D = x_tokens.shape
         device = x_tokens.device
         if t_vec.dim() != 2 or t_vec.shape[0] != B or t_vec.shape[1] != self.hidden_dim:
-            raise ValueError(f"t_vec must be [B, hidden_dim]={B,self.hidden_dim}; got {tuple(t_vec.shape)}")
+            raise ValueError(f"t_vec must be [B, hidden_dim]={B, self.hidden_dim}; got {tuple(t_vec.shape)}")
         pos = self._pos(L, B, device, x_tokens.dtype)
 
         sc_add_H = self.self_cond_proj(sc_feat) if (self.self_conditioning and sc_feat is not None) else None

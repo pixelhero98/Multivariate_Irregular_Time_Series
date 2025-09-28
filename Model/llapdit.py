@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Union, List
 from Model.global_summary import UnifiedGlobalSummarizer
-from Model.cond_diffusion_utils import NoiseScheduler
+from Model.llapdit_utils import NoiseScheduler
 from Model.pos_time_emb import timestep_embedding
 from Model.lapformer import LapFormer
 
@@ -32,11 +32,11 @@ class LLapDiT(nn.Module):
                  context_dim: Optional[int] = None,
                  num_entities: int = None,
                  context_len: int = 16,
-                 lap_mode_main: Optional[str] = 'recurrent,
-                 lap_mode_cond: Optional[str] = 'parallel',
-                 summary_mode: str = 'EFF',
-                 add_guidance_tokens: bool = True,
-                 zero_first_step: bool = True):):
+                 lap_mode_main: str = 'recurrent',
+                 lap_mode_cond: str = 'parallel',
+                 summery_mode: str = 'EFF',
+                 zero_first_step: bool = True,
+                 add_guidance_tokens: bool = True):
         super().__init__()
         assert predict_type in ('eps', 'v')
         if num_entities is None:
@@ -50,7 +50,7 @@ class LLapDiT(nn.Module):
         # global context summarizer; choose simple vs full via lap_mode
         ctx_dim = context_dim if context_dim is not None else data_dim
         self.context = UnifiedGlobalSummarizer(
-            lap_mode=lap_mode,
+            lap_mode=lap_mode_cond,
             num_entities=num_entities,
             feat_dim=ctx_dim,
             hidden_dim=hidden_dim,
@@ -58,7 +58,9 @@ class LLapDiT(nn.Module):
             num_heads=num_heads,
             lap_k=global_k,
             dropout=dropout,
-            add_guidance_tokens=True,
+            add_guidance_tokens=add_guidance_tokens,
+            zero_first_step=zero_first_step,
+            mode=summery_mode
         )
 
         # main LapFormer (mode tied to summarizer)
@@ -69,7 +71,7 @@ class LLapDiT(nn.Module):
             num_layers=num_layers,
             num_heads=num_heads,
             laplace_k=laplace_k,
-            lap_mode=lap_mode,
+            lap_mode=lap_mode_main,
             dropout=dropout,
             attn_dropout=attn_dropout,
             self_conditioning=self_conditioning,
@@ -192,11 +194,11 @@ class LLapDiT(nn.Module):
             else:
                 g_eff = g_scalar.to(pred_u.dtype)
             guided = pred_u + g_eff * (pred_c - pred_u)
-            
+
             if not cfg_rescale:
                 return guided
             reduce_dims = (1, 2)
-            
+
             mu_c = pred_c.mean(dim=reduce_dims, keepdim=True)
             std_c = pred_c.std(dim=reduce_dims, keepdim=True).clamp_min(1e-6)
             mu_g = guided.mean(dim=reduce_dims, keepdim=True)
