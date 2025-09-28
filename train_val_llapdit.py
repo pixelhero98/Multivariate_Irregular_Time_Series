@@ -104,7 +104,7 @@ def train_one_epoch(epoch: int):
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        cond_summary = build_context(diff_model, V, T, mask_bn, device)
+        cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=True)
         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
@@ -203,7 +203,7 @@ def validate():
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        cond_summary = build_context(diff_model, V, T, mask_bn, device)
+        cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=False)
         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
