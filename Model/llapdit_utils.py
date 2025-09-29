@@ -370,19 +370,20 @@ def decode_latents_with_vae(vae, x0_norm: torch.Tensor,
 
 
 def build_context(model, V, T, mask_bn, device, *, norm: bool = True, requires_grad: bool = True):
-    """Returns normalized cond_summary: [B,S,Hm]"""
+    """Legacy helper to construct conditioning summaries via the model."""
     series_diff = T.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
     series      = V.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
     mask_bn     = mask_bn.to(device)
 
-    cond_summary, _ = model.context(x=series, ctx_diff=series_diff, entity_mask=mask_bn)
-    if norm:
-        cond_summary = normalize_cond_per_batch(cond_summary)
+    cond_summary = model.build_cond_summary(
+        series,
+        series_mask=mask_bn,
+        series_diff=series_diff,
+        normalize=norm,
+        detach=not requires_grad,
+    )
 
-    if not requires_grad:
-        return cond_summary.detach()
-
-    if not cond_summary.requires_grad:
+    if requires_grad and not cond_summary.requires_grad:
         raise RuntimeError(
             "Context summary does not require gradients; ensure the context module participates in autograd."
         )
@@ -411,6 +412,11 @@ def diffusion_loss(
     minsnr_gamma: float = 5.0,
     sc_feat: Optional[torch.Tensor] = None,
     reuse_xt_eps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    series: Optional[torch.Tensor] = None,
+    series_mask: Optional[torch.Tensor] = None,
+    series_diff: Optional[torch.Tensor] = None,
+    series_dt: Optional[torch.Tensor] = None,
+    dt: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """
     MSE on v/eps with optional MinSNR weighting.
@@ -441,7 +447,14 @@ def diffusion_loss(
         x_t, eps_true = reuse_xt_eps
 
     # --- Prediction target ---
-    pred = model(x_t, t, cond_summary=cond_summary, sc_feat=sc_feat)
+    pred = model(x_t, t,
+                 cond_summary=cond_summary,
+                 series=series,
+                 series_mask=series_mask,
+                 series_diff=series_diff,
+                 series_dt=series_dt,
+                 sc_feat=sc_feat,
+                 dt=dt)
     if predict_type == "eps":
         target = eps_true
     elif predict_type == "v":
