@@ -9,8 +9,7 @@ from Model.llapdit import LLapDiT
 from Model.llapdit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_mask,
                                  make_warmup_cosine, calculate_v_variance,
                                  compute_latent_stats, diffusion_loss,
-                                 build_context, flatten_targets,
-                                 sample_t_uniform, decode_latents_with_vae
+                                 flatten_targets, sample_t_uniform, decode_latents_with_vae
                                  )
 
 # ============================ Training setup ============================
@@ -108,12 +107,16 @@ def train_one_epoch(epoch: int):
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=True)
+        series = V.permute(0, 2, 1, 3).to(device)
+        series_diff = T.permute(0, 2, 1, 3).to(device)
+        mask_bn_dev = mask_bn.to(device)
         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
 
-        cond_summary_flat = cond_summary[batch_ids]  # [Beff,S,Hm]
+        series_flat = series[batch_ids]
+        series_diff_flat = series_diff[batch_ids]
+        mask_flat = mask_bn_dev[batch_ids]
         mu_norm = encode_mu_norm(
             vae, y_in,
             mu_mean=mu_mean, mu_std=mu_std
@@ -138,7 +141,13 @@ def train_one_epoch(epoch: int):
         if use_sc:
             with torch.no_grad():
                 if idx_c.numel() > 0:
-                    pred_ng_c = diff_model(x_t[idx_c], t[idx_c], cond_summary=cond_summary_flat[idx_c], sc_feat=None)
+                    pred_ng_c = diff_model(
+                        x_t[idx_c], t[idx_c],
+                        series=series_flat[idx_c],
+                        series_mask=mask_flat[idx_c],
+                        series_diff=series_diff_flat[idx_c],
+                        sc_feat=None
+                    )
                     sc_feat_c = scheduler.to_x0(x_t[idx_c], t[idx_c], pred_ng_c, crypto_config.PREDICT_TYPE).detach()
                 if idx_u.numel() > 0:
                     pred_ng_u = diff_model(x_t[idx_u], t[idx_u], cond_summary=None, sc_feat=None)
@@ -152,11 +161,14 @@ def train_one_epoch(epoch: int):
             if idx_c.numel() > 0:
                 loss_c = diffusion_loss(
                     diff_model, scheduler, mu_norm[idx_c], t[idx_c],
-                    cond_summary=cond_summary_flat[idx_c], predict_type=crypto_config.PREDICT_TYPE,
+                    cond_summary=None, predict_type=crypto_config.PREDICT_TYPE,
                     weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
                     minsnr_gamma=crypto_config.MINSNR_GAMMA,
                     sc_feat=sc_feat_c,
                     reuse_xt_eps=(x_t[idx_c], eps_true[idx_c]),
+                    series=series_flat[idx_c],
+                    series_mask=mask_flat[idx_c],
+                    series_diff=series_diff_flat[idx_c]
                 )
                 loss = loss + loss_c * (idx_c.numel() / Beff)
 
@@ -216,11 +228,15 @@ def validate():
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=False)
+        series = V.permute(0, 2, 1, 3).to(device)
+        series_diff = T.permute(0, 2, 1, 3).to(device)
+        mask_bn_dev = mask_bn.to(device)
         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
-        cond_summary_flat = cond_summary[batch_ids]
+        series_flat = series[batch_ids]
+        series_diff_flat = series_diff[batch_ids]
+        mask_flat = mask_bn_dev[batch_ids]
         mu_norm = encode_mu_norm(
             vae, y_in,
             mu_mean=mu_mean, mu_std=mu_std
@@ -230,7 +246,10 @@ def validate():
         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
         loss = diffusion_loss(
             diff_model, scheduler, mu_norm, t,
-            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
+            cond_summary=None, predict_type=crypto_config.PREDICT_TYPE,
+            series=series_flat,
+            series_mask=mask_flat,
+            series_diff=series_diff_flat
         )
         total += loss.item() * mu_norm.size(0)
         count += mu_norm.size(0)
@@ -239,15 +258,18 @@ def validate():
         probe_n = min(128, mu_norm.size(0))
         if probe_n > 0:
             mu_p = mu_norm[:probe_n]
-            cs_p = cond_summary_flat[:probe_n]
+    
             t_p = sample_t_uniform(scheduler, probe_n, device)
             noise_p = torch.randn_like(mu_p)
             x_t_p, eps_p = scheduler.q_sample(mu_p, t_p, noise_p)
 
             loss_cond = diffusion_loss(
                 diff_model, scheduler, mu_p, t_p,
-                cond_summary=cs_p, predict_type=crypto_config.PREDICT_TYPE,
-                reuse_xt_eps=(x_t_p, eps_p)
+                cond_summary=None, predict_type=crypto_config.PREDICT_TYPE,
+                reuse_xt_eps=(x_t_p, eps_p),
+                series=series_flat[:probe_n],
+                series_mask=mask_flat[:probe_n],
+                series_diff=series_diff_flat[:probe_n]
             ).item()
 
             loss_unco = diffusion_loss(
@@ -405,11 +427,15 @@ def finetune_vae_decoder(
         for xb, yb, meta in loader:
             V, T = xb
             mask_bn = meta["entity_mask"]
-            cs_full = build_context(diff_model, V, T, mask_bn, device)
+            series = V.permute(0, 2, 1, 3).to(device)
+            series_diff = T.permute(0, 2, 1, 3).to(device)
+            mask_bn_dev = mask_bn.to(device)
             y_true, batch_ids = _flatten_for_mask(yb, mask_bn, device)
             if y_true is None:
                 continue
-            cs = cs_full[batch_ids]
+            series_flat = series[batch_ids]
+            series_diff_flat = series_diff[batch_ids]
+            mask_flat = mask_bn_dev[batch_ids]
 
             Beff, Hcur, Z = y_true.size(0), y_true.size(1), mu_mean.numel()
 
@@ -418,7 +444,10 @@ def finetune_vae_decoder(
                 x0_norm_gen = diff_model.generate(
                     shape=(Beff, Hcur, Z), steps=gen_steps,
                     guidance_strength=guidance_strength, guidance_power=guidance_power,
-                    cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
+                    series=series_flat,
+                    series_mask=mask_flat,
+                    series_diff=series_diff_flat,
+                    self_cond=crypto_config.SELF_COND, cfg_rescale=True
                 )
 
                 # ---- Forward decoder on generated latents ----
@@ -517,11 +546,15 @@ def evaluate_regression(
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        cond_summary = build_context(diff_model, V, T, mask_bn, device)
+        series = V.permute(0, 2, 1, 3).to(device)
+        series_diff = T.permute(0, 2, 1, 3).to(device)
+        mask_bn_dev = mask_bn.to(device)
         y_in, batch_ids = _flatten_for_mask(yb, mask_bn, device)
         if y_in is None:
             continue
-        cs = cond_summary[batch_ids]
+        series_flat = series[batch_ids]
+        series_diff_flat = series_diff[batch_ids]
+        mask_flat = mask_bn_dev[batch_ids]
 
         Beff, Hcur, Z = y_in.size(0), y_in.size(1), config.VAE_LATENT_CHANNELS
 
@@ -532,7 +565,10 @@ def evaluate_regression(
             x0_norm = diff_model.generate(
                 shape=(Beff, Hcur, Z), steps=steps,
                 guidance_strength=guidance_strength, guidance_power=guidance_power,
-                cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
+                series=series_flat,
+                series_mask=mask_flat,
+                series_diff=series_diff_flat,
+                self_cond=crypto_config.SELF_COND, cfg_rescale=True
             )
 
             y_hat_sample = decode_latents_with_vae(
