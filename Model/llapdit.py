@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Union, List
 from Model.global_summary import UnifiedGlobalSummarizer
-from Model.llapdit_utils import NoiseScheduler
+from Model.llapdit_utils import NoiseScheduler, normalize_cond_per_batch
 from Model.pos_time_emb import timestep_embedding
 from Model.lapformer import LapFormer
 
@@ -36,13 +36,15 @@ class LLapDiT(nn.Module):
                  lap_mode_cond: str = 'parallel',
                  summery_mode: str = 'EFF',
                  zero_first_step: bool = True,
-                 add_guidance_tokens: bool = True):
+                 add_guidance_tokens: bool = True,
+                 normalize_context: bool = True):
         super().__init__()
         assert predict_type in ('eps', 'v')
         if num_entities is None:
             raise ValueError("num_entities must be provided (int) for the global summarizer.")
         self.predict_type = predict_type
         self.self_conditioning = bool(self_conditioning)
+        self.normalize_context = bool(normalize_context)
 
         # diffusion utils (not used in forward path tests)
         self.scheduler = NoiseScheduler(timesteps=timesteps, schedule=schedule)
@@ -85,15 +87,32 @@ class LLapDiT(nn.Module):
     def _time_embed(self, t: torch.Tensor) -> torch.Tensor:
         te = timestep_embedding(t, self.time_dim)  # [B, H]
         return F.silu(te)
-
+    def build_cond_summary(self,
+                           series: torch.Tensor,
+                           *,
+                           series_mask: Optional[torch.Tensor] = None,
+                           series_dt: Optional[torch.Tensor] = None,
+                           series_diff: Optional[torch.Tensor] = None,
+                           normalize: Optional[bool] = None,
+                           detach: bool = False) -> torch.Tensor:
+        """Construct conditioning summary directly from raw context series."""
+        summary, _ = self.context(series, pad_mask=None, dt=series_dt,
+                                  ctx_diff=series_diff, entity_mask=series_mask)
+        do_norm = self.normalize_context if normalize is None else normalize
+        if do_norm:
+            summary = normalize_cond_per_batch(summary)
+        return summary.detach() if detach else summary
+                               
     def _maybe_build_cond(self, series, cond_summary=None, entity_ids=None,
                           ctx_dt=None, ctx_diff=None, entity_mask=None):
         if cond_summary is not None or series is None:
             return cond_summary
-        # Pass dt, ctx_diff, and entity_mask so summarizer can be dt-/mask-aware
-        summary, _ = self.context(series, pad_mask=None, dt=ctx_dt,
-                                  ctx_diff=ctx_diff, entity_mask=entity_mask)
-        return summary
+        # Pass ctx_diff, and entity_mask so summarizer can be mask-aware
+        return self.build_cond_summary(series,
+                                       series_mask=entity_mask,
+                                       series_dt=ctx_dt,
+                                       series_diff=ctx_diff,
+                                       normalize=None)
 
     # -------------------------------
     # Forward call
