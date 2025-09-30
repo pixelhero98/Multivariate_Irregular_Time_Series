@@ -456,7 +456,7 @@ def finetune_vae_decoder(
         for xb, yb, meta in loader:
             V, T = xb
             mask_bn = meta["entity_mask"]
-            cs_full = build_context(diff_model, V, T, mask_bn, device)
+            cs_full = build_context(diff_model, V, T, mask_bn, device, requires_grad=False)
             y_true, batch_ids = _flatten_for_mask(yb, mask_bn, device)
             if y_true is None:
                 continue
