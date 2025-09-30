@@ -1,158 +1,137 @@
 import os
 import math
-from typing import Tuple
+import time
+import json
+from pathlib import Path
+from typing import Dict
 
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-import crypto_config
-from Dataset.fin_dataset import run_experiment
+from Dataset.data_gen import build_datasets  # assumed helper used across repo
+from Model.summarizer import LaplaceAE
+from crypto_config import CONFIG
 
-from Model.summarizer import EffSummarizerAE
 
-# -------------------- Data --------------------
-train_dl, val_dl, test_dl, sizes = run_experiment(
-    data_dir=crypto_config.DATA_DIR,
-    date_batching=crypto_config.date_batching,
-    dates_per_batch=crypto_config.BATCH_SIZE,
-    K=crypto_config.WINDOW,
-    H=crypto_config.PRED,
-    coverage=crypto_config.COVERAGE,
-)
-print("sizes:", sizes)
-train_size, val_size, test_size = sizes
+def set_seed(seed: int = 42):
+    import random
+    import numpy as np
+    random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
 
-# Peek a batch to infer shapes
-xb, yb, meta = next(iter(train_dl))
-V, T = xb  # [B,N,K,D], [B,N,K,D]
-M = meta["entity_mask"]  # [B,N]
-B, N, K, D = V.shape
-print("V:", V.shape, "T:", T.shape)
 
-# -------------------- Model --------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+def count_params(m: nn.Module) -> int:
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
-LAP_K = getattr(crypto_config, "SUM_LAP_K", 8)
-TV_DIM = getattr(crypto_config, "SUM_TV_DIM", 32)
-USE_RES_MLP = getattr(crypto_config, "SUM_USE_RES_MLP", True)
 
-model = EffSummarizerAE(num_entities=N, feat_dim=D, lap_k=LAP_K, tv_dim=TV_DIM, use_residual_mlp=USE_RES_MLP).to(device)
+def save_ckpt(path: Path, model: nn.Module, stats: Dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({'model': model.state_dict(), 'stats': stats}, path)
 
-# -------------------- Optimizer & Schedules --------------------
-LR = getattr(crypto_config, "SUM_LR", 2e-3)
-WD = getattr(crypto_config, "SUM_WD", 1e-4)
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
 
-SCALER = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+def run():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    cfg = CONFIG  # project-wide config
 
-EPOCHS = getattr(crypto_config, "SUM_EPOCHS", 200)
-MAX_PATIENCE = getattr(crypto_config, "SUM_MAX_PATIENCE", 20)
-W_V = getattr(crypto_config, "SUM_W_V", 1.0)
-W_T = getattr(crypto_config, "SUM_W_T", 1.0)
+    # ---- Hyperparams (lightweight; feel free to tune in CONFIG) ----
+    num_entities = cfg['NUM_ENTITIES']         # e.g., 200
+    feat_dim     = cfg.get('ENTITY_FEAT_DIM', 16)
+    seq_len      = cfg.get('SEQ_LEN', 118)
+    lap_k        = cfg.get('LAPLACE_K', 8)
+    out_len      = cfg.get('CTX_OUT_LEN', 16)
+    ctx_dim      = cfg.get('CTX_DIM', 256)
+    tv_hidden    = cfg.get('TV_HIDDEN', 32)
+    dropout      = cfg.get('CTX_DROPOUT', 0.0)
 
-# -------------------- Checkpointing --------------------
-model_dir = getattr(crypto_config, "SUM_DIR", os.path.join("./ldt/saved_model", "SUMMARIZER_EFF"))
-os.makedirs(model_dir, exist_ok=True)
-best_val = float("inf")
-patience = 0
-best_path = None
+    batch_size   = cfg.get('BATCH_SIZE', 20)
+    lr           = cfg.get('LR', 3e-4)
+    wd           = cfg.get('WEIGHT_DECAY', 1e-4)
+    epochs       = cfg.get('EPOCHS', 200)
+    grad_clip    = cfg.get('GRAD_CLIP', 1.0)
+    amp          = cfg.get('AMP', True)
 
-print("Starting summarizer pretraining.")
+    save_root    = Path(cfg.get('SAVE_DIR', './ldt/saved_model/CRYPTO_130'))
+    ckpt_path    = save_root / 'summarizer_laplaceAE.pt'
 
-# -------------------- Training loop --------------------
-for epoch in range(1, EPOCHS + 1):
-    model.train()
-    train_sum, train_elems = 0.0, 0
+    set_seed(cfg.get('SEED', 42))
 
-    for (xb, _, meta) in train_dl:
-        V, T = xb  # [B,N,K,D]
-        M = meta["entity_mask"].to(device)  # [B,N]
-        V = V.permute(0, 2, 1, 3).contiguous().to(device)  # -> [B,K,N,D]
-        T = T.permute(0, 2, 1, 3).contiguous().to(device)  # -> [B,K,N,D]
+    # ---- Data ----
+    train_ds, val_ds = build_datasets(cfg)  # should return items with keys: V,T,mask
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=cfg.get('NUM_WORKERS', 4), pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=cfg.get('NUM_WORKERS', 4), pin_memory=True)
 
-        optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-            loss, parts = model.recon_loss(V, T, entity_mask=M, w_v=W_V, w_t=W_T)
-        SCALER.scale(loss).backward()
-        SCALER.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        SCALER.step(optimizer)
-        SCALER.update()
+    # ---- Model ----
+    model = LaplaceAE(
+        num_entities=num_entities, feat_dim=feat_dim,
+        lap_k=lap_k, tv_hidden=tv_hidden, out_len=out_len, context_dim=ctx_dim, dropout=dropout
+    ).to(device)
 
-        # Track per-element mean over [B*T*N]
-        elems = (M.sum(dim=1, keepdim=True).clamp_min(1).expand(M.size(0), K).sum()).item()
-        train_sum += loss.item() * max(1, int(elems))
-        train_elems += max(1, int(elems))
+    print(f"Model params: {count_params(model)/1e6:.2f}M")
 
-    train_mean = train_sum / max(1, train_elems)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    scaler = GradScaler(enabled=amp)
 
-    # --------------- Validation ---------------
-    model.eval()
-    val_sum, val_elems = 0.0, 0
-    with torch.no_grad():
-        for (xb, _, meta) in val_dl:
-            V, T = xb
-            M = meta["entity_mask"].to(device)
-            V = V.permute(0, 2, 1, 3).contiguous().to(device)  # [B,K,N,D]
-            T = T.permute(0, 2, 1, 3).contiguous().to(device)  # [B,K,N,D]
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                loss, parts = model.recon_loss(V, T, entity_mask=M, w_v=W_V, w_t=W_T)
-            elems = (M.sum(dim=1, keepdim=True).clamp_min(1).expand(M.size(0), K).sum()).item()
-            val_sum += loss.item() * max(1, int(elems))
-            val_elems += max(1, int(elems))
+    best_val = float('inf')
+    history = {}
 
-    val_mean = val_sum / max(1, val_elems)
+    for epoch in range(1, epochs + 1):
+        t0 = time.time()
+        model.train()
+        tr_loss = 0.0
+        n_tr = 0
+        for batch in train_loader:
+            # Expect keys: 'V': [B,K,N,D], 'T': [B,K,N,D], 'entity_mask': [B,N]
+            V = batch['V'].to(device)
+            T = batch['T'].to(device)
+            mask = batch['entity_mask'].to(device)
 
-    print(f"Epoch {epoch}/{EPOCHS} | Train {train_mean:.6f} | Val {val_mean:.6f}")
+            opt.zero_grad(set_to_none=True)
+            with autocast(enabled=amp):
+                _, aux = model(V, ctx_diff=T, entity_mask=mask)
+                loss = model.recon_loss(aux, mask)
+            scaler.scale(loss).backward()
+            if grad_clip is not None and grad_clip > 0:
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(opt)
+            scaler.update()
 
-    improved = val_mean < best_val * 0.995
-    if improved:
-        best_val = val_mean
-        best_path = os.path.join(model_dir, f"summarizer_eff_k{LAP_K}.pt")
-        torch.save(model.state_dict(), best_path)
-        print("  -> Saved best checkpoint")
-        patience = 0
-    else:
-        patience += 1
-        if patience >= MAX_PATIENCE:
-            print(f"Early stopping at epoch {epoch} (no val improvement in {MAX_PATIENCE} epochs).")
-            break
+            tr_loss += loss.item() * V.size(0)
+            n_tr += V.size(0)
 
-# -------------------- Export encoder stats (μ,σ) for whitening if desired) --------------------
-@torch.no_grad()
-def export_feature_stats(dloader) -> Tuple[torch.Tensor, torch.Tensor]:
-    model.eval()
-    running_sum = None
-    running_sq = None
-    count = 0
-    for (xb, _, meta) in dloader:
-        V, T = xb
-        M = meta["entity_mask"].to(device)
-        V = V.permute(0, 2, 1, 3).contiguous().to(device)
-        T = T.permute(0, 2, 1, 3).contiguous().to(device)
-        L = model.summarize(V, T, entity_mask=M)  # [B,K,4K]
-        B, TT, C = L.shape
-        L = L.view(B * TT, C)
-        if running_sum is None:
-            running_sum = L.sum(dim=0)
-            running_sq = (L ** 2).sum(dim=0)
-        else:
-            running_sum += L.sum(dim=0)
-            running_sq += (L ** 2).sum(dim=0)
-        count += L.size(0)
-    mu = running_sum / max(1, count)
-    var = running_sq / max(1, count) - mu ** 2
-    std = var.clamp_min(1e-8).sqrt()
-    return mu.cpu(), std.cpu()
+        tr_loss /= max(1, n_tr)
 
-mu, std = export_feature_stats(train_dl)
-if best_path is None:
-    best_path = os.path.join(model_dir, "last.pt")
-    torch.save(model.state_dict(), best_path)
+        # ---- Validation ----
+        model.eval()
+        val_loss = 0.0
+        n_val = 0
+        with torch.no_grad(), autocast(enabled=amp):
+            for batch in val_loader:
+                V = batch['V'].to(device)
+                T = batch['T'].to(device)
+                mask = batch['entity_mask'].to(device)
+                _, aux = model(V, ctx_diff=T, entity_mask=mask)
+                loss = model.recon_loss(aux, mask)
+                val_loss += loss.item() * V.size(0)
+                n_val += V.size(0)
+        val_loss /= max(1, n_val)
 
-stats_path = os.path.join(model_dir, f"summarizer_eff_k{LAP_K}_stats.pt")
-torch.save({"mu": mu, "std": std}, stats_path)
-print(f"Saved summarizer to: {best_path}\nSaved feature stats to: {stats_path}")
+        dt = time.time() - t0
+        improved = val_loss < best_val - 1e-6
+        if improved:
+            best_val = val_loss
+            save_ckpt(ckpt_path, model, {'epoch': epoch, 'val_loss': val_loss})
 
+        print(
+            f"Epoch {epoch:03d} | train: {tr_loss:.6f} | val: {val_loss:.6f} | "
+            f"best: {best_val:.6f} | {'*' if improved else ' '} | {dt:.1f}s"
+        )
+
+    # Final save for reference
+    save_ckpt(ckpt_path.with_suffix('.final.pt'), model, {'best_val': best_val, 'epochs': epochs})
+
+
+if __name__ == "__main__":
+    run()
