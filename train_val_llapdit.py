@@ -311,6 +311,10 @@ else:
         print(f"Model path not found: {skip_with_trained_model}. Starting training from scratch.")
 
     best_val = float("inf")
+    best_cond_gap = -float("inf")
+    best_summary_state = None
+    cond_gap_plateau = 0
+    summarizer_frozen = False
     patience = 0
     current_best_path = None
     os.makedirs(crypto_config.CKPT_DIR, exist_ok=True)
@@ -329,13 +333,35 @@ else:
             if BASELINE_V_VARIANCE is not None
             else float("nan")
         )
-
+        cond_gap_scaled = cond_gap * Z if math.isfinite(cond_gap) else float("nan")
         print(
             f"Epoch {epoch:03d} | train: {train_loss:.6f} "
-            f"| val: {val_loss:.6f} | cond_gap: {cond_gap * Z:.6f} "
+            f"| val: {val_loss:.6f} | cond_gap: {cond_gap_scaled:.6f} "
             f"| val/v_var: {val_vs_baseline:.6f} | improvement: {improvement:.6f}"
         )
 
+        if (not summarizer_frozen and getattr(crypto_config, "FREEZE_SUMMARIZER_ON_PLATEAU", False)):
+            if math.isfinite(cond_gap_scaled):
+                if cond_gap_scaled > best_cond_gap + getattr(crypto_config, "COND_GAP_TOL", 0.0):
+                    best_cond_gap = cond_gap_scaled
+                    cond_gap_plateau = 0
+                    best_summary_state = {
+                        k: v.detach().cpu() for k, v in diff_model.context.state_dict().items()
+                    }
+                else:
+                    cond_gap_plateau += 1
+            else:
+                cond_gap_plateau += 1
+
+            if cond_gap_plateau >= getattr(crypto_config, "COND_GAP_PATIENCE", 0) and best_summary_state is not None:
+                diff_model.context.load_state_dict(best_summary_state)
+                diff_model.context.requires_grad_(False)
+                summarizer_frozen = True
+                print(
+                    f"[info] Freezing summarizer at epoch {epoch} after cond_gap plateau. "
+                    f"Best cond_gap (scaled): {best_cond_gap:.6f}"
+                )
+              
         # checkpoint best (with EMA state)
         if val_loss < best_val:
             best_val = val_loss;
