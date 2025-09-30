@@ -138,7 +138,7 @@ class LLapDiT(nn.Module):
             
         t_emb = self._time_embed(t).to(x_t.dtype)
         # Pass dt to LapFormer (only used when lap_mode='recurrent')
-        raw = self.model(x_t, t_emb, cond_summary=cond_summary, sc_feat=sc_feat, dt=dt)
+        raw = self.model(x_t, t_emb, cond_summary=final_cond, sc_feat=sc_feat, dt=dt)
         return raw
 
     # -------------------------------
