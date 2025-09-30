@@ -180,6 +180,7 @@ def train_one_epoch(epoch: int):
                     minsnr_gamma=crypto_config.MINSNR_GAMMA,
                     sc_feat=sc_feat_u,
                     reuse_xt_eps=(x_t[idx_u], eps_true[idx_u]),
+                    entity_ids=entity_ids[idx_u]
                 )
                 loss = loss + loss_u * (idx_u.numel() / Beff)
 
@@ -279,7 +280,8 @@ def validate():
             loss_unco = diffusion_loss(
                 diff_model, scheduler, mu_p, t_p,
                 cond_summary=None, predict_type=crypto_config.PREDICT_TYPE,
-                reuse_xt_eps=(x_t_p, eps_p)
+                reuse_xt_eps=(x_t_p, eps_p),
+                entity_ids=ent_p
             ).item()
 
             cond_gap_accum += (loss_unco - loss_cond)
