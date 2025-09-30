@@ -463,7 +463,14 @@ def finetune_vae_decoder(
             if y_true is None:
                 continue
             cs = cs_full[batch_ids]
-
+            mask_flat = mask_bn.to(device=device, dtype=torch.bool).reshape(-1)
+            entity_index = (
+                torch.arange(mask_bn.size(1), device=device)
+                .unsqueeze(0)
+                .expand(mask_bn.size(0), -1)
+                .reshape(-1)
+            )
+            entity_ids = entity_index[mask_flat]
             Beff, Hcur, Z = y_true.size(0), y_true.size(1), mu_mean.numel()
 
             # ---- Generate x0_norm in latent space (no grads) ----
@@ -472,6 +479,7 @@ def finetune_vae_decoder(
                     shape=(Beff, Hcur, Z), steps=gen_steps,
                     guidance_strength=guidance_strength, guidance_power=guidance_power,
                     cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
+                    entity_ids=entity_ids
                 )
 
                 # ---- Forward decoder on generated latents ----
@@ -575,7 +583,14 @@ def evaluate_regression(
         if y_in is None:
             continue
         cs = cond_summary[batch_ids]
-
+        mask_flat = mask_bn.to(device=device, dtype=torch.bool).reshape(-1)
+        entity_index = (
+            torch.arange(mask_bn.size(1), device=device)
+            .unsqueeze(0)
+            .expand(mask_bn.size(0), -1)
+            .reshape(-1)
+        )
+        entity_ids = entity_index[mask_flat]
         Beff, Hcur, Z = y_in.size(0), y_in.size(1), config.VAE_LATENT_CHANNELS
 
         # ---- Generate multiple samples in latent space and decode ----
@@ -586,6 +601,7 @@ def evaluate_regression(
                 shape=(Beff, Hcur, Z), steps=steps,
                 guidance_strength=guidance_strength, guidance_power=guidance_power,
                 cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
+                entity_ids=entity_ids
             )
 
             y_hat_sample = decode_latents_with_vae(
