@@ -1,4 +1,4 @@
-import os, torch
+import os, torch, math
 import crypto_config
 from torch import nn
 from tqdm import tqdm
@@ -117,6 +117,14 @@ def train_one_epoch(epoch: int):
             continue
 
         cond_summary_flat = cond_summary[batch_ids]  # [Beff,S,Hm]
+        mask_flat = mask_bn.to(device=device, dtype=torch.bool).reshape(-1)
+        entity_index = (
+            torch.arange(mask_bn.size(1), device=device)
+            .unsqueeze(0)
+            .expand(mask_bn.size(0), -1)
+            .reshape(-1)
+        )
+        entity_ids = entity_index[mask_flat]
         mu_norm = encode_mu_norm(
             vae, y_in,
             mu_mean=mu_mean, mu_std=mu_std
@@ -160,6 +168,7 @@ def train_one_epoch(epoch: int):
                     minsnr_gamma=crypto_config.MINSNR_GAMMA,
                     sc_feat=sc_feat_c,
                     reuse_xt_eps=(x_t[idx_c], eps_true[idx_c]),
+                    entity_ids=entity_ids[idx_c]
                 )
                 loss = loss + loss_c * (idx_c.numel() / Beff)
 
@@ -224,6 +233,16 @@ def validate():
         if y_in is None:
             continue
         cond_summary_flat = cond_summary[batch_ids]
+
+        mask_flat = mask_bn.to(device=device, dtype=torch.bool).reshape(-1)
+        entity_index = (
+            torch.arange(mask_bn.size(1), device=device)
+            .unsqueeze(0)
+            .expand(mask_bn.size(0), -1)
+            .reshape(-1)
+        )
+        entity_ids = entity_index[mask_flat]
+        
         mu_norm = encode_mu_norm(
             vae, y_in,
             mu_mean=mu_mean, mu_std=mu_std
@@ -233,7 +252,8 @@ def validate():
         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
         loss = diffusion_loss(
             diff_model, scheduler, mu_norm, t,
-            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
+            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE,
+            entity_ids=entity_ids
         )
         total += loss.item() * mu_norm.size(0)
         count += mu_norm.size(0)
@@ -241,8 +261,10 @@ def validate():
         # low-variance cond_gap probe: reuse same (t, x_t, eps) for both branches
         probe_n = min(128, mu_norm.size(0))
         if probe_n > 0:
-            mu_p = mu_norm[:probe_n]
-            cs_p = cond_summary_flat[:probe_n]
+            sample_idx = torch.randperm(mu_norm.size(0), device=device)[:probe_n]
+            mu_p = mu_norm[sample_idx]
+            cs_p = cond_summary_flat[sample_idx]
+            ent_p = entity_ids[sample_idx]
             t_p = sample_t_uniform(scheduler, probe_n, device)
             noise_p = torch.randn_like(mu_p)
             x_t_p, eps_p = scheduler.q_sample(mu_p, t_p, noise_p)
@@ -250,7 +272,8 @@ def validate():
             loss_cond = diffusion_loss(
                 diff_model, scheduler, mu_p, t_p,
                 cond_summary=cs_p, predict_type=crypto_config.PREDICT_TYPE,
-                reuse_xt_eps=(x_t_p, eps_p)
+                reuse_xt_eps=(x_t_p, eps_p),
+                entity_ids=ent_p
             ).item()
 
             loss_unco = diffusion_loss(
