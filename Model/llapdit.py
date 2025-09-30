@@ -35,7 +35,7 @@ class LLapDiT(nn.Module):
                  lap_mode_main: str = 'recurrent',
                  lap_mode_cond: str = 'parallel',
                  summery_mode: str = 'EFF',
-                 zero_first_step: bool = True,
+                 zero_first_step: bool = False,
                  add_guidance_tokens: bool = True):
         super().__init__()
         assert predict_type in ('eps', 'v')
@@ -62,9 +62,7 @@ class LLapDiT(nn.Module):
             zero_first_step=zero_first_step,
             mode=summery_mode
         )
-                     
-        self.entity_embed = nn.Embedding(num_entities, hidden_dim)
-                     
+
         # main LapFormer (mode tied to summarizer)
 
         self.model = LapFormer(
@@ -121,24 +119,9 @@ class LLapDiT(nn.Module):
             ctx_diff=series_diff,
             entity_mask=series_mask
         )
-                    
-        final_cond = cond_summary
-        if entity_ids is not None:
-            ent_emb = self.entity_embed(entity_ids.long()).unsqueeze(1)
-            if final_cond is not None:
-                # Add entity info to the existing time-series context
-                if final_cond.size(0) != entity_ids.size(0):
-                    raise ValueError(
-                        "entity_ids must have the same batch dimension as cond_summary"
-                    )
-                final_cond = final_cond + ent_emb
-            else:
-                # Use entity info as the sole conditioning
-                final_cond = ent_emb
-            
         t_emb = self._time_embed(t).to(x_t.dtype)
         # Pass dt to LapFormer (only used when lap_mode='recurrent')
-        raw = self.model(x_t, t_emb, cond_summary=final_cond, sc_feat=sc_feat, dt=dt)
+        raw = self.model(x_t, t_emb, cond_summary=cond_summary, sc_feat=sc_feat, dt=dt)
         return raw
 
     # -------------------------------
