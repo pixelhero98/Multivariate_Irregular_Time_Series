@@ -14,7 +14,8 @@ from Model.llapdit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_ma
                                  )
 
 # ============================ Training setup ============================
-
+# Baseline variance for validation comparisons (populated after initial computation)
+BASELINE_V_VARIANCE = None
 device = set_torch()
 context_grad_checked = False
 train_dl, val_dl, test_dl, sizes = run_experiment(
@@ -83,6 +84,7 @@ v_variance = calculate_v_variance(
 )
 print(f"calculated V-Prediction Target Variance: {v_variance:.4f}")
 print("=========================================================")
+BASELINE_V_VARIANCE = float(v_variance)
 
 ema = EMA(diff_model, decay=crypto_config.EMA_DECAY) if crypto_config.USE_EMA_EVAL else None
 
@@ -317,8 +319,22 @@ else:
         train_loss = train_one_epoch(epoch)
         val_loss, cond_gap = validate()
         Z = crypto_config.VAE_LATENT_CHANNELS
-        print(f"Epoch {epoch:03d} | train: {train_loss:.6f} "
-              f"| val: {val_loss:.6f} | cond_gap: {cond_gap * Z:.6f}")
+        val_vs_baseline = (
+            val_loss / BASELINE_V_VARIANCE
+            if BASELINE_V_VARIANCE and BASELINE_V_VARIANCE > 0
+            else float("inf")
+        )
+        improvement = (
+            BASELINE_V_VARIANCE - val_loss
+            if BASELINE_V_VARIANCE is not None
+            else float("nan")
+        )
+
+        print(
+            f"Epoch {epoch:03d} | train: {train_loss:.6f} "
+            f"| val: {val_loss:.6f} | cond_gap: {cond_gap * Z:.6f} "
+            f"| val/v_var: {val_vs_baseline:.6f} | improvement: {improvement:.6f}"
+        )
 
         # checkpoint best (with EMA state)
         if val_loss < best_val:
@@ -327,9 +343,20 @@ else:
             if current_best_path and os.path.exists(current_best_path):
                 os.remove(current_best_path)
 
+            val_vs_baseline = (
+                val_loss / BASELINE_V_VARIANCE
+                if BASELINE_V_VARIANCE and BASELINE_V_VARIANCE > 0
+                else float("inf")
+            )
+            ratio_str = (
+                f"{val_vs_baseline:.6f}"
+                if math.isfinite(val_vs_baseline)
+                else ("inf" if val_vs_baseline > 0 else "nan")
+            )
+            
             ckpt_path = os.path.join(
                 crypto_config.CKPT_DIR,
-                f"mode-{crypto_config.LAP_MODE_main}-pred-{crypto_config.PRED}_ch-{crypto_config.VAE_LATENT_CHANNELS}_val_{val_loss:.6f}_cond_{cond_gap * Z:.6f}.pt"
+                f"mode-{crypto_config.LAP_MODE_main}-pred-{crypto_config.PRED}_ch-{crypto_config.VAE_LATENT_CHANNELS}_val_{val_loss:.6f}_cond_{cond_gap * Z:.6f}_ratio_{ratio_str}.pt"
             )
             save_payload = {
                 "epoch": epoch,
