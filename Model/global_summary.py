@@ -113,7 +113,7 @@ class EfficientSummarizer(nn.Module):
             if self.zero_first_step:
                 lap_tokens = lap_tokens.clone();
                 lap_tokens[:, :1, :] = 0
-            memory = torch.cat([K, lap_tokens], dim=1)
+            memory = K + lap_tokens #torch.cat([K, lap_tokens], dim=1)
             values = memory
             key_padding_mask = (None if pad_mask is None else
                                 torch.cat([pad_mask.to(torch.bool),
