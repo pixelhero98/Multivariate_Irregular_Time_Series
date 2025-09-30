@@ -10,9 +10,9 @@ import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-from Dataset.data_gen import build_datasets  # assumed helper used across repo
+from Dataset.fin_dataset import run_experiment
 from Model.summarizer import LaplaceAE
-from crypto_config import CONFIG
+import crypto_config
 
 
 def set_seed(seed: int = 42):
@@ -33,38 +33,45 @@ def save_ckpt(path: Path, model: nn.Module, stats: Dict):
 
 def run():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    cfg = CONFIG  # project-wide config
 
-    # ---- Hyperparams (lightweight; feel free to tune in CONFIG) ----
-    num_entities = cfg['NUM_ENTITIES']         # e.g., 200
-    feat_dim     = cfg.get('ENTITY_FEAT_DIM', 16)
-    seq_len      = cfg.get('SEQ_LEN', 118)
-    lap_k        = cfg.get('LAPLACE_K', 8)
-    out_len      = cfg.get('CTX_OUT_LEN', 16)
-    ctx_dim      = cfg.get('CTX_DIM', 256)
-    tv_hidden    = cfg.get('TV_HIDDEN', 32)
-    dropout      = cfg.get('CTX_DROPOUT', 0.0)
+    # ---- Hyperparams (read from crypto_config to mirror VAE script) ----
+    lap_k     = getattr(crypto_config, 'LAPLACE_K', 8)
+    out_len   = getattr(crypto_config, 'CTX_OUT_LEN', 16)
+    ctx_dim   = getattr(crypto_config, 'CTX_DIM', 256)
+    tv_hidden = getattr(crypto_config, 'TV_HIDDEN', 32)
+    dropout   = getattr(crypto_config, 'CTX_DROPOUT', 0.0)
 
-    batch_size   = cfg.get('BATCH_SIZE', 20)
-    lr           = cfg.get('LR', 3e-4)
-    wd           = cfg.get('WEIGHT_DECAY', 1e-4)
-    epochs       = cfg.get('EPOCHS', 200)
-    grad_clip    = cfg.get('GRAD_CLIP', 1.0)
-    amp          = cfg.get('AMP', True)
+    lr        = getattr(crypto_config, 'BASE_LR', 3e-4)
+    wd        = getattr(crypto_config, 'WEIGHT_DECAY', 1e-4)
+    epochs    = getattr(crypto_config, 'EPOCHS', 200)
+    grad_clip = getattr(crypto_config, 'GRAD_CLIP', 1.0)
+    amp       = getattr(crypto_config, 'AMP', True)
 
-    save_root    = Path(cfg.get('SAVE_DIR', './ldt/saved_model/CRYPTO_130'))
-    ckpt_path    = save_root / 'summarizer_laplaceAE.pt'
+    model_dir = Path(getattr(crypto_config, 'SUM_DIR', './ldt/saved_model/SUMMARIZER_EFF'))
+    ckpt_path = model_dir / 'summarizer_laplaceAE.pt'
 
-    set_seed(cfg.get('SEED', 42))
+    set_seed(getattr(crypto_config, 'SEED', 42))
 
-    # ---- Data ----
-    train_ds, val_ds = build_datasets(cfg)  # should return items with keys: V,T,mask
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=cfg.get('NUM_WORKERS', 4), pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=cfg.get('NUM_WORKERS', 4), pin_memory=True)
+    # ---- Data (identical entrypoint to VAE) ----
+    train_loader, val_loader, test_loader, sizes = run_experiment(
+        data_dir=crypto_config.DATA_DIR,
+        date_batching=crypto_config.date_batching,
+        dates_per_batch=crypto_config.BATCH_SIZE,
+        K=crypto_config.WINDOW,
+        H=crypto_config.PRED,
+        coverage=crypto_config.COVERAGE,
+    )
+    print('sizes:', sizes)
+
+    # Probe one batch for dims
+    (xb, yb, meta0) = next(iter(train_loader))
+    V0, T0 = xb  # [B,N,K,F]
+    B0, N0, K0, F0 = V0.shape
+    print('V:', V0.shape, 'T:', T0.shape, 'y:', yb.shape)
 
     # ---- Model ----
     model = LaplaceAE(
-        num_entities=num_entities, feat_dim=feat_dim,
+        num_entities=N0, feat_dim=F0,
         lap_k=lap_k, tv_hidden=tv_hidden, out_len=out_len, context_dim=ctx_dim, dropout=dropout
     ).to(device)
 
@@ -81,11 +88,11 @@ def run():
         model.train()
         tr_loss = 0.0
         n_tr = 0
-        for batch in train_loader:
-            # Expect keys: 'V': [B,K,N,D], 'T': [B,K,N,D], 'entity_mask': [B,N]
-            V = batch['V'].to(device)
-            T = batch['T'].to(device)
-            mask = batch['entity_mask'].to(device)
+        for (V, T), y, meta in train_loader:
+            # V,T come as [B,N,K,F] → convert to [B,K,N,F]
+            V = V.permute(0, 2, 1, 3).contiguous().to(device)
+            T = T.permute(0, 2, 1, 3).contiguous().to(device)
+            mask = meta['entity_mask'].to(device)
 
             opt.zero_grad(set_to_none=True)
             with autocast(enabled=amp):
@@ -108,10 +115,10 @@ def run():
         val_loss = 0.0
         n_val = 0
         with torch.no_grad(), autocast(enabled=amp):
-            for batch in val_loader:
-                V = batch['V'].to(device)
-                T = batch['T'].to(device)
-                mask = batch['entity_mask'].to(device)
+            for (V, T), y, meta in val_loader:
+                V = V.permute(0, 2, 1, 3).contiguous().to(device)
+                T = T.permute(0, 2, 1, 3).contiguous().to(device)
+                mask = meta['entity_mask'].to(device)
                 _, aux = model(V, ctx_diff=T, entity_mask=mask)
                 loss = model.recon_loss(aux, mask)
                 val_loss += loss.item() * V.size(0)
