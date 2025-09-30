@@ -112,19 +112,11 @@ def train_one_epoch(epoch: int):
         mask_bn = meta["entity_mask"]
 
         cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=True)
-        y_in, batch_ids = flatten_targets(yb, mask_bn, device)
+        y_in, batch_ids, entity_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
 
         cond_summary_flat = cond_summary[batch_ids]  # [Beff,S,Hm]
-        mask_flat = mask_bn.to(device=device, dtype=torch.bool).reshape(-1)
-        entity_index = (
-            torch.arange(mask_bn.size(1), device=device)
-            .unsqueeze(0)
-            .expand(mask_bn.size(0), -1)
-            .reshape(-1)
-        )
-        entity_ids = entity_index[mask_flat]
         mu_norm = encode_mu_norm(
             vae, y_in,
             mu_mean=mu_mean, mu_std=mu_std
@@ -149,10 +141,22 @@ def train_one_epoch(epoch: int):
         if use_sc:
             with torch.no_grad():
                 if idx_c.numel() > 0:
-                    pred_ng_c = diff_model(x_t[idx_c], t[idx_c], cond_summary=cond_summary_flat[idx_c], sc_feat=None)
+                    pred_ng_c = diff_model(
+                        x_t[idx_c],
+                        t[idx_c],
+                        cond_summary=cond_summary_flat[idx_c],
+                        entity_ids=entity_ids[idx_c],
+                        sc_feat=None,
+                    )
                     sc_feat_c = scheduler.to_x0(x_t[idx_c], t[idx_c], pred_ng_c, crypto_config.PREDICT_TYPE).detach()
                 if idx_u.numel() > 0:
-                    pred_ng_u = diff_model(x_t[idx_u], t[idx_u], cond_summary=None, sc_feat=None)
+                    pred_ng_u = diff_model(
+                        x_t[idx_u],
+                        t[idx_u],
+                        cond_summary=None,
+                        entity_ids=entity_ids[idx_u],
+                        sc_feat=None,
+                    )
                     sc_feat_u = scheduler.to_x0(x_t[idx_u], t[idx_u], pred_ng_u, crypto_config.PREDICT_TYPE).detach()
 
         # --------- compute losses on each subset, weighted by fraction ---------
@@ -180,7 +184,7 @@ def train_one_epoch(epoch: int):
                     minsnr_gamma=crypto_config.MINSNR_GAMMA,
                     sc_feat=sc_feat_u,
                     reuse_xt_eps=(x_t[idx_u], eps_true[idx_u]),
-                    entity_ids=entity_ids[idx_u]
+                    entity_ids=entity_ids[idx_u],
                 )
                 loss = loss + loss_u * (idx_u.numel() / Beff)
 
@@ -230,20 +234,11 @@ def validate():
         mask_bn = meta["entity_mask"]
 
         cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=False)
-        y_in, batch_ids = flatten_targets(yb, mask_bn, device)
+        y_in, batch_ids, entity_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
         cond_summary_flat = cond_summary[batch_ids]
-
-        mask_flat = mask_bn.to(device=device, dtype=torch.bool).reshape(-1)
-        entity_index = (
-            torch.arange(mask_bn.size(1), device=device)
-            .unsqueeze(0)
-            .expand(mask_bn.size(0), -1)
-            .reshape(-1)
-        )
-        entity_ids = entity_index[mask_flat]
-        
+      
         mu_norm = encode_mu_norm(
             vae, y_in,
             mu_mean=mu_mean, mu_std=mu_std
@@ -459,7 +454,7 @@ def finetune_vae_decoder(
             V, T = xb
             mask_bn = meta["entity_mask"]
             cs_full = build_context(diff_model, V, T, mask_bn, device, requires_grad=False)
-            y_true, batch_ids = _flatten_for_mask(yb, mask_bn, device)
+            y_true, batch_ids, entity_ids = _flatten_for_mask(yb, mask_bn, device)
             if y_true is None:
                 continue
             cs = cs_full[batch_ids]
@@ -579,7 +574,7 @@ def evaluate_regression(
         mask_bn = meta["entity_mask"]
 
         cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=False)
-        y_in, batch_ids = _flatten_for_mask(yb, mask_bn, device)
+        y_in, batch_ids, entity_ids = _flatten_for_mask(yb, mask_bn, device)
         if y_in is None:
             continue
         cs = cond_summary[batch_ids]
