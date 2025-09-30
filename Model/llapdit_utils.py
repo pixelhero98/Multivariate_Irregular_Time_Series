@@ -411,6 +411,7 @@ def diffusion_loss(
     minsnr_gamma: float = 5.0,
     sc_feat: Optional[torch.Tensor] = None,
     reuse_xt_eps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    entity_ids: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """
     MSE on v/eps with optional MinSNR weighting.
@@ -441,7 +442,13 @@ def diffusion_loss(
         x_t, eps_true = reuse_xt_eps
 
     # --- Prediction target ---
-    pred = model(x_t, t, cond_summary=cond_summary, sc_feat=sc_feat)
+    pred = model(
+        x_t,
+        t,
+        cond_summary=cond_summary,
+        sc_feat=sc_feat,
+        entity_ids=entity_ids,
+    )
     if predict_type == "eps":
         target = eps_true
     elif predict_type == "v":
