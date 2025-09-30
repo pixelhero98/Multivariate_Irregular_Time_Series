@@ -62,7 +62,9 @@ class LLapDiT(nn.Module):
             zero_first_step=zero_first_step,
             mode=summery_mode
         )
-
+                     
+        self.entity_embed = nn.Embedding(num_entities, hidden_dim)
+                     
         # main LapFormer (mode tied to summarizer)
 
         self.model = LapFormer(
@@ -119,6 +121,14 @@ class LLapDiT(nn.Module):
             ctx_diff=series_diff,
             entity_mask=series_mask
         )
+                    
+        if cond_summary is not None and entity_ids is not None:
+            if cond_summary.size(0) != entity_ids.size(0):
+                raise ValueError(
+                    "entity_ids must have the same batch dimension as cond_summary"
+                )
+            cond_summary = cond_summary + self.entity_embed(entity_ids.long()).unsqueeze(1)
+            
         t_emb = self._time_embed(t).to(x_t.dtype)
         # Pass dt to LapFormer (only used when lap_mode='recurrent')
         raw = self.model(x_t, t_emb, cond_summary=cond_summary, sc_feat=sc_feat, dt=dt)
