@@ -244,23 +244,36 @@ def _print_log(metrics: dict, step: int, csv_path: str = None):
 
 
 # ============================ VAE Latent stats helpers ============================
-def flatten_targets(yb: torch.Tensor, mask_bn: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """yb: [B,N,H] -> y_in: [Beff,H,1], batch_ids: [Beff] mapping to B for cond rows"""
+def flatten_targets(
+    yb: torch.Tensor, mask_bn: torch.Tensor, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """yb: [B,N,H] -> (y_in: [Beff,H,1], batch_ids: [Beff], entity_ids: [Beff])"""
     y = yb.to(device)
     B, N, Hcur = y.shape
     y_flat = y.reshape(B * N, Hcur).unsqueeze(-1)  # [B*N, H, 1]
-    m_flat = mask_bn.to(device).reshape(B * N)
+    m_flat = mask_bn.to(device=device, dtype=torch.bool).reshape(B * N)
     if not m_flat.any():
-        return None, None
+        return None, None, None
     y_in = y_flat[m_flat]
-    batch_ids = torch.arange(B, device=device).unsqueeze(1).expand(B, N).reshape(B * N)[m_flat]
-    return y_in, batch_ids
+    batch_ids = (
+        torch.arange(B, device=device, dtype=torch.long)
+        .unsqueeze(1)
+        .expand(B, N)
+        .reshape(B * N)[m_flat]
+    )
+    entity_ids = (
+        torch.arange(N, device=device, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(B, N)
+        .reshape(B * N)[m_flat]
+    )
+    return y_in, batch_ids, entity_ids
 
 
 @torch.no_grad()
 def _flatten_for_mask(yb, mask_bn, device):
-    y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-    return y_in, batch_ids
+    y_in, batch_ids, entity_ids = flatten_targets(yb, mask_bn, device)
+    return y_in, batch_ids, entity_ids
 
 
 # ============================ EMA Weights (for evaluation) ============================
@@ -513,7 +526,7 @@ def calculate_v_variance(scheduler, dataloader, vae, device, latent_stats):
     for xb, yb, meta in dataloader:
         # This block is the same as in your validate() function
         # It gets the normalized latent variable 'mu_norm' which is the x0 for diffusion
-        y_in, _ = flatten_targets(yb, meta["entity_mask"], device)
+        y_in, _, _ = flatten_targets(yb, meta["entity_mask"], device)
         if y_in is None:
             continue
 
