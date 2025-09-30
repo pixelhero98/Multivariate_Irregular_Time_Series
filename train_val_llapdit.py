@@ -9,14 +9,14 @@ from Model.llapdit import LLapDiT
 from Model.llapdit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_mask,
                                  make_warmup_cosine, calculate_v_variance,
                                  compute_latent_stats, diffusion_loss,
-                                 flatten_targets, sample_t_uniform, decode_latents_with_vae
+                                 build_context, flatten_targets,
+                                 sample_t_uniform, decode_latents_with_vae
                                  )
 
 # ============================ Training setup ============================
 
 device = set_torch()
 context_grad_checked = False
-
 train_dl, val_dl, test_dl, sizes = run_experiment(
     data_dir=crypto_config.DATA_DIR,
     date_batching=crypto_config.date_batching,
@@ -95,6 +95,8 @@ lr_sched = make_warmup_cosine(optimizer, crypto_config.EPOCHS * max(1, len(train
                               base_lr=crypto_config.BASE_LR,
                               min_lr=crypto_config.MIN_LR)
 scaler = GradScaler(enabled=(device.type == "cuda"))
+
+
 # ============================ train/val loops ============================
 def train_one_epoch(epoch: int):
     diff_model.train()
@@ -102,21 +104,17 @@ def train_one_epoch(epoch: int):
     num_samples = 0
     global global_step
     global context_grad_checked
-  
+
     for xb, yb, meta in train_dl:
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        series = V.permute(0, 2, 1, 3).to(device)
-        series_diff = T.permute(0, 2, 1, 3).to(device)
-        mask_bn_dev = mask_bn.to(device)
+        cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=True)
         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
 
-        series_flat = series[batch_ids]
-        series_diff_flat = series_diff[batch_ids]
-        mask_flat = mask_bn_dev[batch_ids]
+        cond_summary_flat = cond_summary[batch_ids]  # [Beff,S,Hm]
         mu_norm = encode_mu_norm(
             vae, y_in,
             mu_mean=mu_mean, mu_std=mu_std
@@ -141,13 +139,7 @@ def train_one_epoch(epoch: int):
         if use_sc:
             with torch.no_grad():
                 if idx_c.numel() > 0:
-                    pred_ng_c = diff_model(
-                        x_t[idx_c], t[idx_c],
-                        series=series_flat[idx_c],
-                        series_mask=mask_flat[idx_c],
-                        series_diff=series_diff_flat[idx_c],
-                        sc_feat=None
-                    )
+                    pred_ng_c = diff_model(x_t[idx_c], t[idx_c], cond_summary=cond_summary_flat[idx_c], sc_feat=None)
                     sc_feat_c = scheduler.to_x0(x_t[idx_c], t[idx_c], pred_ng_c, crypto_config.PREDICT_TYPE).detach()
                 if idx_u.numel() > 0:
                     pred_ng_u = diff_model(x_t[idx_u], t[idx_u], cond_summary=None, sc_feat=None)
@@ -161,14 +153,11 @@ def train_one_epoch(epoch: int):
             if idx_c.numel() > 0:
                 loss_c = diffusion_loss(
                     diff_model, scheduler, mu_norm[idx_c], t[idx_c],
-                    cond_summary=None, predict_type=crypto_config.PREDICT_TYPE,
+                    cond_summary=cond_summary_flat[idx_c], predict_type=crypto_config.PREDICT_TYPE,
                     weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
                     minsnr_gamma=crypto_config.MINSNR_GAMMA,
                     sc_feat=sc_feat_c,
                     reuse_xt_eps=(x_t[idx_c], eps_true[idx_c]),
-                    series=series_flat[idx_c],
-                    series_mask=mask_flat[idx_c],
-                    series_diff=series_diff_flat[idx_c]
                 )
                 loss = loss + loss_c * (idx_c.numel() / Beff)
 
@@ -191,7 +180,7 @@ def train_one_epoch(epoch: int):
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-      
+
         if idx_c.numel() > 0 and not context_grad_checked:
             has_context_grad = any(p.grad is not None for p in diff_model.context.parameters())
             if not has_context_grad:
@@ -199,7 +188,7 @@ def train_one_epoch(epoch: int):
                     "Context parameters did not receive gradients despite being used for conditioning."
                 )
             context_grad_checked = True
-          
+
         if getattr(crypto_config, "GRAD_CLIP", 0.0) and crypto_config.GRAD_CLIP > 0:
             nn.utils.clip_grad_norm_(diff_model.parameters(), crypto_config.GRAD_CLIP)
         scaler.step(optimizer)
@@ -228,15 +217,11 @@ def validate():
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        series = V.permute(0, 2, 1, 3).to(device)
-        series_diff = T.permute(0, 2, 1, 3).to(device)
-        mask_bn_dev = mask_bn.to(device)
+        cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=False)
         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
-        series_flat = series[batch_ids]
-        series_diff_flat = series_diff[batch_ids]
-        mask_flat = mask_bn_dev[batch_ids]
+        cond_summary_flat = cond_summary[batch_ids]
         mu_norm = encode_mu_norm(
             vae, y_in,
             mu_mean=mu_mean, mu_std=mu_std
@@ -246,10 +231,7 @@ def validate():
         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
         loss = diffusion_loss(
             diff_model, scheduler, mu_norm, t,
-            cond_summary=None, predict_type=crypto_config.PREDICT_TYPE,
-            series=series_flat,
-            series_mask=mask_flat,
-            series_diff=series_diff_flat
+            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
         )
         total += loss.item() * mu_norm.size(0)
         count += mu_norm.size(0)
@@ -258,18 +240,15 @@ def validate():
         probe_n = min(128, mu_norm.size(0))
         if probe_n > 0:
             mu_p = mu_norm[:probe_n]
-    
+            cs_p = cond_summary_flat[:probe_n]
             t_p = sample_t_uniform(scheduler, probe_n, device)
             noise_p = torch.randn_like(mu_p)
             x_t_p, eps_p = scheduler.q_sample(mu_p, t_p, noise_p)
 
             loss_cond = diffusion_loss(
                 diff_model, scheduler, mu_p, t_p,
-                cond_summary=None, predict_type=crypto_config.PREDICT_TYPE,
-                reuse_xt_eps=(x_t_p, eps_p),
-                series=series_flat[:probe_n],
-                series_mask=mask_flat[:probe_n],
-                series_diff=series_diff_flat[:probe_n]
+                cond_summary=cs_p, predict_type=crypto_config.PREDICT_TYPE,
+                reuse_xt_eps=(x_t_p, eps_p)
             ).item()
 
             loss_unco = diffusion_loss(
@@ -329,7 +308,6 @@ else:
     else:
         print(f"Model path not found: {skip_with_trained_model}. Starting training from scratch.")
 
-
     best_val = float("inf")
     patience = 0
     current_best_path = None
@@ -374,6 +352,7 @@ else:
             if patience >= crypto_config.EARLY_STOP:
                 print("Early stopping.")
                 break
+
 
 # ============================ Decoder finetune + regression eval ============================
 
@@ -427,15 +406,11 @@ def finetune_vae_decoder(
         for xb, yb, meta in loader:
             V, T = xb
             mask_bn = meta["entity_mask"]
-            series = V.permute(0, 2, 1, 3).to(device)
-            series_diff = T.permute(0, 2, 1, 3).to(device)
-            mask_bn_dev = mask_bn.to(device)
+            cs_full = build_context(diff_model, V, T, mask_bn, device)
             y_true, batch_ids = _flatten_for_mask(yb, mask_bn, device)
             if y_true is None:
                 continue
-            series_flat = series[batch_ids]
-            series_diff_flat = series_diff[batch_ids]
-            mask_flat = mask_bn_dev[batch_ids]
+            cs = cs_full[batch_ids]
 
             Beff, Hcur, Z = y_true.size(0), y_true.size(1), mu_mean.numel()
 
@@ -444,10 +419,7 @@ def finetune_vae_decoder(
                 x0_norm_gen = diff_model.generate(
                     shape=(Beff, Hcur, Z), steps=gen_steps,
                     guidance_strength=guidance_strength, guidance_power=guidance_power,
-                    series=series_flat,
-                    series_mask=mask_flat,
-                    series_diff=series_diff_flat,
-                    self_cond=crypto_config.SELF_COND, cfg_rescale=True
+                    cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
                 )
 
                 # ---- Forward decoder on generated latents ----
@@ -493,10 +465,10 @@ def finetune_vae_decoder(
 
 @torch.no_grad()
 def evaluate_regression(
-    diff_model, vae, dataloader, device, mu_mean, mu_std, config, ema=None,
-    steps: int = 36, guidance_strength: float = 2.0, guidance_power: float = 0.3,
-    aggregation_method: str = 'mean',
-    quantiles: tuple = (0.1, 0.5, 0.9),
+        diff_model, vae, dataloader, device, mu_mean, mu_std, config, ema=None,
+        steps: int = 36, guidance_strength: float = 2.0, guidance_power: float = 0.3,
+        aggregation_method: str = 'mean',
+        quantiles: tuple = (0.1, 0.5, 0.9),
 ):
     """
     Evaluates the model by generating multiple samples and creating a probabilistic forecast.
@@ -546,15 +518,11 @@ def evaluate_regression(
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        series = V.permute(0, 2, 1, 3).to(device)
-        series_diff = T.permute(0, 2, 1, 3).to(device)
-        mask_bn_dev = mask_bn.to(device)
+        cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=False)
         y_in, batch_ids = _flatten_for_mask(yb, mask_bn, device)
         if y_in is None:
             continue
-        series_flat = series[batch_ids]
-        series_diff_flat = series_diff[batch_ids]
-        mask_flat = mask_bn_dev[batch_ids]
+        cs = cond_summary[batch_ids]
 
         Beff, Hcur, Z = y_in.size(0), y_in.size(1), config.VAE_LATENT_CHANNELS
 
@@ -565,10 +533,7 @@ def evaluate_regression(
             x0_norm = diff_model.generate(
                 shape=(Beff, Hcur, Z), steps=steps,
                 guidance_strength=guidance_strength, guidance_power=guidance_power,
-                series=series_flat,
-                series_mask=mask_flat,
-                series_diff=series_diff_flat,
-                self_cond=crypto_config.SELF_COND, cfg_rescale=True
+                cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
             )
 
             y_hat_sample = decode_latents_with_vae(
@@ -588,8 +553,8 @@ def evaluate_regression(
         # ---- Deterministic metrics (exact) ----
         res = point_forecast - y_in
         abs_sum += res.abs().sum().item()
-        sq_sum  += (res ** 2).sum().item()
-        elts    += res.numel()
+        sq_sum += (res ** 2).sum().item()
+        elts += res.numel()
 
         # ---- CRPS using all-pairs estimator ----
         # CRPS = E[|X - y|] - 0.5 * E[|X - X'|]
@@ -601,8 +566,8 @@ def evaluate_regression(
         else:
             diffs = (all_samples.unsqueeze(0) - all_samples.unsqueeze(1)).abs()  # [M,M,B,H,C]
             iu = torch.triu_indices(M, M, offset=1, device=diffs.device)
-            diffs_ij = diffs[iu[0], iu[1], ...]                                   # [M*(M-1)/2,B,H,C]
-            term2 = diffs_ij.mean(dim=0)                # [B,H,C]
+            diffs_ij = diffs[iu[0], iu[1], ...]  # [M*(M-1)/2,B,H,C]
+            term2 = diffs_ij.mean(dim=0)  # [B,H,C]
 
         batch_crps = (term1 - 0.5 * term2).mean().item()
         crps_sum += batch_crps * Beff
@@ -611,17 +576,17 @@ def evaluate_regression(
         # ---- Pinball (quantile) loss ----
         for q in quantiles:
             q = float(q)
-            y_q = torch.quantile(all_samples, q, dim=0, interpolation="linear")   # [B,H,C]
-            diff = y_in - y_q                                                     # note: y - ŷ_q
+            y_q = torch.quantile(all_samples, q, dim=0, interpolation="linear")  # [B,H,C]
+            diff = y_in - y_q  # note: y - ŷ_q
             # pinball per element
-            loss_q = torch.maximum(q * diff, (q - 1.0) * diff)                    # [B,H,C]
+            loss_q = torch.maximum(q * diff, (q - 1.0) * diff)  # [B,H,C]
             pinball_sums[q] += loss_q.sum().item()
 
     if use_ema:
         ema.restore(diff_model)
 
     mae = abs_sum / max(1, elts)
-    mse = sq_sum  / max(1, elts)
+    mse = sq_sum / max(1, elts)
     crps = crps_sum / max(1, n)
     pinball = {q: (pinball_sums[q] / max(1, elts)) for q in pinball_sums.keys()}
 
