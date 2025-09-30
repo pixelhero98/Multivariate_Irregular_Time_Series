@@ -1,21 +1,15 @@
-import os
 import math
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Reuse the Laplace encoder/decoder from your repo
-from Model.laptrans import LearnableLaplaceBasis, LearnablepesudoInverse
+from Model.laptrans import LearnableLaplaceBasis, LearnablepesudoInverse  # note: class name spelled as in repo
 
 
 class TVHead(nn.Module):
-    """
-    Matches the light per-entity scalar heads used in the EFF summarizer.
-    Input:  x  [B, T, N, D]
-    Output: y  [B, T, N]  (one scalar per entity)
-    """
+    """Per-entity feature → scalar signal head (works on tensors with ..., D)."""
     def __init__(self, feat_dim: int, hidden: int = 32):
         super().__init__()
         self.net = nn.Sequential(
@@ -25,142 +19,126 @@ class TVHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, N, D = x.shape
-        y = self.net(x).squeeze(-1)  # [B,T,N]
-        return y
+        # x: [..., D] → [...]
+        return self.net(x).squeeze(-1)
 
 
-class EffSummarizerAE(nn.Module):
+class LaplaceAE(nn.Module):
     """
-    EFF-style *deterministic* summarizer pretrainer (autoencoder over entity signals).
+    Minimal autoencoder for EFF-style entity signals using a single parallel
+    LearnableLaplaceBasis encoder and a single LearnablepesudoInverse decoder
+    per stream (V and T). The module also produces a lightweight context token
+    stream by projecting concatenated Laplace features.
 
-    Encoder:   TVHead -> LearnableLaplaceBasis (mode='parallel')
-    Decoder:   LearnablepesudoInverse (1 layer, complex-aware linear + optional tiny MLP)
+    Inputs (match EfficientSummarizer signature so it can be dropped-in later):
+        x:          [B,K,N,D]   ̶→ source series (we use it for V)
+        ctx_diff:   [B,K,N,D]   ̶→ auxiliary series (we use it for T)
+        entity_mask:[B,N]       ̶→ boolean mask of valid entities
 
-    It learns two independent AEs, one for V and one for T, sharing the same architecture.
-
-    Targets are entity-wise scalar signals (one per entity) derived from V and T via TVHead,
-    which matches how the runtime EFF summarizer forms its Laplace inputs.
+    Returns:
+        context:    [B,S,Hc]    ̶→ simple token projection (S = out_len)
+        aux: dict with:
+            v_sig, t_sig:       ground truth signals [B,K,N]
+            v_hat, t_hat:       reconstructions       [B,K,N]
+            recon_loss:         scalar
     """
-
     def __init__(
         self,
         num_entities: int,
         feat_dim: int,
+        *,
         lap_k: int = 8,
-        tv_dim: int = 32,
-        use_residual_mlp: bool = True,
-    ) -> None:
+        tv_hidden: int = 32,
+        out_len: int = 16,
+        context_dim: int = 256,
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        self.N = int(num_entities)
-        self.D = int(feat_dim)
-        self.K = int(lap_k)
+        self.N = num_entities
+        self.D = feat_dim
+        self.K = lap_k
+        self.Hc = context_dim
+        self.S = out_len
 
-        # Heads that compress feature dimension to one scalar per entity
-        self.v_head = TVHead(self.D, hidden=tv_dim)
-        self.t_head = TVHead(self.D, hidden=tv_dim)
+        # Per-entity feature→signal heads
+        self.v_head = TVHead(self.D, tv_hidden)
+        self.t_head = TVHead(self.D, tv_hidden)
 
-        # Parallel (time-invariant) Laplace encoders over the entity axis
+        # 1-layer parallel Laplace encoders for V and T signals
         self.lap_v = LearnableLaplaceBasis(k=self.K, feat_dim=self.N, mode="parallel")
         self.lap_t = LearnableLaplaceBasis(k=self.K, feat_dim=self.N, mode="parallel")
 
-        # Lightweight decoders back to entity signals
-        self.dec_v = LearnablepesudoInverse(self.lap_v, use_mlp_residual=use_residual_mlp)
-        self.dec_t = LearnablepesudoInverse(self.lap_t, use_mlp_residual=use_residual_mlp)
+        # Matching 1-layer inverses
+        self.inv_v = LearnablepesudoInverse(k=self.K, feat_dim=self.N, mode="parallel")
+        self.inv_t = LearnablepesudoInverse(k=self.K, feat_dim=self.N, mode="parallel")
 
-        # Small output-scale parameters (learnable) in case targets differ in magnitude
-        init_raw = math.log(math.e - 1.0)
-        self.v_gain_raw = nn.Parameter(torch.tensor(init_raw))
-        self.t_gain_raw = nn.Parameter(torch.tensor(init_raw))
-
-    @staticmethod
-    def _apply_entity_mask(x_btnd: torch.Tensor, m_bn: Optional[torch.Tensor]) -> torch.Tensor:
-        if m_bn is None:
-            return x_btnd
-        B, T, N, D = x_btnd.shape
-        m = m_bn.to(dtype=x_btnd.dtype, device=x_btnd.device)
-        if m.dim() == 2:  # [B,N]
-            m = m.unsqueeze(1).expand(B, T, N)
-        return x_btnd * m.unsqueeze(-1)
+        # Simple token projection from concatenated Laplace features
+        self.token_proj = nn.Sequential(
+            nn.Linear(2 * self.K, self.Hc), nn.GELU(), nn.Dropout(dropout)
+        )
+        # Learn S query tokens to pool over K time steps via cross-attn-lite (linear)
+        self.queries = nn.Parameter(torch.randn(self.S, self.Hc) / math.sqrt(self.Hc))
+        self.norm = nn.LayerNorm(self.Hc)
 
     @staticmethod
-    def _masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
-        if mask is None:
-            return F.mse_loss(pred, target, reduction='mean')
-        B, T, N = target.shape
-        m = mask.to(dtype=target.dtype, device=target.device)
-        if m.dim() == 2:
-            m = m.unsqueeze(1).expand(B, T, N)
-        diff2 = (pred - target) ** 2 * m
-        denom = m.sum().clamp_min(1.0)
-        return diff2.sum() / denom
-
-    def encode_signals(
-        self,
-        V: torch.Tensor,   # [B,T,N,D]
-        T: torch.Tensor,   # [B,T,N,D]
-        entity_mask: Optional[torch.Tensor] = None,  # [B,N]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return (V_sig, T_sig, L_v, L_t)."""
-        V = self._apply_entity_mask(V, entity_mask)
-        T = self._apply_entity_mask(T, entity_mask)
-        V_sig = self.v_head(V)  # [B,T,N]
-        T_sig = self.t_head(T)  # [B,T,N]
-        L_v = self.lap_v(V_sig)  # [B,T,2K]
-        L_t = self.lap_t(T_sig)  # [B,T,2K]
-        return V_sig, T_sig, L_v, L_t
-
-    def decode_signals(self, L_v: torch.Tensor, L_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        V_rec = self.dec_v(L_v)  # [B,T,N]
-        T_rec = self.dec_t(L_t)  # [B,T,N]
-        # Allow a simple learned positive rescale
-        V_rec = F.softplus(self.v_gain_raw) * V_rec
-        T_rec = F.softplus(self.t_gain_raw) * T_rec
-        return V_rec, T_rec
+    def _masked_mse(pred: torch.Tensor, target: torch.Tensor, mask_bn: torch.Tensor) -> torch.Tensor:
+        """pred/target: [B,K,N], mask_bn: [B,N] bool. Returns mean over valid elements."""
+        m = mask_bn.to(dtype=pred.dtype)[..., None, :]  # [B,1,N]
+        se = (pred - target).pow(2)  # [B,K,N]
+        se = se * m
+        denom = m.sum() * pred.size(1)  # K is unmasked; weight only valid entities
+        denom = denom.clamp_min(1.0)
+        return se.sum() / denom
 
     def forward(
         self,
-        V: torch.Tensor,   # [B,T,N,D]
-        T: torch.Tensor,   # [B,T,N,D]
+        x: torch.Tensor,                    # [B,K,N,D]   (V series)
+        pad_mask: Optional[torch.Tensor] = None,  # unused (keep signature)
+        dt: Optional[torch.Tensor] = None,        # unused
+        ctx_diff: Optional[torch.Tensor] = None,  # [B,K,N,D] (T series)
         entity_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
-        V_sig, T_sig, L_v, L_t = self.encode_signals(V, T, entity_mask)
-        V_rec, T_rec = self.decode_signals(L_v, L_t)
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if entity_mask is None:
+            raise ValueError("entity_mask must be provided: [B,N] bool")
+        if ctx_diff is None:
+            raise ValueError("ctx_diff (T series) must be provided: [B,K,N,D]")
+
+        B, K, N, D = x.shape
+        assert N == self.N and D == self.D, f"Got (N,D)=({N},{D}), expected ({self.N},{self.D})"
+
+        # ---- Build scalar signals per entity (EFF-style) ----
+        v_sig = self.v_head(x)         # [B,K,N]
+        t_sig = self.t_head(ctx_diff)  # [B,K,N]
+
+        # ---- 1-layer Laplace encoders (parallel) ----
+        v_lap = self.lap_v(v_sig)  # [B,K,2K]
+        t_lap = self.lap_t(t_sig)  # [B,K,2K]
+
+        # ---- Reconstructions via single inverses ----
+        v_hat = self.inv_v(v_lap)  # [B,K,N]
+        t_hat = self.inv_t(t_lap)  # [B,K,N]
+
+        # ---- Lightweight context tokens (for downstream conditioning) ----
+        fused = torch.cat([v_lap, t_lap], dim=-1)          # [B,K,4K]
+        # First compress back to 2K before projection (keeps param count modest)
+        fused = fused.view(B, K, 2, 2 * self.K).sum(dim=2)  # [B,K,2K]
+        tokens = self.token_proj(fused)                     # [B,K,Hc]
+        # Pool K→S with learned queries via simple attention scores
+        # (no expensive MHA; just content-based pooling)
+        q = self.queries[None, :, :]                        # [1,S,Hc]
+        att = torch.einsum('bkh,bsh->bks', self.norm(tokens), self.norm(q)) / math.sqrt(self.Hc)
+        att = att.softmax(dim=1)                            # softmax over K
+        context = torch.einsum('bks,bkh->bsh', att, tokens) # [B,S,Hc]
+
         aux = {
-            "V_sig": V_sig.detach(),
-            "T_sig": T_sig.detach(),
-            "L_v": L_v.detach(),
-            "L_t": L_t.detach(),
+            'v_sig': v_sig, 't_sig': t_sig,
+            'v_hat': v_hat, 't_hat': t_hat,
         }
-        return (V_rec, T_rec), aux
+        # loss is computed externally; keep forward pure when used inside bigger graphs
+        return context, aux
 
-    def recon_loss(
-        self,
-        V: torch.Tensor,
-        T: torch.Tensor,
-        entity_mask: Optional[torch.Tensor] = None,
-        w_v: float = 1.0,
-        w_t: float = 1.0,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        V_sig, T_sig, L_v, L_t = self.encode_signals(V, T, entity_mask)
-        V_rec, T_rec = self.decode_signals(L_v, L_t)
-        mv = self._masked_mse(V_rec, V_sig, entity_mask)
-        mt = self._masked_mse(T_rec, T_sig, entity_mask)
-        loss = w_v * mv + w_t * mt
-        return loss, {"mv": float(mv.item()), "mt": float(mt.item())}
-
-    @torch.no_grad()
-    def summarize(
-        self,
-        V: torch.Tensor,
-        T: torch.Tensor,
-        entity_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Deterministic summary tokens for downstream diffusion.
-        Here we just return the concatenated Laplace features [L_v | L_t].
-        Shape: [B, T, 4K]
-        """
-        self.eval()
-        _, _, L_v, L_t = self.encode_signals(V, T, entity_mask)
-        return torch.cat([L_v, L_t], dim=-1)
+    def recon_loss(self, aux: Dict[str, torch.Tensor], entity_mask: torch.Tensor) -> torch.Tensor:
+        """Convenience helper for training scripts."""
+        lv = self._masked_mse(aux['v_hat'], aux['v_sig'], entity_mask)
+        lt = self._masked_mse(aux['t_hat'], aux['t_sig'], entity_mask)
+        return lv + lt
