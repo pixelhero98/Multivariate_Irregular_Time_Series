@@ -122,12 +122,19 @@ class LLapDiT(nn.Module):
             entity_mask=series_mask
         )
                     
-        if cond_summary is not None and entity_ids is not None:
-            if cond_summary.size(0) != entity_ids.size(0):
-                raise ValueError(
-                    "entity_ids must have the same batch dimension as cond_summary"
-                )
-            cond_summary = cond_summary + self.entity_embed(entity_ids.long()).unsqueeze(1)
+        final_cond = cond_summary
+        if entity_ids is not None:
+            ent_emb = self.entity_embed(entity_ids.long()).unsqueeze(1)
+            if final_cond is not None:
+                # Add entity info to the existing time-series context
+                if final_cond.size(0) != entity_ids.size(0):
+                    raise ValueError(
+                        "entity_ids must have the same batch dimension as cond_summary"
+                    )
+                final_cond = final_cond + ent_emb
+            else:
+                # Use entity info as the sole conditioning
+                final_cond = ent_emb
             
         t_emb = self._time_embed(t).to(x_t.dtype)
         # Pass dt to LapFormer (only used when lap_mode='recurrent')
