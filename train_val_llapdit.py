@@ -112,7 +112,7 @@ def train_one_epoch(epoch: int):
         mask_bn = meta["entity_mask"]
 
         cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=True)
-        y_in, batch_ids, entity_ids = flatten_targets(yb, mask_bn, device)
+        y_in, batch_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
 
@@ -141,22 +141,10 @@ def train_one_epoch(epoch: int):
         if use_sc:
             with torch.no_grad():
                 if idx_c.numel() > 0:
-                    pred_ng_c = diff_model(
-                        x_t[idx_c],
-                        t[idx_c],
-                        cond_summary=cond_summary_flat[idx_c],
-                        entity_ids=entity_ids[idx_c],
-                        sc_feat=None,
-                    )
+                    pred_ng_c = diff_model(x_t[idx_c], t[idx_c], cond_summary=cond_summary_flat[idx_c], sc_feat=None)
                     sc_feat_c = scheduler.to_x0(x_t[idx_c], t[idx_c], pred_ng_c, crypto_config.PREDICT_TYPE).detach()
                 if idx_u.numel() > 0:
-                    pred_ng_u = diff_model(
-                        x_t[idx_u],
-                        t[idx_u],
-                        cond_summary=None,
-                        entity_ids=entity_ids[idx_u],
-                        sc_feat=None,
-                    )
+                    pred_ng_u = diff_model(x_t[idx_u], t[idx_u], cond_summary=None, sc_feat=None)
                     sc_feat_u = scheduler.to_x0(x_t[idx_u], t[idx_u], pred_ng_u, crypto_config.PREDICT_TYPE).detach()
 
         # --------- compute losses on each subset, weighted by fraction ---------
@@ -172,7 +160,6 @@ def train_one_epoch(epoch: int):
                     minsnr_gamma=crypto_config.MINSNR_GAMMA,
                     sc_feat=sc_feat_c,
                     reuse_xt_eps=(x_t[idx_c], eps_true[idx_c]),
-                    entity_ids=entity_ids[idx_c]
                 )
                 loss = loss + loss_c * (idx_c.numel() / Beff)
 
@@ -184,7 +171,6 @@ def train_one_epoch(epoch: int):
                     minsnr_gamma=crypto_config.MINSNR_GAMMA,
                     sc_feat=sc_feat_u,
                     reuse_xt_eps=(x_t[idx_u], eps_true[idx_u]),
-                    entity_ids=entity_ids[idx_u],
                 )
                 loss = loss + loss_u * (idx_u.numel() / Beff)
 
@@ -233,12 +219,11 @@ def validate():
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=False)
-        y_in, batch_ids, entity_ids = flatten_targets(yb, mask_bn, device)
+        cond_summary = build_context(diff_model, V, T, mask_bn, device)
+        y_in, batch_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
         cond_summary_flat = cond_summary[batch_ids]
-      
         mu_norm = encode_mu_norm(
             vae, y_in,
             mu_mean=mu_mean, mu_std=mu_std
@@ -248,8 +233,7 @@ def validate():
         t = sample_t_uniform(scheduler, mu_norm.size(0), device)
         loss = diffusion_loss(
             diff_model, scheduler, mu_norm, t,
-            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE,
-            entity_ids=entity_ids
+            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
         )
         total += loss.item() * mu_norm.size(0)
         count += mu_norm.size(0)
@@ -257,10 +241,8 @@ def validate():
         # low-variance cond_gap probe: reuse same (t, x_t, eps) for both branches
         probe_n = min(128, mu_norm.size(0))
         if probe_n > 0:
-            sample_idx = torch.randperm(mu_norm.size(0), device=device)[:probe_n]
-            mu_p = mu_norm[sample_idx]
-            cs_p = cond_summary_flat[sample_idx]
-            ent_p = entity_ids[sample_idx]
+            mu_p = mu_norm[:probe_n]
+            cs_p = cond_summary_flat[:probe_n]
             t_p = sample_t_uniform(scheduler, probe_n, device)
             noise_p = torch.randn_like(mu_p)
             x_t_p, eps_p = scheduler.q_sample(mu_p, t_p, noise_p)
@@ -268,15 +250,13 @@ def validate():
             loss_cond = diffusion_loss(
                 diff_model, scheduler, mu_p, t_p,
                 cond_summary=cs_p, predict_type=crypto_config.PREDICT_TYPE,
-                reuse_xt_eps=(x_t_p, eps_p),
-                entity_ids=ent_p
+                reuse_xt_eps=(x_t_p, eps_p)
             ).item()
 
             loss_unco = diffusion_loss(
                 diff_model, scheduler, mu_p, t_p,
                 cond_summary=None, predict_type=crypto_config.PREDICT_TYPE,
-                reuse_xt_eps=(x_t_p, eps_p),
-                entity_ids=ent_p
+                reuse_xt_eps=(x_t_p, eps_p)
             ).item()
 
             cond_gap_accum += (loss_unco - loss_cond)
@@ -373,7 +353,7 @@ else:
                 if math.isfinite(val_vs_baseline)
                 else ("inf" if val_vs_baseline > 0 else "nan")
             )
-            
+
             ckpt_path = os.path.join(
                 crypto_config.CKPT_DIR,
                 f"mode-{crypto_config.LAP_MODE_main}-pred-{crypto_config.PRED}_ch-{crypto_config.VAE_LATENT_CHANNELS}_val_{val_loss:.6f}_cond_{cond_gap * Z:.6f}_ratio_{ratio_str}.pt"
@@ -453,19 +433,12 @@ def finetune_vae_decoder(
         for xb, yb, meta in loader:
             V, T = xb
             mask_bn = meta["entity_mask"]
-            cs_full = build_context(diff_model, V, T, mask_bn, device, requires_grad=False)
-            y_true, batch_ids, entity_ids = _flatten_for_mask(yb, mask_bn, device)
+            cs_full = build_context(diff_model, V, T, mask_bn, device)
+            y_true, batch_ids = _flatten_for_mask(yb, mask_bn, device)
             if y_true is None:
                 continue
             cs = cs_full[batch_ids]
-            mask_flat = mask_bn.to(device=device, dtype=torch.bool).reshape(-1)
-            entity_index = (
-                torch.arange(mask_bn.size(1), device=device)
-                .unsqueeze(0)
-                .expand(mask_bn.size(0), -1)
-                .reshape(-1)
-            )
-            entity_ids = entity_index[mask_flat]
+
             Beff, Hcur, Z = y_true.size(0), y_true.size(1), mu_mean.numel()
 
             # ---- Generate x0_norm in latent space (no grads) ----
@@ -474,7 +447,6 @@ def finetune_vae_decoder(
                     shape=(Beff, Hcur, Z), steps=gen_steps,
                     guidance_strength=guidance_strength, guidance_power=guidance_power,
                     cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
-                    entity_ids=entity_ids
                 )
 
                 # ---- Forward decoder on generated latents ----
@@ -573,19 +545,12 @@ def evaluate_regression(
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=False)
-        y_in, batch_ids, entity_ids = _flatten_for_mask(yb, mask_bn, device)
+        cond_summary = build_context(diff_model, V, T, mask_bn, device)
+        y_in, batch_ids = _flatten_for_mask(yb, mask_bn, device)
         if y_in is None:
             continue
         cs = cond_summary[batch_ids]
-        mask_flat = mask_bn.to(device=device, dtype=torch.bool).reshape(-1)
-        entity_index = (
-            torch.arange(mask_bn.size(1), device=device)
-            .unsqueeze(0)
-            .expand(mask_bn.size(0), -1)
-            .reshape(-1)
-        )
-        entity_ids = entity_index[mask_flat]
+
         Beff, Hcur, Z = y_in.size(0), y_in.size(1), config.VAE_LATENT_CHANNELS
 
         # ---- Generate multiple samples in latent space and decode ----
@@ -596,7 +561,6 @@ def evaluate_regression(
                 shape=(Beff, Hcur, Z), steps=steps,
                 guidance_strength=guidance_strength, guidance_power=guidance_power,
                 cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
-                entity_ids=entity_ids
             )
 
             y_hat_sample = decode_latents_with_vae(
