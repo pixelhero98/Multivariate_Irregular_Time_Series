@@ -17,17 +17,7 @@ import torch.nn.functional as F
 from Model.laptrans import LearnableLaplaceBasis, LearnablepesudoInverse  # note: class name spelled as in repo
 
 
-__all__ = ["LaplaceAE"]
-
-
-
 class TVHead(nn.Module):
-   """Project per-entity features to a single scalar signal.
-
-    This head is used for both value (``V``) and time-difference (``T``)
-    streams.  The sequential stack keeps the implementation compact while the
-    layer normalisation guards against scale shifts between entities.
-    """
 
     def __init__(self, feat_dim: int, hidden: int = 32) -> None:
         super().__init__()
@@ -37,36 +27,14 @@ class TVHead(nn.Module):
             nn.GELU(),
             nn.Linear(hidden, 1),
         )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return a scalar for each entity in ``x``.
 
-        Args:
-            x: ``[..., D]`` tensor containing per-entity features.
-
-        Returns:
-            ``[...,]`` tensor of scalar signals.
-        """
         return self.net(x).squeeze(-1)
 
 
 class LaplaceAE(nn.Module):
-     """Single-layer Laplace auto-encoder for entity level signals.
 
-    Inputs (matching the EfficientSummarizer contract):
-
-    ``x``
-        Value stream tensor with shape ``[B, K, N, D]``.
-    ``ctx_diff``
-        Auxiliary stream tensor (time-differences) with the same shape as
-        ``x``.
-    ``entity_mask``
-        Boolean tensor ``[B, N]`` indicating which entities are real (``True``)
-        versus padded (``False``).
-
-    Returns a tuple ``(context, aux)`` where ``context`` are pooled tokens with
-    shape ``[B, S, Hc]`` and ``aux`` contains the intermediate signals and
-    reconstructions required to compute the reconstruction loss.
-    """
     def __init__(
         self,
         num_entities: int,
@@ -119,7 +87,7 @@ class LaplaceAE(nn.Module):
         self,
         x: torch.Tensor,                    # [B,K,N,D]   (V series)
         pad_mask: Optional[torch.Tensor] = None,  # unused (keep signature)
-        dt: Optional[torch.Tensor] = None,        # unused
+        dt: Optional[torch.Tensor] = None,        #
         ctx_diff: Optional[torch.Tensor] = None,  # [B,K,N,D] (T series)
         entity_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
