@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Union, List
-from Model.global_summary import UnifiedGlobalSummarizer
 from Model.llapdit_utils import NoiseScheduler
 from Model.pos_time_emb import timestep_embedding
 from Model.lapformer import LapFormer
@@ -12,7 +11,8 @@ class LLapDiT(nn.Module):
     """Latent Laplace-DiT for multivariate time series with global conditioning.
 
     - Uses UnifiedGlobalSummarizer for multi-entity context (mode tied to LapFormer).
-    - LapFormer does per-target temporal modeling in parallel or recurrent Laplace mode.
+    Expects an external (typically frozen) context module whose summaries are
+    passed in explicitly during training and sampling.
     """
 
     def __init__(self,
@@ -29,45 +29,16 @@ class LLapDiT(nn.Module):
                  dropout: float = 0.0,
                  attn_dropout: float = 0.0,
                  self_conditioning: bool = False,
-                 context_dim: Optional[int] = None,
-                 context_module: Optional[nn.Module] = None,
-                 num_entities: int = None,
-                 context_len: int = 16,
-                 lap_mode_main: str = 'recurrent',
-                 lap_mode_cond: str = 'parallel',
-                 summery_mode: str = 'EFF',
-                 zero_first_step: bool = False,
-                 add_guidance_tokens: bool = True):
+                 lap_mode_main: str = 'recurrent'
+                 ):
         super().__init__()
         assert predict_type in ('eps', 'v')
-        if num_entities is None:
-            raise ValueError("num_entities must be provided (int) for the global summarizer.")
+       
         self.predict_type = predict_type
         self.self_conditioning = bool(self_conditioning)
 
         # diffusion utils (not used in forward path tests)
         self.scheduler = NoiseScheduler(timesteps=timesteps, schedule=schedule)
-
-        if context_module is not None:
-            if not isinstance(context_module, nn.Module):
-                raise TypeError("context_module must be an nn.Module")
-            self.context = context_module
-        else:
-            # global context summarizer; choose simple vs full via lap_mode
-            ctx_dim = context_dim if context_dim is not None else data_dim
-            self.context = UnifiedGlobalSummarizer(
-                lap_mode=lap_mode_cond,
-                num_entities=num_entities,
-                feat_dim=ctx_dim,
-                hidden_dim=hidden_dim,
-                out_len=context_len,
-                num_heads=num_heads,
-                lap_k=global_k,
-                dropout=dropout,
-                add_guidance_tokens=add_guidance_tokens,
-                zero_first_step=zero_first_step,
-                mode=summery_mode
-            )
 
         # main LapFormer (mode tied to summarizer)
 
@@ -92,15 +63,6 @@ class LLapDiT(nn.Module):
         te = timestep_embedding(t, self.time_dim)  # [B, H]
         return F.silu(te)
 
-    def _maybe_build_cond(self, series, cond_summary=None, entity_ids=None,
-                          ctx_dt=None, ctx_diff=None, entity_mask=None):
-        if cond_summary is not None or series is None:
-            return cond_summary
-        # Pass dt, ctx_diff, and entity_mask so summarizer can be dt-/mask-aware
-        summary, _ = self.context(series, pad_mask=None, dt=ctx_dt,
-                                  ctx_diff=ctx_diff, entity_mask=entity_mask)
-        return summary
-
     # -------------------------------
     # Forward call
     # -------------------------------
@@ -117,14 +79,12 @@ class LLapDiT(nn.Module):
                 series_dt: Optional[torch.Tensor] = None,
                 series_diff: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Predict native param ('eps' or 'v') at timestep t for x_t."""
-        cond_summary = self._maybe_build_cond(
-            series,
-            cond_summary=cond_summary,
-            entity_ids=entity_ids,
-            ctx_dt=series_dt,
-            ctx_diff=series_diff,
-            entity_mask=series_mask
-        )
+        if cond_summary is None:
+            if any(arg is not None for arg in (series, series_mask, entity_ids, series_dt, series_diff)):
+                raise ValueError(
+                    "LLapDiT no longer builds conditioning internally. "
+                    "Provide `cond_summary` from a pre-trained summarizer."
+                )
         t_emb = self._time_embed(t).to(x_t.dtype)
         # Pass dt to LapFormer (only used when lap_mode='recurrent')
         raw = self.model(x_t, t_emb, cond_summary=cond_summary, sc_feat=sc_feat, dt=dt)
@@ -167,10 +127,10 @@ class LLapDiT(nn.Module):
         T = int(self.scheduler.timesteps)
 
         # ---- build context once (dt/mask/diff aware) ----
-        if (series is not None) and (cond_summary is None):
-            cond_summary, _ = self.context(
-                series, pad_mask=None, dt=series_dt, ctx_diff=series_diff, entity_mask=series_mask
-            )
+        if cond_summary is None and any(arg is not None for arg in (series, series_mask, series_dt, series_diff, entity_ids)):
+            raise ValueError(
+                "LLapDiT.generate requires `cond_summary` from the frozen summarizer; "
+                "internal summarizer construction has been removed."
 
         # ---- vectorized Karras step indices (descending) ----
         ab = self.scheduler.alpha_bars.to(device)
