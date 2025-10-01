@@ -30,6 +30,7 @@ class LLapDiT(nn.Module):
                  attn_dropout: float = 0.0,
                  self_conditioning: bool = False,
                  context_dim: Optional[int] = None,
+                 context_module: Optional[nn.Module] = None,
                  num_entities: int = None,
                  context_len: int = 16,
                  lap_mode_main: str = 'recurrent',
@@ -47,21 +48,26 @@ class LLapDiT(nn.Module):
         # diffusion utils (not used in forward path tests)
         self.scheduler = NoiseScheduler(timesteps=timesteps, schedule=schedule)
 
-        # global context summarizer; choose simple vs full via lap_mode
-        ctx_dim = context_dim if context_dim is not None else data_dim
-        self.context = UnifiedGlobalSummarizer(
-            lap_mode=lap_mode_cond,
-            num_entities=num_entities,
-            feat_dim=ctx_dim,
-            hidden_dim=hidden_dim,
-            out_len=context_len,
-            num_heads=num_heads,
-            lap_k=global_k,
-            dropout=dropout,
-            add_guidance_tokens=add_guidance_tokens,
-            zero_first_step=zero_first_step,
-            mode=summery_mode
-        )
+        if context_module is not None:
+            if not isinstance(context_module, nn.Module):
+                raise TypeError("context_module must be an nn.Module")
+            self.context = context_module
+        else:
+            # global context summarizer; choose simple vs full via lap_mode
+            ctx_dim = context_dim if context_dim is not None else data_dim
+            self.context = UnifiedGlobalSummarizer(
+                lap_mode=lap_mode_cond,
+                num_entities=num_entities,
+                feat_dim=ctx_dim,
+                hidden_dim=hidden_dim,
+                out_len=context_len,
+                num_heads=num_heads,
+                lap_k=global_k,
+                dropout=dropout,
+                add_guidance_tokens=add_guidance_tokens,
+                zero_first_step=zero_first_step,
+                mode=summery_mode
+            )
 
         # main LapFormer (mode tied to summarizer)
 
