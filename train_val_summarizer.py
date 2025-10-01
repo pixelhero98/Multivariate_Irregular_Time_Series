@@ -133,7 +133,7 @@ def run() -> None:
             scaler.update()
 
             train_sum += loss.item() * elems
-            n_tr += V.size(0)
+            train_elems += elems
 
         train_loss = train_sum / train_elems if train_elems > 0 else 0.0
 
