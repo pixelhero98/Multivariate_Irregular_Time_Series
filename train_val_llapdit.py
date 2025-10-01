@@ -49,7 +49,7 @@ sum_dropout = crypto_config.SUM_DROPOUT
 summarizer_ckpt = crypto_config.SUM_CKPT
 if summarizer_ckpt is None:
     summarizer_dir = crypto_config.SUM_DIR
-    summarizer_ckpt = Path(summarizer_dir) / f"{crypto_config.PRED}-{crypto_config.VAE_LATENT_CHANNELS}-summarizer_laplaceAE.pt"
+    summarizer_ckpt = Path(summarizer_dir) / f"{crypto_config.PRED}-{crypto_config.VAE_LATENT_CHANNELS}-summarizer.pt"
 else:
     summarizer_ckpt = Path(summarizer_ckpt)
 
