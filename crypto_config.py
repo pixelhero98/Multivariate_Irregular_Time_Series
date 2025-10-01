@@ -22,8 +22,8 @@ VAE_LAYERS = 3
 VAE_HEADS = 4
 VAE_FF = 256              # feed-forward dim of the Transformers
 VAE_DROPOUT = 0.0
-VAE_DIR = './ldt/saved_model/' + MKT
-VAE_CKPT = "./ldt/saved_model/" + MKT + f"/pred-{PRED}_ch-{VAE_LATENT_CHANNELS}_elbo.pt"
+VAE_DIR = './ldt/vae/saved_model/' + MKT
+VAE_CKPT = "./ldt/vae/saved_model/" + MKT + f"/pred-{PRED}_ch-{VAE_LATENT_CHANNELS}_elbo.pt"
 # --- VAE Fine-Tuning (Optional, after diffusion training) ---
 # Set DECODER_FT_EPOCHS = 0 to disable this step.
 VAE_LEARNING_RATE = 2e-4
@@ -33,7 +33,7 @@ VAE_BETA = 0.005
 VAE_MAX_PATIENCE = 6
 DECODER_FT_EPOCHS = 25
 DECODER_FT_LR = 2e-4
-
+SUM_DIR = "./ldt/SUMMARIZER_EFF/saved_model/" + MKT
 # ============================ Diffusion Model (LLapDiT) ============================
 CKPT_DIR = "./ldt/checkpoints/" + MKT
 
@@ -55,7 +55,7 @@ NUM_LAYERS    = 5
 NUM_HEADS     = 4
 LAPLACE_K     = 96
 GLOBAL_K      = 256
-LAP_MODE_main      = 'recurrent'   # 'parallel' or 'recurrent (support irregular sampling interval, with time-varying Lap basis updates)'
+LAP_MODE_main      = 'parallel'   # 'parallel' or 'recurrent (support irregular sampling interval, with time-varying Lap basis updates)'
 LAP_MODE_cond      = 'parallel'
 zero_first_step = False
 add_guidance_tokens = True
