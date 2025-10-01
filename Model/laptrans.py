@@ -40,7 +40,7 @@ class LearnableLaplaceTrans(nn.Module):
         self,
         k: int,
         feat_dim: int,
-        mode: str = "parallel",
+        mode: str = "effective",
         alpha_min: float = 1e-6,
         omega_max: float = math.pi,
     ) -> None:
@@ -185,9 +185,9 @@ class LearnableLaplaceTrans(nn.Module):
         return torch.cat([C, S], dim=2).contiguous()
 
 # =====================================
-# PesudoInverser (NOT a strict inverse)
+# PseudoInverser (NOT a strict inverse)
 # =====================================
-class PesudoInverse(nn.Module):
+class PseudoInverse(nn.Module):
     """
     Decoder that maps Laplace features back to the original feature space.
     This acts as a pseudo-inverse to the LearnableLaplaceTrans.
@@ -201,7 +201,7 @@ class PesudoInverse(nn.Module):
 
     def __init__(
         self,
-        encoder: LaplaceEncoder,
+        encoder: LearnableLaplaceTrans,
         hidden_dim: Optional[int] = None,
         num_layers: int = 2,
         use_mlp_residual: bool = True,
