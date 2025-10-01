@@ -35,18 +35,19 @@ DECODER_FT_EPOCHS = 25
 DECODER_FT_LR = 2e-4
 # ======================= Summarizer (LaplaceAE) =======================
 SUM_DIR = "./ldt/SUMMARIZER_EFF/saved_model/" + MKT
-SUM_LAPLACE_K = 256
-CTX_OUT_LEN = 64
-CTX_DIM = 128
-TV_HIDDEN = 32
-CTX_DROPOUT = 0.0
-SUM_LR = 2e-4
+SUM_LAPLACE_K = 48
+SUM_CONTEXT_LEN = 16
+SUM_CONTEXT_DIM = 256
+SUM_TV_HIDDEN = 32
+SUM_DROPOUT = 0.1
+SUM_LR = 3e-4
 SUM_WEIGHT_DECAY = 1e-4
 SUM_EPOCHS = 150
 SUM_GRAD_CLIP = 1.0
 SUM_AMP = True
-SUM_PATIENCE = 20
-SUM_MIN_DELTA = 1e-5
+SUM_PATIENCE = 25
+SUM_MIN_DELTA = 5e-5
+SUM_CKPT = SUM_DIR + "/summarizer_laplaceAE.pt"
 # ============================ Diffusion Model (LLapDiT) ============================
 CKPT_DIR = "./ldt/checkpoints/" + MKT
 
@@ -63,16 +64,16 @@ LOSS_WEIGHT_SCHEME = 'weighted_min_snr'
 MINSNR_GAMMA = 5.0
 
 # --- LLapDiT Architecture ---
-MODEL_WIDTH   = 256
+MODEL_WIDTH   = SUM_CONTEXT_DIM
 NUM_LAYERS    = 5
 NUM_HEADS     = 4
 LAPLACE_K     = 96
-GLOBAL_K      = 256
+GLOBAL_K      = SUM_LAPLACE_K
 LAP_MODE_main      = 'parallel'   # 'parallel' or 'recurrent (support irregular sampling interval, with time-varying Lap basis updates)'
 LAP_MODE_cond      = 'parallel'
 zero_first_step = False
 add_guidance_tokens = True
-CONTEXT_LEN   = GLOBAL_K // 2 if add_guidance_tokens else GLOBAL_K # Learned summary tokens length
+CONTEXT_LEN   = SUM_CONTEXT_LEN  
 # ============================ Training Hyperparameters ============================
 EPOCHS = 900
 BASE_LR = 5e-4
