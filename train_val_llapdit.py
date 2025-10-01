@@ -19,7 +19,7 @@ from Model.llapdit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_ma
 # Baseline variance for validation comparisons (populated after initial computation)
 BASELINE_V_VARIANCE = None
 device = set_torch()
-# context_grad_checked = True
+
 train_dl, val_dl, test_dl, sizes = run_experiment(
     data_dir=crypto_config.DATA_DIR,
     date_batching=crypto_config.date_batching,
@@ -61,7 +61,7 @@ laplace_summarizer = LaplaceAE(
     out_len=sum_ctx_len,
     context_dim=sum_ctx_dim,
     dropout=sum_dropout,
-)
+).to(device)
 
 if summarizer_ckpt.exists():
     state = torch.load(summarizer_ckpt, map_location="cpu")
@@ -108,11 +108,7 @@ diff_model = LLapDiT(
     timesteps=crypto_config.TIMESTEPS, schedule=crypto_config.SCHEDULE,
     dropout=crypto_config.DROPOUT, attn_dropout=crypto_config.ATTN_DROPOUT,
     self_conditioning=crypto_config.SELF_COND,
-    context_dim=Fv, context_module=laplace_summarizer, num_entities=N0, context_len=crypto_config.CONTEXT_LEN,
-    lap_mode_main=crypto_config.LAP_MODE_main,
-    lap_mode_cond=crypto_config.LAP_MODE_cond,
-    zero_first_step=crypto_config.zero_first_step,
-    add_guidance_tokens=crypto_config.add_guidance_tokens
+    lap_mode_main=crypto_config.LAP_MODE_main
 ).to(device)
 
 # ---- Calculate the variance of the v-prediction target ----
@@ -146,13 +142,12 @@ def train_one_epoch(epoch: int):
     running_loss = 0.0
     num_samples = 0
     global global_step
-    # global context_grad_checked
 
     for xb, yb, meta in train_dl:
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        cond_summary = build_context(diff_model, V, T, mask_bn, device)
+        cond_summary = build_context(laplace_summarizer, V, T, mask_bn, device)
         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
@@ -224,14 +219,6 @@ def train_one_epoch(epoch: int):
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
 
-        # if idx_c.numel() > 0 and not context_grad_checked:
-        #     has_context_grad = any(p.grad is not None for p in diff_model.context.parameters())
-        #     if not has_context_grad:
-        #         raise RuntimeError(
-        #             "Context parameters did not receive gradients despite being used for conditioning."
-        #         )
-        #     context_grad_checked = True
-
         if getattr(crypto_config, "GRAD_CLIP", 0.0) and crypto_config.GRAD_CLIP > 0:
             nn.utils.clip_grad_norm_(diff_model.parameters(), crypto_config.GRAD_CLIP)
         scaler.step(optimizer)
@@ -260,7 +247,7 @@ def validate():
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        cond_summary = build_context(diff_model, V, T, mask_bn, device)
+        cond_summary = build_context(laplace_summarizer, V, T, mask_bn, device)
         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
@@ -381,28 +368,6 @@ else:
             f"| val/v_var: {val_vs_baseline:.6f} | improvement: {improvement:.6f}"
         )
 
-        # if (not summarizer_frozen and getattr(crypto_config, "FREEZE_SUMMARIZER_ON_PLATEAU", False)):
-        #     if math.isfinite(cond_gap_scaled):
-        #         if cond_gap_scaled > best_cond_gap + getattr(crypto_config, "COND_GAP_TOL", 0.0):
-        #             best_cond_gap = cond_gap_scaled
-        #             cond_gap_plateau = 0
-        #             best_summary_state = {
-        #                 k: v.detach().cpu() for k, v in diff_model.context.state_dict().items()
-        #             }
-        #         else:
-        #             cond_gap_plateau += 1
-        #     else:
-        #         cond_gap_plateau += 1
-        #
-        #     if cond_gap_plateau >= getattr(crypto_config, "COND_GAP_PATIENCE", 0) and best_summary_state is not None:
-        #         diff_model.context.load_state_dict(best_summary_state)
-        #         diff_model.context.requires_grad_(False)
-        #         summarizer_frozen = True
-        #         print(
-        #             f"[info] Freezing summarizer at epoch {epoch} after cond_gap plateau. "
-        #             f"Best cond_gap (scaled): {best_cond_gap:.6f}"
-        #         )
-
         # checkpoint best (with EMA state)
         if val_loss < best_val:
             best_val = val_loss;
@@ -500,7 +465,7 @@ def finetune_vae_decoder(
         for xb, yb, meta in loader:
             V, T = xb
             mask_bn = meta["entity_mask"]
-            cs_full = build_context(diff_model, V, T, mask_bn, device)
+            cs_full = build_context(laplace_summarizer, V, T, mask_bn, device)
             y_true, batch_ids = _flatten_for_mask(yb, mask_bn, device)
             if y_true is None:
                 continue
@@ -612,7 +577,7 @@ def evaluate_regression(
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        cond_summary = build_context(diff_model, V, T, mask_bn, device)
+        cond_summary = build_context(laplace_summarizer, V, T, mask_bn, device)
         y_in, batch_ids = _flatten_for_mask(yb, mask_bn, device)
         if y_in is None:
             continue
