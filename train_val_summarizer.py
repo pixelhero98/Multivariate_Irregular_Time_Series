@@ -1,18 +1,13 @@
-
 import math
 import time
-
 from pathlib import Path
 from typing import Dict
 import crypto_config
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
-
-
 from Dataset.fin_dataset import run_experiment
 from Model.summarizer import LaplaceAE
-
 
 
 def set_seed(seed: int = 42) -> None:
@@ -51,24 +46,24 @@ def run() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ---- Hyper-parameters ----
-    lap_k = getattr(crypto_config, "SUM_LAPLACE_K", getattr(crypto_config, "LAPLACE_K", 8))
-    out_len = getattr(crypto_config, "CTX_OUT_LEN", 16)
-    ctx_dim = getattr(crypto_config, "CTX_DIM", 256)
-    tv_hidden = getattr(crypto_config, "TV_HIDDEN", 32)
-    dropout = getattr(crypto_config, "CTX_DROPOUT", 0.0)
+    lap_k = crypto_config.SUM_LAPLACE_K
+    out_len = crypto_config.SUM_CONTEXT_LEN
+    ctx_dim = crypto_config.SUM_CONTEXT_DIM
+    tv_hidden = crypto_config.SUM_TV_HIDDEN
+    dropout = crypto_config.SUM_DROPOUT
 
-    lr = getattr(crypto_config, "SUM_LR", getattr(crypto_config, "BASE_LR", 3e-4))
-    wd = getattr(crypto_config, "SUM_WEIGHT_DECAY", getattr(crypto_config, "WEIGHT_DECAY", 1e-4))
-    epochs = getattr(crypto_config, "SUM_EPOCHS", getattr(crypto_config, "EPOCHS", 200))
-    grad_clip = getattr(crypto_config, "SUM_GRAD_CLIP", getattr(crypto_config, "GRAD_CLIP", 1.0))
-    amp = getattr(crypto_config, "SUM_AMP", True)
-    patience = getattr(crypto_config, "SUM_PATIENCE", 20)
-    min_delta = getattr(crypto_config, "SUM_MIN_DELTA", 1e-4)
+    lr = crypto_config.SUM_LR
+    wd = crypto_config.SUM_WEIGHT_DECAY
+    epochs = crypto_config.SUM_EPOCHS
+    grad_clip = crypto_config.GRAD_CLIP
+    amp = crypto_config.SUM_AMP
+    patience = crypto_config.SUM_PATIENCE
+    min_delta = crypto_config.SUM_MIN_DELTA
 
-    model_dir = Path(getattr(crypto_config, "SUM_DIR", "./ldt/saved_model/SUMMARIZER_EFF"))
-    ckpt_path = model_dir / "summarizer_laplaceAE.pt"
+    model_dir = crypto_config.SUM_DIR
+    ckpt_path = Path(model_dir) / f"{crypto_config.PRED}-{crypto_config.VAE_LATENT_CHANNELS}-summarizer.pt"
 
-    set_seed(getattr(crypto_config, "SEED", 42))
+    set_seed(crypto_config.SEED)
 
     # ---- Data loaders ----
     train_loader, val_loader, test_loader, sizes = run_experiment(
