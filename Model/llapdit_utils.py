@@ -369,7 +369,7 @@ def decode_latents_with_vae(vae, x0_norm: torch.Tensor,
     return x_hat
 
 
-def build_context(model, V, T, mask_bn, device, *, norm: bool = False, requires_grad: bool = False):
+def build_context(model, V, T, mask_bn, device, *, norm: bool = True, requires_grad: bool = False):
     """Returns normalized cond_summary: [B,S,Hm]"""
     series_diff = T.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
     series      = V.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
@@ -382,10 +382,6 @@ def build_context(model, V, T, mask_bn, device, *, norm: bool = False, requires_
     if not requires_grad:
         return cond_summary.detach()
 
-    if not cond_summary.requires_grad:
-        raise RuntimeError(
-            "Context summary does not require gradients; ensure the context module participates in autograd."
-        )
     return cond_summary
 
 
