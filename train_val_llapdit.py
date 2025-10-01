@@ -19,7 +19,7 @@ from Model.llapdit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_ma
 # Baseline variance for validation comparisons (populated after initial computation)
 BASELINE_V_VARIANCE = None
 device = set_torch()
-context_grad_checked = False
+# context_grad_checked = True
 train_dl, val_dl, test_dl, sizes = run_experiment(
     data_dir=crypto_config.DATA_DIR,
     date_batching=crypto_config.date_batching,
@@ -40,16 +40,16 @@ assert Fv == Ft, f"Expected Fv == Ft, got {Fv} vs {Ft}"
 print("V:", V0.shape, "T:", T0.shape, "y:", yb0.shape)
 
 # ---- Load pretrained Laplace summarizer (shared with standalone training) ----
-sum_lap_k = getattr(crypto_config, "SUM_LAPLACE_K", getattr(crypto_config, "LAPLACE_K", 8))
-sum_ctx_len = getattr(crypto_config, "SUM_CONTEXT_LEN", getattr(crypto_config, "CTX_OUT_LEN", 16))
-sum_ctx_dim = getattr(crypto_config, "SUM_CONTEXT_DIM", getattr(crypto_config, "CTX_DIM", Fv))
-sum_tv_hidden = getattr(crypto_config, "SUM_TV_HIDDEN", getattr(crypto_config, "TV_HIDDEN", 32))
-sum_dropout = getattr(crypto_config, "SUM_DROPOUT", getattr(crypto_config, "CTX_DROPOUT", 0.0))
+sum_lap_k = crypto_config.SUM_LAPLACE_K
+sum_ctx_len = crypto_config.SUM_CONTEXT_LEN
+sum_ctx_dim = crypto_config.SUM_CONTEXT_DIM
+sum_tv_hidden = crypto_config.SUM_TV_HIDDEN
+sum_dropout = crypto_config.SUM_DROPOUT
 
-summarizer_ckpt = getattr(crypto_config, "SUM_CKPT", None)
+summarizer_ckpt = crypto_config.SUM_CKPT
 if summarizer_ckpt is None:
-    summarizer_dir = getattr(crypto_config, "SUM_DIR", "./ldt/SUMMARIZER_EFF/saved_model")
-    summarizer_ckpt = Path(summarizer_dir) / "summarizer_laplaceAE.pt"
+    summarizer_dir = crypto_config.SUM_DIR
+    summarizer_ckpt = Path(summarizer_dir) / f"{crypto_config.PRED}-{crypto_config.VAE_LATENT_CHANNELS}-summarizer_laplaceAE.pt"
 else:
     summarizer_ckpt = Path(summarizer_ckpt)
 
@@ -70,7 +70,11 @@ if summarizer_ckpt.exists():
 else:
     print(f"[warn] Summarizer checkpoint not found at {summarizer_ckpt}; using randomly initialised weights.")
 
-if getattr(crypto_config, "MODEL_WIDTH", sum_ctx_dim) != sum_ctx_dim:
+laplace_summarizer.eval()
+for p in laplace_summarizer.parameters():
+    p.requires_grad = False
+
+if crypto_config.MODEL_WIDTH != sum_ctx_dim:
     raise ValueError(
         f"crypto_config.MODEL_WIDTH ({crypto_config.MODEL_WIDTH}) must match SUM_CONTEXT_DIM ({sum_ctx_dim})"
     )
@@ -108,8 +112,7 @@ diff_model = LLapDiT(
     lap_mode_main=crypto_config.LAP_MODE_main,
     lap_mode_cond=crypto_config.LAP_MODE_cond,
     zero_first_step=crypto_config.zero_first_step,
-    add_guidance_tokens=crypto_config.add_guidance_tokens,
-    summery_mode='EFF'
+    add_guidance_tokens=crypto_config.add_guidance_tokens
 ).to(device)
 
 # ---- Calculate the variance of the v-prediction target ----
@@ -143,13 +146,13 @@ def train_one_epoch(epoch: int):
     running_loss = 0.0
     num_samples = 0
     global global_step
-    global context_grad_checked
+    # global context_grad_checked
 
     for xb, yb, meta in train_dl:
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        cond_summary = build_context(diff_model, V, T, mask_bn, device, requires_grad=True)
+        cond_summary = build_context(diff_model, V, T, mask_bn, device)
         y_in, batch_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
@@ -221,13 +224,13 @@ def train_one_epoch(epoch: int):
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
 
-        if idx_c.numel() > 0 and not context_grad_checked:
-            has_context_grad = any(p.grad is not None for p in diff_model.context.parameters())
-            if not has_context_grad:
-                raise RuntimeError(
-                    "Context parameters did not receive gradients despite being used for conditioning."
-                )
-            context_grad_checked = True
+        # if idx_c.numel() > 0 and not context_grad_checked:
+        #     has_context_grad = any(p.grad is not None for p in diff_model.context.parameters())
+        #     if not has_context_grad:
+        #         raise RuntimeError(
+        #             "Context parameters did not receive gradients despite being used for conditioning."
+        #         )
+        #     context_grad_checked = True
 
         if getattr(crypto_config, "GRAD_CLIP", 0.0) and crypto_config.GRAD_CLIP > 0:
             nn.utils.clip_grad_norm_(diff_model.parameters(), crypto_config.GRAD_CLIP)
@@ -350,9 +353,9 @@ else:
 
     best_val = float("inf")
     best_cond_gap = -float("inf")
-    best_summary_state = None
-    cond_gap_plateau = 0
-    summarizer_frozen = False
+    # best_summary_state = None
+    # cond_gap_plateau = 0
+    # summarizer_frozen = False
     patience = 0
     current_best_path = None
     os.makedirs(crypto_config.CKPT_DIR, exist_ok=True)
@@ -378,28 +381,28 @@ else:
             f"| val/v_var: {val_vs_baseline:.6f} | improvement: {improvement:.6f}"
         )
 
-        if (not summarizer_frozen and getattr(crypto_config, "FREEZE_SUMMARIZER_ON_PLATEAU", False)):
-            if math.isfinite(cond_gap_scaled):
-                if cond_gap_scaled > best_cond_gap + getattr(crypto_config, "COND_GAP_TOL", 0.0):
-                    best_cond_gap = cond_gap_scaled
-                    cond_gap_plateau = 0
-                    best_summary_state = {
-                        k: v.detach().cpu() for k, v in diff_model.context.state_dict().items()
-                    }
-                else:
-                    cond_gap_plateau += 1
-            else:
-                cond_gap_plateau += 1
+        # if (not summarizer_frozen and getattr(crypto_config, "FREEZE_SUMMARIZER_ON_PLATEAU", False)):
+        #     if math.isfinite(cond_gap_scaled):
+        #         if cond_gap_scaled > best_cond_gap + getattr(crypto_config, "COND_GAP_TOL", 0.0):
+        #             best_cond_gap = cond_gap_scaled
+        #             cond_gap_plateau = 0
+        #             best_summary_state = {
+        #                 k: v.detach().cpu() for k, v in diff_model.context.state_dict().items()
+        #             }
+        #         else:
+        #             cond_gap_plateau += 1
+        #     else:
+        #         cond_gap_plateau += 1
+        #
+        #     if cond_gap_plateau >= getattr(crypto_config, "COND_GAP_PATIENCE", 0) and best_summary_state is not None:
+        #         diff_model.context.load_state_dict(best_summary_state)
+        #         diff_model.context.requires_grad_(False)
+        #         summarizer_frozen = True
+        #         print(
+        #             f"[info] Freezing summarizer at epoch {epoch} after cond_gap plateau. "
+        #             f"Best cond_gap (scaled): {best_cond_gap:.6f}"
+        #         )
 
-            if cond_gap_plateau >= getattr(crypto_config, "COND_GAP_PATIENCE", 0) and best_summary_state is not None:
-                diff_model.context.load_state_dict(best_summary_state)
-                diff_model.context.requires_grad_(False)
-                summarizer_frozen = True
-                print(
-                    f"[info] Freezing summarizer at epoch {epoch} after cond_gap plateau. "
-                    f"Best cond_gap (scaled): {best_cond_gap:.6f}"
-                )
-              
         # checkpoint best (with EMA state)
         if val_loss < best_val:
             best_val = val_loss;
