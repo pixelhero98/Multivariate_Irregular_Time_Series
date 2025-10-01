@@ -35,18 +35,18 @@ DECODER_FT_EPOCHS = 25
 DECODER_FT_LR = 2e-4
 # ======================= Summarizer (LaplaceAE) =======================
 SUM_DIR = "./ldt/SUMMARIZER_EFF/saved_model/" + MKT
-SUM_LAPLACE_K = 48
-CTX_OUT_LEN = 16
-CTX_DIM = 256
+SUM_LAPLACE_K = 256
+CTX_OUT_LEN = 64
+CTX_DIM = 128
 TV_HIDDEN = 32
-CTX_DROPOUT = 0.1
-SUM_LR = 3e-4
+CTX_DROPOUT = 0.0
+SUM_LR = 2e-4
 SUM_WEIGHT_DECAY = 1e-4
 SUM_EPOCHS = 150
 SUM_GRAD_CLIP = 1.0
 SUM_AMP = True
-SUM_PATIENCE = 25
-SUM_MIN_DELTA = 5e-5
+SUM_PATIENCE = 20
+SUM_MIN_DELTA = 1e-5
 # ============================ Diffusion Model (LLapDiT) ============================
 CKPT_DIR = "./ldt/checkpoints/" + MKT
 
