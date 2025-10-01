@@ -23,7 +23,6 @@ class LLapDiT(nn.Module):
                  *,
                  predict_type: str = 'v',
                  laplace_k: Union[int, List[int]] = 32,
-                 global_k: int = 64,
                  timesteps: int = 1000,
                  schedule: str = 'cosine',
                  dropout: float = 0.0,
