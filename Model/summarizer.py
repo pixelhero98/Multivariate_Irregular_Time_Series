@@ -69,8 +69,8 @@ class LaplaceAE(nn.Module):
         self.lap_t = LearnableLaplaceBasis(k=self.K, feat_dim=self.N, mode="parallel")
 
         # Matching 1-layer inverses
-        self.inv_v = LearnablepesudoInverse(k=self.K, feat_dim=self.N, mode="parallel")
-        self.inv_t = LearnablepesudoInverse(k=self.K, feat_dim=self.N, mode="parallel")
+        self.inv_v = LearnablepesudoInverse(self.lap_v)
+        self.inv_t = LearnablepesudoInverse(self.lap_t)
 
         # Simple token projection from concatenated Laplace features
         self.token_proj = nn.Sequential(
