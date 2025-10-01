@@ -104,7 +104,7 @@ mu_mean, mu_std = compute_latent_stats(vae, train_dl, device)
 diff_model = LLapDiT(
     data_dim=crypto_config.VAE_LATENT_CHANNELS, hidden_dim=crypto_config.MODEL_WIDTH,
     num_layers=crypto_config.NUM_LAYERS, num_heads=crypto_config.NUM_HEADS,
-    predict_type=crypto_config.PREDICT_TYPE, laplace_k=crypto_config.LAPLACE_K, global_k=crypto_config.GLOBAL_K,
+    predict_type=crypto_config.PREDICT_TYPE, laplace_k=crypto_config.LAPLACE_K,
     timesteps=crypto_config.TIMESTEPS, schedule=crypto_config.SCHEDULE,
     dropout=crypto_config.DROPOUT, attn_dropout=crypto_config.ATTN_DROPOUT,
     self_conditioning=crypto_config.SELF_COND,
