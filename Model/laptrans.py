@@ -1,29 +1,40 @@
 import math
-import warnings
 from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 
+"""
+This module implements a learnable Laplace transform encoder and a corresponding
+decoder, based on the theory of dt-marginalization.
 
-class LearnableLaplaceBasis(nn.Module):
+- LaplaceEncoder: Can operate in two modes:
+    1. 'effective': A fast, parallel, dt-agnostic path that projects onto a
+       basis of damped exponentials defined by "effective" poles. These poles
+       have statistically absorbed the effect of irregular time gaps.
+    2. 'exact': A slower, recurrent path that computes the exact Zero-Order-Hold
+       (ZOH) solution for each specific time gap, making it dt-sensitive.
+
+- LaplaceDecoder: A complex-aware linear head that maps the Laplace features
+  from the encoder back to the original feature space.
+"""
+
+class LearnableLaplaceTrans(nn.Module):
     """
     Learnable Laplace transform basis producing 2*k channels (cos & sin).
 
+    This encoder implements the core logic of transforming a time series into
+    the Laplace domain using learnable poles.
+
     Args:
-        k:         number of complex poles (output channels = 2*k)
-        feat_dim:  input feature dimension (last dim of x)
-        mode:      'parallel' (fixed basis) or 'recurrent' (irregular-step recurrence)
-        alpha_min: strictly positive floor added to softplus(real part)
-        omega_max: clamp for imaginary part in 'parallel' mode
-
-    Forward:
-        x:  [B, T, D]
-        dt: [T] or [B, T] step sizes; None -> uniform over [0,1]
-
-    Returns:
-        lap_feats: [B, T, 2*k]  (concat of cosine-like and sine-like channels)
+        k:         Number of complex poles (output channels = 2*k).
+        feat_dim:  Input feature dimension.
+        mode:      'effective' (dt-agnostic parallel path) or
+                   'exact' (dt-sensitive recurrent path).
+        alpha_min: A small positive floor for the real part of the poles to
+                   ensure stability (decay).
+        omega_max: Clamp for the imaginary part (frequency) of the poles.
     """
     def __init__(
         self,
@@ -34,68 +45,53 @@ class LearnableLaplaceBasis(nn.Module):
         omega_max: float = math.pi,
     ) -> None:
         super().__init__()
-        self.mode = self._canonicalize_mode(mode)
+        if mode.lower() not in {"effective", "exact"}:
+            raise ValueError("mode must be 'effective' or 'exact'.")
+        self.mode = mode.lower()
         self.k = int(k)
         self.feat_dim = int(feat_dim)
         self.alpha_min = float(alpha_min)
         self.omega_max = float(omega_max)
 
-        # Trainable pole parameters
-        self._s_real_raw = nn.Parameter(torch.empty(k))  # softplus -> positive, then + alpha_min
-        self.s_imag = nn.Parameter(torch.empty(k))       # frequency (can be negative)
+        # Trainable pole parameters: s = -alpha + i*omega
+        # Raw parameter for the real part (decay), becomes > 0 via softplus.
+        self._s_real_raw = nn.Parameter(torch.empty(k))
+        # Imaginary part (frequency).
+        self.s_imag = nn.Parameter(torch.empty(k))
 
-        # Optional global time-scale for recurrent path
-        self._tau = nn.Parameter(torch.tensor(0.0))      # softplus(~0) ≈ 1 at init
+        # Optional learnable global time-scale for the 'exact' recurrent path.
+        self._tau = nn.Parameter(torch.tensor(0.0))
 
-        # Projection feat_dim -> k (shared across modes)
-        self.proj = spectral_norm(
-            nn.Linear(self.feat_dim, k, bias=True),
-            n_power_iterations=1, eps=1e-6
-        )
+        # Linear layer to project input features to the k modes.
+        self.proj = spectral_norm(nn.Linear(self.feat_dim, k, bias=True))
 
-        # Per-mode nonnegative input gain shared across cos/sin (softplus → ≥0)
-        init_val = math.log(math.e - 1.0)   # softplus(init_val) ≈ 1
+        # Per-mode nonnegative input gain (b_k >= 0).
+        init_val = math.log(math.e - 1.0)  # softplus(init_val) ≈ 1
         self.b_param = nn.Parameter(torch.full((1, 1, k), init_val))
 
         self.reset_parameters()
 
-    @staticmethod
-    def _canonicalize_mode(mode: str) -> str:
-        m = mode.lower()
-        if m in {"parallel"}:  return "parallel"
-        if m in {"recurrent"}: return "recurrent"
-        if m in {"static"}:
-            warnings.warn("mode='static' is deprecated; use 'parallel'.", DeprecationWarning, stacklevel=3)
-            return "parallel"
-        if m in {"tv", "timevarying", "time-varying"}:
-            warnings.warn("mode='tv' is deprecated; use 'recurrent'.", DeprecationWarning, stacklevel=3)
-            return "recurrent"
-        raise ValueError("mode must be one of {'parallel','recurrent'} (or deprecated {'static','tv'}).")
-
     @property
     def s_real(self) -> torch.Tensor:
-        """Strictly positive real part (decay): softplus(raw) + alpha_min."""
+        """Returns the strictly positive real part of the poles (decay rate alpha)."""
         return F.softplus(self._s_real_raw) + self.alpha_min
 
     def reset_parameters(self) -> None:
+        """Initializes the model parameters."""
         with torch.no_grad():
-            # Imag part in [-π, π]
+            # Init frequency in [-π, π]
             nn.init.uniform_(self.s_imag, -math.pi, math.pi)
-            # Real part target in [0.01, 0.2] (then + alpha_min)
+            # Init decay rate to target a range of [0.01, 0.2]
             target_alpha = torch.empty_like(self._s_real_raw).uniform_(0.01, 0.2)
             y = (target_alpha - self.alpha_min).clamp_min(1e-8)
-            self._s_real_raw.copy_(torch.log(torch.expm1(y)))  # softplus^{-1}(y)
+            self._s_real_raw.copy_(torch.log(torch.expm1(y)))  # Inverse softplus
 
-            # Projection init
+            # Standard init for the projection layer.
             w = getattr(self.proj, "weight_orig", self.proj.weight)
             nn.init.kaiming_uniform_(w, a=math.sqrt(5))
             if self.proj.bias is not None:
                 bound = 1 / math.sqrt(self.proj.in_features)
                 nn.init.uniform_(self.proj.bias, -bound, bound)
-
-            # Input gain b=1 at init; tau≈1 at init
-            self.b_param.zero_()
-            self._tau.zero_()
 
     def forward(
         self,
@@ -104,169 +100,161 @@ class LearnableLaplaceBasis(nn.Module):
     ) -> torch.Tensor:
         assert x.dim() == 3 and x.size(-1) == self.feat_dim, f"x must be [B, T, {self.feat_dim}]"
         B, T, _ = x.shape
-        device, dtype = x.device, x.dtype
         k = self.k
 
-        if self.mode == "parallel":
-            # Complex exponential basis (fast path)
-            alpha = self.s_real.to(dtype)                                  # [k]
-            beta  = self.s_imag.clamp(-self.omega_max, self.omega_max).to(dtype)
-            t_idx = torch.arange(T, device=device, dtype=dtype).unsqueeze(1)  # [T,1]
-            s = torch.complex((-alpha).float(), beta.float())              # [k] complex
-            expo = torch.exp(t_idx.float() * s.unsqueeze(0))               # [T,k] complex
-            re_basis, im_basis = expo.real.to(dtype), expo.imag.to(dtype)  # [T,k]
-            proj_feats = self.proj(x)                                      # [B,T,k]
-            return torch.cat([proj_feats * re_basis.unsqueeze(0),
-                              proj_feats * im_basis.unsqueeze(0)], dim=2).contiguous()
+        # --------------------------------------------------------------------
+        # --- 'effective' mode: dt-agnostic parallel projection (Fast Path) ---
+        # --------------------------------------------------------------------
+        if self.mode == "effective":
+            # This path models the system using effective poles that have
+            # absorbed the statistics of the time gaps (dt-marginalization).
+            # It is dt-agnostic at runtime and computes in parallel.
+            alpha = self.s_real.to(x.dtype)
+            omega = self.s_imag.clamp(-self.omega_max, self.omega_max).to(x.dtype)
+            s = torch.complex(-alpha, omega)  # Pole: s = -α + iω
 
-        # ----- recurrent (irregular) path -----
+            # Create the exponential basis functions: exp(s*t)
+            t_idx = torch.arange(T, device=x.device, dtype=x.dtype).unsqueeze(1)
+            expo_basis = torch.exp(t_idx * s.unsqueeze(0)) # [T, k]
+            re_basis, im_basis = expo_basis.real, expo_basis.imag
+
+            # Project input onto the basis.
+            proj_feats = self.proj(x)  # [B, T, k]
+            
+            # Real part is projection on cosine, Imaginary part on sine.
+            C = proj_feats * re_basis.unsqueeze(0)
+            S = proj_feats * im_basis.unsqueeze(0)
+            return torch.cat([C, S], dim=2).contiguous()
+
+        # ------------------------------------------------------------------
+        # --- 'exact' mode: dt-sensitive recurrent update (Precise Path) ---
+        # ------------------------------------------------------------------
+        # This path computes the exact Zero-Order Hold (ZOH) solution for
+        # each irregular time step dt. It is computationally
+        # more expensive due to its sequential nature.
         tau = F.softplus(self._tau) + 1e-3
-        alpha0 = self.s_real * tau                 # [k]
-        omega0 = self.s_imag * tau                 # [k]
-        omega0 = omega0.clamp(-self.omega_max, self.omega_max)
+        alpha = (self.s_real * tau).to(x.dtype)
+        omega = (self.s_imag * tau).clamp(-self.omega_max, self.omega_max).to(x.dtype)
 
-        # dt -> [B, T, 1]
+        # Prepare dt to be [B, T, 1] for broadcasting.
         if dt is None:
-            base = (1.0 / max(T - 1, 1)) if T > 1 else 1.0
-            dt_bt1 = x.new_full((B, T, 1), base)
+            dt_val = 1.0 / max(T - 1, 1)
+            dt = x.new_full((B, T, 1), dt_val)
         else:
-            if dt.dim() == 1:
-                if dt.numel() != T:
-                    raise ValueError(f"dt shape {tuple(dt.shape)} incompatible with T={T}.")
-                dt_bt1 = dt.view(1, T, 1).to(dtype=dtype, device=device).expand(B, T, 1)
-            elif dt.dim() == 2:
-                if dt.shape != (B, T):
-                    raise ValueError(f"dt must be [B, T]={B,T} if 2D; got {tuple(dt.shape)}.")
-                dt_bt1 = dt.unsqueeze(-1).to(dtype=dtype, device=device)
-            else:
-                raise ValueError("dt must be [T] or [B, T] if provided")
+            dt = dt.to(x.dtype).view(dt.shape[0] if dt.dim() > 1 else 1, T, 1)
+            if dt.shape[0] == 1: dt = dt.expand(B, -1, -1)
+        
+        # Per-timestep drive signal.
+        u = self.proj(x)  # [B, T, k]
 
-        # Expand poles to [B, T, k]
-        alpha = alpha0.view(1, 1, k).expand(B, T, k).to(dtype)
-        omega = omega0.view(1, 1, k).expand(B, T, k).to(dtype)
-
-        # Per-timestep per-mode drive
-        u = self.proj(x)  # [B,T,k]
-
-        # Step-wise decay & rotation
-        rho   = torch.exp(-alpha * dt_bt1)     # [B,T,k]
-        theta = omega * dt_bt1                  # [B,T,k]
+        # Step-wise decay (rho) and rotation (theta) based on exact dt.
+        rho = torch.exp(-alpha.view(1, 1, k) * dt)
+        theta = omega.view(1, 1, k) * dt
         cos_t, sin_t = torch.cos(theta), torch.sin(theta)
 
-        # Exact ZOH input map Ψ(Δ) for B = [0, 1]^T (2×1).
-        # If other parts assume B=[0, -1]^T, flip the sign of u upstream.
-        den   = (alpha**2 + omega**2).clamp_min(1e-6)                     # [B,T,k]
-        psi_c = (-omega + rho * (alpha * sin_t + omega * cos_t)) / den    # [B,T,k]
-        psi_s = ( alpha - rho * (alpha * cos_t - omega * sin_t)) / den    # [B,T,k]
+        # Calculate the exact ZOH input map coefficients (Psi).
+        alpha_sq = alpha**2
+        omega_sq = omega**2
+        den = (alpha_sq + omega_sq).clamp_min(1e-6).view(1, 1, k)
+        
+        # This corresponds to integrating exp(A*t)*B from 0 to dt.
+        psi_c = (-omega + rho * (alpha * sin_t + omega * cos_t)) / den
+        psi_s = ( alpha - rho * (alpha * cos_t - omega * sin_t)) / den
 
-        # Nonnegative per-mode input gain
-        b = F.softplus(self.b_param).to(dtype=dtype, device=device) + 1e-8  # [1,1,k]
-        u_eff = u * b                                                        # [B,T,k]
+        # Apply nonnegative input gain.
+        b = F.softplus(self.b_param).to(x.dtype) + 1e-8
+        u_eff = u * b
 
-        # Recurrent rollout
+        # Sequential rollout.
         c_hist, s_hist = [], []
-        c = torch.zeros(B, k, dtype=dtype, device=device)
-        s = torch.zeros(B, k, dtype=dtype, device=device)
+        c = torch.zeros(B, k, device=x.device, dtype=x.dtype)
+        s = torch.zeros(B, k, device=x.device, dtype=x.dtype)
+        
         for t in range(T):
-            rt, ct, st = rho[:, t, :], cos_t[:, t, :], sin_t[:, t, :]
-            # homogeneous drift
-            c_new = rt * (c * ct - s * st)
-            s_new = rt * (c * st + s * ct)
-            # exact ZOH input
-            c = c_new + psi_c[:, t, :] * u_eff[:, t, :]
-            s = s_new + psi_s[:, t, :] * u_eff[:, t, :]
-            c_hist.append(c); s_hist.append(s)
+            # Homogeneous part: state evolution without input.
+            c_new = rho[:, t] * (c * cos_t[:, t] - s * sin_t[:, t])
+            s_new = rho[:, t] * (c * sin_t[:, t] + s * cos_t[:, t])
+            # Input part: add the effect of the input over the interval.
+            c = c_new + psi_c[:, t] * u_eff[:, t]
+            s = s_new + psi_s[:, t] * u_eff[:, t]
+            c_hist.append(c)
+            s_hist.append(s)
 
-        C = torch.stack(c_hist, dim=1)  # [B,T,k]
-        S = torch.stack(s_hist, dim=1)  # [B,T,k]
-        return torch.cat([C, S], dim=2).contiguous()  # [B,T,2k]
+        C = torch.stack(c_hist, dim=1)
+        S = torch.stack(s_hist, dim=1)
+        return torch.cat([C, S], dim=2).contiguous()
 
-# ==============================
-# Decoder (NOT a strict inverse)
-# ==============================
-class LearnablepesudoInverse(nn.Module):
+# =====================================
+# PesudoInverser (NOT a strict inverse)
+# =====================================
+class PesudoInverse(nn.Module):
     """
     Decoder that maps Laplace features back to the original feature space.
-
-    Always paired with a LearnableLaplacianBasis:
-        input_dim  = 2 * basis.k
-        output_dim = basis.feat_dim
-
-    Implements a complex-aware linear head:
-        y_lin = C @ Wc - S @ Ws
-    Optionally adds a small MLP residual on top for non-linear corrections.
+    This acts as a pseudo-inverse to the LearnableLaplaceTrans.
 
     Args:
-        basis:               the paired LearnableLaplacianBasis
-        hidden_dim:          width of the residual MLP; default = max(2k, D)
-        num_layers:          residual MLP depth (>=2 recommended if enabled)
-        use_sn:              apply spectral norm to linear layers
-        use_mlp_residual:    add MLP residual on top of the complex-aware head
+        encoder:          The paired LearnableLaplaceTrans instance.
+        hidden_dim:       Width of the optional residual MLP.
+        num_layers:       Depth of the optional residual MLP.
+        use_mlp_residual: If True, adds an MLP on top of the linear head.
     """
 
     def __init__(
         self,
-        basis: LearnableLaplaceBasis,
+        encoder: LaplaceEncoder,
         hidden_dim: Optional[int] = None,
         num_layers: int = 2,
-        use_sn: bool = True,
         use_mlp_residual: bool = True,
     ) -> None:
         super().__init__()
-        assert isinstance(basis, LearnableLaplaceBasis), "basis must be a LearnableLaplacianBasis"
-        self.basis = basis
+        self.encoder = encoder
         self.use_mlp_residual = bool(use_mlp_residual)
 
-        k = basis.k
-        D = basis.feat_dim
+        k = encoder.k
+        D = encoder.feat_dim
         in_dim = 2 * k
         H = int(hidden_dim if hidden_dim is not None else max(in_dim, D))
 
-        def maybe_sn(linear: nn.Linear) -> nn.Linear:
-            return spectral_norm(linear, n_power_iterations=1, eps=1e-6) if use_sn else linear
+        # --- Complex-aware linear head ---
+        # This performs a linear transform on a complex number (C + iS)
+        # by applying separate weights to the real (C) and imaginary (S) parts.
+        # The output is y = head_c(C) + head_s(S).
+        self.head_c = spectral_norm(nn.Linear(k, D, bias=False))
+        self.head_s = spectral_norm(nn.Linear(k, D, bias=False))
 
-        # --- Complex-aware linear head: y = C @ Wc - S @ Ws ---
-        self.head_c = maybe_sn(nn.Linear(k, D, bias=False))
-        self.head_s = maybe_sn(nn.Linear(k, D, bias=False))
-
-        # --- Optional residual MLP over [C,S] ---
+        # --- Optional residual MLP for non-linear corrections ---
         if self.use_mlp_residual:
             self.norm = nn.LayerNorm(in_dim)
-            layers = [maybe_sn(nn.Linear(in_dim, H)), nn.GELU()]
-            for _ in range(max(0, num_layers - 2)):
-                layers += [maybe_sn(nn.Linear(H, H)), nn.GELU()]
-            layers += [maybe_sn(nn.Linear(H, D))]
+            layers = [spectral_norm(nn.Linear(in_dim, H)), nn.GELU()]
+            for _ in range(num_layers - 2):
+                layers += [spectral_norm(nn.Linear(H, H)), nn.GELU()]
+            layers += [spectral_norm(nn.Linear(H, D))]
             self.mlp = nn.Sequential(*layers)
 
-        # Init
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initializes decoder parameters."""
         with torch.no_grad():
-            for lin in (self.head_c, self.head_s):
-                w = getattr(lin, "weight_orig", lin.weight)
-                nn.init.kaiming_uniform_(w, a=math.sqrt(5))
-            if self.use_mlp_residual:
-                for m in self.mlp:
-                    if isinstance(m, nn.Linear):
-                        w = getattr(m, "weight_orig", m.weight)
-                        nn.init.kaiming_uniform_(w, a=math.sqrt(5))
-                        if m.bias is not None:
-                            bound = 1 / math.sqrt(m.in_features)
-                            nn.init.uniform_(m.bias, -bound, bound)
+            nn.init.kaiming_uniform_(self.head_c.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.head_s.weight, a=math.sqrt(5))
 
     def forward(self, lap_feats: torch.Tensor) -> torch.Tensor:
-        # lap_feats: [B, T, 2k] with [C | S] halves
-        B, T, Ctot = lap_feats.shape
-        k = self.basis.k
-        assert Ctot == 2 * k, f"lap_feats must be [B, T, {2*k}]"
+        """
+        Args:
+            lap_feats: [B, T, 2k] tensor from the LaplaceEncoder.
+        Returns:
+            y: [B, T, D] tensor in the original feature space.
+        """
+        k = self.encoder.k
+        C, S = lap_feats.chunk(2, dim=-1)  # Split into cos/sin channels
 
-        C, S = lap_feats[..., :k], lap_feats[..., k:]  # [B,T,k] each
-
-        # Complex-aware linear readout (no LayerNorm to preserve amplitude/phase scale)
-        y_lin = self.head_c(C) - self.head_s(S)       # [B,T,D]
+        # Linear readout combines the two channels.
+        y_lin = self.head_c(C) + self.head_s(S)
 
         if not self.use_mlp_residual:
             return y_lin
 
-        # Residual MLP over concatenated [C,S]
-        h = self.norm(lap_feats)
-        y_mlp = self.mlp(h)                            # [B,T,D]
+        # Add non-linear residual correction.
+        y_mlp = self.mlp(self.norm(lap_feats))
         return y_lin + y_mlp
