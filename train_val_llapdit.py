@@ -233,7 +233,7 @@ def train_one_epoch(epoch: int):
     return running_loss / max(1, num_samples)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def validate():
     diff_model.eval()
     total, count = 0.0, 0
@@ -339,10 +339,6 @@ else:
         print(f"Model path not found: {skip_with_trained_model}. Starting training from scratch.")
 
     best_val = float("inf")
-    best_cond_gap = -float("inf")
-    # best_summary_state = None
-    # cond_gap_plateau = 0
-    # summarizer_frozen = False
     patience = 0
     current_best_path = None
     os.makedirs(crypto_config.CKPT_DIR, exist_ok=True)
@@ -522,7 +518,7 @@ def finetune_vae_decoder(
         ema.restore(diff_model)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate_regression(
         diff_model, vae, dataloader, device, mu_mean, mu_std, config, ema=None,
         steps: int = 36, guidance_strength: float = 2.0, guidance_power: float = 0.3,
