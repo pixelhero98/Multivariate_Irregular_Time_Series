@@ -1,8 +1,7 @@
-
 # ============================ Data & Preprocessing ============================
 DATA_DIR = "/home/pyh/Documents/school/projects/yzn_ts/ldt/LLapDiT_Data/CRYPTO_130_data"
 MKT = DATA_DIR[60:-5]
-
+SEED = 42
 # --- Data Parameters ---
 PRED = 20            # Target sequence length to predict (H)
 WINDOW = 200           # Conditional input sequence length (K)
@@ -23,7 +22,7 @@ VAE_HEADS = 4
 VAE_FF = 256              # feed-forward dim of the Transformers
 VAE_DROPOUT = 0.0
 VAE_DIR = './ldt/vae/saved_model/' + MKT
-VAE_CKPT = "./ldt/vae/saved_model/" + MKT + f"/pred-{PRED}_ch-{VAE_LATENT_CHANNELS}_elbo.pt"
+VAE_CKPT = VAE_DIR + f"/pred-{PRED}_ch-{VAE_LATENT_CHANNELS}_elbo.pt"
 # --- VAE Fine-Tuning (Optional, after diffusion training) ---
 # Set DECODER_FT_EPOCHS = 0 to disable this step.
 VAE_LEARNING_RATE = 2e-4
@@ -35,19 +34,19 @@ DECODER_FT_EPOCHS = 25
 DECODER_FT_LR = 2e-4
 # ======================= Summarizer (LaplaceAE) =======================
 SUM_DIR = "./ldt/SUMMARIZER_EFF/saved_model/" + MKT
-SUM_LAPLACE_K = 48
-SUM_CONTEXT_LEN = 16
+SUM_LAPLACE_K = 256
+SUM_CONTEXT_LEN = 32
 SUM_CONTEXT_DIM = 256
 SUM_TV_HIDDEN = 32
-SUM_DROPOUT = 0.1
-SUM_LR = 3e-4
+SUM_DROPOUT = 0.0
+SUM_LR = 2e-4
 SUM_WEIGHT_DECAY = 1e-4
 SUM_EPOCHS = 150
 SUM_GRAD_CLIP = 1.0
 SUM_AMP = True
 SUM_PATIENCE = 25
-SUM_MIN_DELTA = 5e-5
-SUM_CKPT = SUM_DIR + "/summarizer_laplaceAE.pt"
+SUM_MIN_DELTA = 1e-6
+SUM_CKPT = SUM_DIR + f"/{PRED}-{VAE_LATENT_CHANNELS}-summarizer.pt"
 # ============================ Diffusion Model (LLapDiT) ============================
 CKPT_DIR = "./ldt/checkpoints/" + MKT
 
@@ -67,19 +66,19 @@ MINSNR_GAMMA = 5.0
 MODEL_WIDTH   = SUM_CONTEXT_DIM
 NUM_LAYERS    = 5
 NUM_HEADS     = 4
-LAPLACE_K     = 96
+LAPLACE_K     = 128
 GLOBAL_K      = SUM_LAPLACE_K
-LAP_MODE_main      = 'parallel'   # 'parallel' or 'recurrent (support irregular sampling interval, with time-varying Lap basis updates)'
+LAP_MODE_main      = 'recurrent'   # 'parallel' or 'recurrent (support irregular sampling interval, with time-varying Lap basis updates)'
 LAP_MODE_cond      = 'parallel'
 zero_first_step = False
 add_guidance_tokens = True
-CONTEXT_LEN   = SUM_CONTEXT_LEN  
+CONTEXT_LEN   = SUM_CONTEXT_LEN
 # ============================ Training Hyperparameters ============================
-EPOCHS = 900
+EPOCHS = 500
 BASE_LR = 5e-4
-MIN_LR = 1e-5
+MIN_LR = 0.5e-5
 WARMUP_FRAC = 0.08
-WEIGHT_DECAY = 5e-4
+WEIGHT_DECAY = 1e-4
 GRAD_CLIP = 1.0
 EARLY_STOP = 100
 DROPOUT       = 0.0
@@ -95,10 +94,6 @@ SELF_COND_P   = 0.5
 SELF_COND_START_EPOCH = 210
 TRAINED_LLapDiT = ""
 downstream = False
-# --- Latent Normalization ---
-FT_WARMUP_FRAC=0.035
-FT_BASE_LR=1e-4
-FT_MIN_LR=5e-6
 # ============================ Evaluation & Sampling ============================
 # Use Exponential Moving Average of model weights for evaluation.
 USE_EMA_EVAL = True
