@@ -9,14 +9,14 @@ from torch.nn.utils import spectral_norm
 This module implements a learnable Laplace transform encoder and a corresponding
 decoder, based on the theory of dt-marginalization.
 
-- LaplaceEncoder: Can operate in two modes:
+- LearnableLaplaceTrans: Can operate in two modes:
     1. 'effective': A fast, parallel, dt-agnostic path that projects onto a
        basis of damped exponentials defined by "effective" poles. These poles
        have statistically absorbed the effect of irregular time gaps.
     2. 'exact': A slower, recurrent path that computes the exact Zero-Order-Hold
        (ZOH) solution for each specific time gap, making it dt-sensitive.
 
-- LaplaceDecoder: A complex-aware linear head that maps the Laplace features
+- PseudoInverse: A complex-aware linear head that maps the Laplace features
   from the encoder back to the original feature space.
 """
 
