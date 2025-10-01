@@ -1,5 +1,14 @@
+"""Lightweight Laplace auto-encoder used to summarise panel time-series data.
+
+The original repository contained a minimally documented implementation.  This
+rewrite keeps the public API intact while clarifying tensor shapes, tightening
+validation and explicitly handling padded entities.  The module exposes the
+`LaplaceAE` class which turns raw panel features into a compact context token
+sequence alongside reconstruction auxiliaries that are consumed during
+training.
+"""
 import math
-from typing import Optional, Tuple, Dict
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -8,39 +17,55 @@ import torch.nn.functional as F
 from Model.laptrans import LearnableLaplaceBasis, LearnablepesudoInverse  # note: class name spelled as in repo
 
 
+__all__ = ["LaplaceAE"]
+
+
+
 class TVHead(nn.Module):
-    """Per-entity feature → scalar signal head (works on tensors with ..., D)."""
-    def __init__(self, feat_dim: int, hidden: int = 32):
+   """Project per-entity features to a single scalar signal.
+
+    This head is used for both value (``V``) and time-difference (``T``)
+    streams.  The sequential stack keeps the implementation compact while the
+    layer normalisation guards against scale shifts between entities.
+    """
+
+    def __init__(self, feat_dim: int, hidden: int = 32) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.LayerNorm(feat_dim),
-            nn.Linear(feat_dim, hidden), nn.GELU(),
+            nn.Linear(feat_dim, hidden),
+            nn.GELU(),
             nn.Linear(hidden, 1),
         )
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [..., D] → [...]
+        """Return a scalar for each entity in ``x``.
+
+        Args:
+            x: ``[..., D]`` tensor containing per-entity features.
+
+        Returns:
+            ``[...,]`` tensor of scalar signals.
+        """
         return self.net(x).squeeze(-1)
 
 
 class LaplaceAE(nn.Module):
-    """
-    Minimal autoencoder for EFF-style entity signals using a single parallel
-    LearnableLaplaceBasis encoder and a single LearnablepesudoInverse decoder
-    per stream (V and T). The module also produces a lightweight context token
-    stream by projecting concatenated Laplace features.
+     """Single-layer Laplace auto-encoder for entity level signals.
 
-    Inputs (match EfficientSummarizer signature so it can be dropped-in later):
-        x:          [B,K,N,D]   ̶→ source series (we use it for V)
-        ctx_diff:   [B,K,N,D]   ̶→ auxiliary series (we use it for T)
-        entity_mask:[B,N]       ̶→ boolean mask of valid entities
+    Inputs (matching the EfficientSummarizer contract):
 
-    Returns:
-        context:    [B,S,Hc]    ̶→ simple token projection (S = out_len)
-        aux: dict with:
-            v_sig, t_sig:       ground truth signals [B,K,N]
-            v_hat, t_hat:       reconstructions       [B,K,N]
-            recon_loss:         scalar
+    ``x``
+        Value stream tensor with shape ``[B, K, N, D]``.
+    ``ctx_diff``
+        Auxiliary stream tensor (time-differences) with the same shape as
+        ``x``.
+    ``entity_mask``
+        Boolean tensor ``[B, N]`` indicating which entities are real (``True``)
+        versus padded (``False``).
+
+    Returns a tuple ``(context, aux)`` where ``context`` are pooled tokens with
+    shape ``[B, S, Hc]`` and ``aux`` contains the intermediate signals and
+    reconstructions required to compute the reconstruction loss.
     """
     def __init__(
         self,
@@ -100,23 +125,36 @@ class LaplaceAE(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if entity_mask is None:
             raise ValueError("entity_mask must be provided: [B,N] bool")
+        if entity_mask.dtype != torch.bool:
+            raise TypeError(f"entity_mask must be boolean, got {entity_mask.dtype}")
         if ctx_diff is None:
             raise ValueError("ctx_diff (T series) must be provided: [B,K,N,D]")
 
         B, K, N, D = x.shape
+        if ctx_diff.shape != x.shape:
+            raise ValueError(
+                f"ctx_diff must have same shape as x. Got {ctx_diff.shape}, expected {x.shape}"
+            )
+        if entity_mask.shape != (B, N):
+            raise ValueError(
+                f"entity_mask must be of shape [B,N]={B,N}, got {tuple(entity_mask.shape)}"
+            )
         assert N == self.N and D == self.D, f"Got (N,D)=({N},{D}), expected ({self.N},{self.D})"
 
         # ---- Build scalar signals per entity (EFF-style) ----
-        v_sig = self.v_head(x)         # [B,K,N]
-        t_sig = self.t_head(ctx_diff)  # [B,K,N]
+        mask = entity_mask.to(dtype=x.dtype, device=x.device)
+        mask = mask.unsqueeze(1)  # [B,1,N] for broadcasting
+
+        v_sig = self.v_head(x) * mask  # [B,K,N]
+        t_sig = self.t_head(ctx_diff) * mask  # [B,K,N]
 
         # ---- 1-layer Laplace encoders (parallel) ----
         v_lap = self.lap_v(v_sig)  # [B,K,2K]
         t_lap = self.lap_t(t_sig)  # [B,K,2K]
 
         # ---- Reconstructions via single inverses ----
-        v_hat = self.inv_v(v_lap)  # [B,K,N]
-        t_hat = self.inv_t(t_lap)  # [B,K,N]
+        v_hat = self.inv_v(v_lap) * mask  # [B,K,N]
+        t_hat = self.inv_t(t_lap) * mask  # [B,K,N]
 
         # ---- Lightweight context tokens (for downstream conditioning) ----
         fused = torch.cat([v_lap, t_lap], dim=-1)          # [B,K,4K]
