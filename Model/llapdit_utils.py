@@ -369,13 +369,26 @@ def decode_latents_with_vae(vae, x0_norm: torch.Tensor,
     return x_hat
 
 
-def build_context(model, V, T, mask_bn, device, *, norm: bool = True, requires_grad: bool = False):
+def build_context(context_module: nn.Module,
+                  V,
+                  T,
+                  mask_bn,
+                  device,
+                  *,
+                  norm: bool = True,
+                  requires_grad: bool = False):
     """Returns normalized cond_summary: [B,S,Hm]"""
     series_diff = T.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
     series      = V.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
     mask_bn     = mask_bn.to(device)
 
-    cond_summary, _ = model.context(x=series, ctx_diff=series_diff, entity_mask=mask_bn)
+    if context_module is None:
+        raise AttributeError("context_module must be provided to build_context.")
+
+    frozen = not any(p.requires_grad for p in context_module.parameters())
+    grad_guard = torch.enable_grad if (requires_grad or not frozen) else torch.no_grad
+    with grad_guard():
+        cond_summary, _ = context_module(x=series, ctx_diff=series_diff, entity_mask=mask_bn)
     if norm:
         cond_summary = normalize_cond_per_batch(cond_summary)
 
