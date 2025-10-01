@@ -1,10 +1,12 @@
 import os, torch, math
 import crypto_config
+from pathlib import Path
 from torch import nn
 from tqdm import tqdm
 from torch.cuda.amp import GradScaler, autocast
 from Dataset.data_gen import run_experiment
 from Latent_Space.latent_vae import LatentVAE
+from Model.summarizer import LaplaceAE
 from Model.llapdit import LLapDiT
 from Model.llapdit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_mask,
                                  make_warmup_cosine, calculate_v_variance,
@@ -37,6 +39,42 @@ H = yb0.shape[-1]
 assert Fv == Ft, f"Expected Fv == Ft, got {Fv} vs {Ft}"
 print("V:", V0.shape, "T:", T0.shape, "y:", yb0.shape)
 
+# ---- Load pretrained Laplace summarizer (shared with standalone training) ----
+sum_lap_k = getattr(crypto_config, "SUM_LAPLACE_K", getattr(crypto_config, "LAPLACE_K", 8))
+sum_ctx_len = getattr(crypto_config, "SUM_CONTEXT_LEN", getattr(crypto_config, "CTX_OUT_LEN", 16))
+sum_ctx_dim = getattr(crypto_config, "SUM_CONTEXT_DIM", getattr(crypto_config, "CTX_DIM", Fv))
+sum_tv_hidden = getattr(crypto_config, "SUM_TV_HIDDEN", getattr(crypto_config, "TV_HIDDEN", 32))
+sum_dropout = getattr(crypto_config, "SUM_DROPOUT", getattr(crypto_config, "CTX_DROPOUT", 0.0))
+
+summarizer_ckpt = getattr(crypto_config, "SUM_CKPT", None)
+if summarizer_ckpt is None:
+    summarizer_dir = getattr(crypto_config, "SUM_DIR", "./ldt/SUMMARIZER_EFF/saved_model")
+    summarizer_ckpt = Path(summarizer_dir) / "summarizer_laplaceAE.pt"
+else:
+    summarizer_ckpt = Path(summarizer_ckpt)
+
+laplace_summarizer = LaplaceAE(
+    num_entities=N0,
+    feat_dim=Fv,
+    lap_k=sum_lap_k,
+    tv_hidden=sum_tv_hidden,
+    out_len=sum_ctx_len,
+    context_dim=sum_ctx_dim,
+    dropout=sum_dropout,
+)
+
+if summarizer_ckpt.exists():
+    state = torch.load(summarizer_ckpt, map_location="cpu")
+    laplace_summarizer.load_state_dict(state.get("model", state))
+    print(f"Loaded summarizer checkpoint: {summarizer_ckpt}")
+else:
+    print(f"[warn] Summarizer checkpoint not found at {summarizer_ckpt}; using randomly initialised weights.")
+
+if getattr(crypto_config, "MODEL_WIDTH", sum_ctx_dim) != sum_ctx_dim:
+    raise ValueError(
+        f"crypto_config.MODEL_WIDTH ({crypto_config.MODEL_WIDTH}) must match SUM_CONTEXT_DIM ({sum_ctx_dim})"
+    )
+
 # ---- Estimate global latent stats (uses same window-normalization) ----
 vae = LatentVAE(
     seq_len=crypto_config.PRED,
@@ -66,7 +104,7 @@ diff_model = LLapDiT(
     timesteps=crypto_config.TIMESTEPS, schedule=crypto_config.SCHEDULE,
     dropout=crypto_config.DROPOUT, attn_dropout=crypto_config.ATTN_DROPOUT,
     self_conditioning=crypto_config.SELF_COND,
-    context_dim=Fv, num_entities=N0, context_len=crypto_config.CONTEXT_LEN,
+    context_dim=Fv, context_module=laplace_summarizer, num_entities=N0, context_len=crypto_config.CONTEXT_LEN,
     lap_mode_main=crypto_config.LAP_MODE_main,
     lap_mode_cond=crypto_config.LAP_MODE_cond,
     zero_first_step=crypto_config.zero_first_step,
