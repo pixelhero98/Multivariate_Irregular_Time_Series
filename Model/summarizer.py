@@ -158,8 +158,8 @@ class LaplaceAE(nn.Module):
         # First compress back to 2K before projection (keeps param count modest)
         fused = fused.view(B, K, 2, 2 * self.K).sum(dim=2)  # [B,K,2K]
         tokens = self.token_proj(fused)  # [B,K,Hc]
+        
         # Pool K→S with learned queries via simple attention scores
-        # (no expensive MHA; just content-based pooling)
         norm_tokens = self.norm(tokens)
         norm_queries = F.layer_norm(self.queries, (self.Hc,))  # [S,Hc]
         att = torch.matmul(norm_tokens, norm_queries.t()) / math.sqrt(self.Hc)  # [B,K,S]
