@@ -40,13 +40,14 @@ class LaplaceTransformEncoder(nn.Module):
                    ensure stability (decay).
         omega_max: Clamp for the imaginary part (frequency) of the poles.
     """
+
     def __init__(
-        self,
-        k: int,
-        feat_dim: int,
-        mode: str = "effective",
-        alpha_min: float = 1e-6,
-        omega_max: float = math.pi,
+            self,
+            k: int,
+            feat_dim: int,
+            mode: str = "effective",
+            alpha_min: float = 1e-6,
+            omega_max: float = math.pi,
     ) -> None:
         super().__init__()
         if mode.lower() not in {"effective", "exact"}:
@@ -98,9 +99,9 @@ class LaplaceTransformEncoder(nn.Module):
                 nn.init.uniform_(self.proj.bias, -bound, bound)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        dt: Optional[torch.Tensor] = None,
+            self,
+            x: torch.Tensor,
+            dt: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Encodes an input sequence into Laplace-domain features.
 
@@ -135,104 +136,119 @@ class LaplaceTransformEncoder(nn.Module):
 
         alpha = self.s_real.to(x.dtype)
         omega = self.s_imag.clamp(-self.omega_max, self.omega_max).to(x.dtype)
-        s = torch.complex(-alpha, omega)  # Pole: s = -α + iω
+        proj_feats = self.proj(x)  # Shape: [B, T, k]
 
-        proj_feats = self.proj(x)  # [B, T, k]
-
+        # --- Basis Calculation ---
         time_index = torch.arange(seq_len, device=x.device, dtype=x.dtype).unsqueeze(1)
-        basis = torch.exp(time_index * s.unsqueeze(0))  # [T, k]
-        cos_basis, sin_basis = basis.real, basis.imag
 
+        # Deconstruct the complex exponentiation using Euler's formula and torch.sincos.
+        # This avoids creating a ComplexHalf tensor and is more efficient.
+        # e^(t*s) = e^(t*(-α+iω)) = e^(-tα) * (cos(tω) + i*sin(tω))
+        t_alpha = time_index * alpha.unsqueeze(0)
+        t_omega = time_index * omega.unsqueeze(0)
+
+        exp_decay = torch.exp(-t_alpha)
+
+        # Note: torch.sincos returns the tuple (sin, cos) in that order.
+        sin_t_omega, cos_t_omega = torch.sincos(t_omega)
+
+        cos_basis = exp_decay * cos_t_omega
+        sin_basis = exp_decay * sin_t_omega
+
+        # --- Calculate Final Response ---
         cosine_response = proj_feats * cos_basis.unsqueeze(0)
         sine_response = proj_feats * sin_basis.unsqueeze(0)
+
         return torch.cat([cosine_response, sine_response], dim=2).contiguous()
 
-    def _forward_exact(
+
+def _forward_exact(
         self,
         x: torch.Tensor,
         dt: Optional[torch.Tensor],
         batch_size: int,
         seq_len: int,
         num_poles: int,
-    ) -> torch.Tensor:
-        """Sequential, dt-sensitive Zero-Order Hold rollout."""
+) -> torch.Tensor:
+    """Sequential, dt-sensitive Zero-Order Hold rollout."""
 
-        dtype = x.dtype
+    dtype = x.dtype
 
-        tau = F.softplus(self._tau) + 1e-3
-        alpha = (self.s_real * tau).to(dtype)
-        omega = (self.s_imag * tau).clamp(-self.omega_max, self.omega_max).to(dtype)
+    tau = F.softplus(self._tau) + 1e-3
+    alpha = (self.s_real * tau).to(dtype)
+    omega = (self.s_imag * tau).clamp(-self.omega_max, self.omega_max).to(dtype)
 
-        dt = self._prepare_dt(dt, batch_size, seq_len, dtype, x.device)
+    dt = self._prepare_dt(dt, batch_size, seq_len, dtype, x.device)
 
-        drive = self.proj(x)  # [B, T, k]
+    drive = self.proj(x)  # [B, T, k]
 
-        alpha = alpha.view(1, 1, num_poles)
-        omega = omega.view(1, 1, num_poles)
+    alpha = alpha.view(1, 1, num_poles)
+    omega = omega.view(1, 1, num_poles)
 
-        rho = torch.exp(-alpha * dt)
-        theta = omega * dt
-        cos_theta, sin_theta = torch.cos(theta), torch.sin(theta)
+    rho = torch.exp(-alpha * dt)
+    theta = omega * dt
+    cos_theta, sin_theta = torch.cos(theta), torch.sin(theta)
 
-        denom = (alpha.square() + omega.square()).clamp_min(1e-6)
+    denom = (alpha.square() + omega.square()).clamp_min(1e-6)
 
-        psi_cos = (-omega + rho * (alpha * sin_theta + omega * cos_theta)) / denom
-        psi_sin = (alpha - rho * (alpha * cos_theta - omega * sin_theta)) / denom
+    psi_cos = (-omega + rho * (alpha * sin_theta + omega * cos_theta)) / denom
+    psi_sin = (alpha - rho * (alpha * cos_theta - omega * sin_theta)) / denom
 
-        gain = F.softplus(self.b_param).to(dtype) + 1e-8
-        drive = drive * gain
+    gain = F.softplus(self.b_param).to(dtype) + 1e-8
+    drive = drive * gain
 
-        cos_hist, sin_hist = [], []
-        cos_state = torch.zeros(batch_size, num_poles, device=x.device, dtype=dtype)
-        sin_state = torch.zeros(batch_size, num_poles, device=x.device, dtype=dtype)
+    cos_hist, sin_hist = [], []
+    cos_state = torch.zeros(batch_size, num_poles, device=x.device, dtype=dtype)
+    sin_state = torch.zeros(batch_size, num_poles, device=x.device, dtype=dtype)
 
-        for t in range(seq_len):
-            cos_new = rho[:, t] * (cos_state * cos_theta[:, t] - sin_state * sin_theta[:, t])
-            sin_new = rho[:, t] * (cos_state * sin_theta[:, t] + sin_state * cos_theta[:, t])
+    for t in range(seq_len):
+        cos_new = rho[:, t] * (cos_state * cos_theta[:, t] - sin_state * sin_theta[:, t])
+        sin_new = rho[:, t] * (cos_state * sin_theta[:, t] + sin_state * cos_theta[:, t])
 
-            cos_state = cos_new + psi_cos[:, t] * drive[:, t]
-            sin_state = sin_new + psi_sin[:, t] * drive[:, t]
+        cos_state = cos_new + psi_cos[:, t] * drive[:, t]
+        sin_state = sin_new + psi_sin[:, t] * drive[:, t]
 
-            cos_hist.append(cos_state)
-            sin_hist.append(sin_state)
+        cos_hist.append(cos_state)
+        sin_hist.append(sin_state)
 
-        cosine_response = torch.stack(cos_hist, dim=1)
-        sine_response = torch.stack(sin_hist, dim=1)
-        return torch.cat([cosine_response, sine_response], dim=2).contiguous()
+    cosine_response = torch.stack(cos_hist, dim=1)
+    sine_response = torch.stack(sin_hist, dim=1)
+    return torch.cat([cosine_response, sine_response], dim=2).contiguous()
 
-    def _prepare_dt(
+
+def _prepare_dt(
         self,
         dt: Optional[torch.Tensor],
         batch_size: int,
         seq_len: int,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> torch.Tensor:
-        """Normalises dt tensors to the broadcastable ``[B, T, 1]`` shape."""
+) -> torch.Tensor:
+    """Normalises dt tensors to the broadcastable ``[B, T, 1]`` shape."""
 
-        if dt is None:
-            default_dt = 1.0 / max(seq_len - 1, 1)
-            return torch.full((batch_size, seq_len, 1), default_dt, dtype=dtype, device=device)
+    if dt is None:
+        default_dt = 1.0 / max(seq_len - 1, 1)
+        return torch.full((batch_size, seq_len, 1), default_dt, dtype=dtype, device=device)
 
-        dt = dt.to(dtype=dtype, device=device)
+    dt = dt.to(dtype=dtype, device=device)
 
-        if dt.dim() == 1:
-            dt = dt.view(1, seq_len, 1)
-        elif dt.dim() == 2:
-            dt = dt.view(dt.size(0), seq_len, 1)
-        elif dt.dim() == 3:
-            if dt.size(-1) != 1:
-                raise ValueError("dt tensors must have last dimension equal to 1")
-            dt = dt.view(dt.size(0), seq_len, 1)
-        else:
-            raise ValueError("dt must have 1, 2 or 3 dimensions")
+    if dt.dim() == 1:
+        dt = dt.view(1, seq_len, 1)
+    elif dt.dim() == 2:
+        dt = dt.view(dt.size(0), seq_len, 1)
+    elif dt.dim() == 3:
+        if dt.size(-1) != 1:
+            raise ValueError("dt tensors must have last dimension equal to 1")
+        dt = dt.view(dt.size(0), seq_len, 1)
+    else:
+        raise ValueError("dt must have 1, 2 or 3 dimensions")
 
-        if dt.size(0) == 1 and batch_size > 1:
-            dt = dt.expand(batch_size, -1, -1)
-        elif dt.size(0) != batch_size:
-            raise ValueError("dt batch dimension must either be 1 or match x")
+    if dt.size(0) == 1 and batch_size > 1:
+        dt = dt.expand(batch_size, -1, -1)
+    elif dt.size(0) != batch_size:
+        raise ValueError("dt batch dimension must either be 1 or match x")
 
-        return dt
+    return dt
 
 
 class LaplacePseudoInverse(nn.Module):
@@ -248,11 +264,11 @@ class LaplacePseudoInverse(nn.Module):
     """
 
     def __init__(
-        self,
-        encoder: LaplaceTransformEncoder,
-        hidden_dim: Optional[int] = None,
-        num_layers: int = 2,
-        use_mlp_residual: bool = True,
+            self,
+            encoder: LaplaceTransformEncoder,
+            hidden_dim: Optional[int] = None,
+            num_layers: int = 2,
+            use_mlp_residual: bool = True,
     ) -> None:
         super().__init__()
         self.encoder = encoder
