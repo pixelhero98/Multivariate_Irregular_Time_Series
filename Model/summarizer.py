@@ -60,7 +60,14 @@ class LaplaceAE(nn.Module):
         # 1-layer parallel Laplace encoders for V and T signals
         self.lap_v = LearnableLaplaceBasis(k=self.K, feat_dim=self.N, mode="parallel")
         self.lap_t = LearnableLaplaceBasis(k=self.K, feat_dim=self.N, mode="parallel")
-
+        
+        # It learns to reconstruct the signals from the final context summary.
+        self.aux_decoder = nn.Sequential(
+            nn.Linear(self.Hc, self.Hc * 2),
+            nn.GELU(),
+            nn.Linear(self.Hc * 2, self.K * self.N * 2) # Project to shape [K, N*2]
+        )
+        
         # Matching 1-layer inverses
         self.inv_v = LearnablepesudoInverse(self.lap_v)
         self.inv_t = LearnablepesudoInverse(self.lap_t)
@@ -135,16 +142,33 @@ class LaplaceAE(nn.Module):
         att = torch.einsum('bkh,bsh->bks', self.norm(tokens), self.norm(q)) / math.sqrt(self.Hc)
         att = att.softmax(dim=1)                            # softmax over K
         context = torch.einsum('bks,bkh->bsh', att, tokens) # [B,S,Hc]
-
+        context_pooled = context.mean(dim=1) # Shape: [B, Hc]
+        aux_recon = self.aux_decoder(context_pooled) # Shape: [B, K*N*2]
+        aux_recon = aux_recon.view(B, self.K, self.N * 2) # Reshape to [B, K, N*2]
+        
+        # Split into auxiliary v_hat and t_hat
+        v_hat_aux, t_hat_aux = torch.chunk(aux_recon, 2, dim=-1) # Both [B, K, N]
+        
+        # --- Modify the aux dictionary ---
         aux = {
             'v_sig': v_sig, 't_sig': t_sig,
             'v_hat': v_hat, 't_hat': t_hat,
+            'v_hat_aux': v_hat_aux, 't_hat_aux': t_hat_aux, # Add the new reconstructions
         }
-        # loss is computed externally; keep forward pure when used inside bigger graphs
         return context, aux
 
-    def recon_loss(self, aux: Dict[str, torch.Tensor], entity_mask: torch.Tensor) -> torch.Tensor:
+    def recon_loss(self, aux: Dict[str, torch.Tensor], entity_mask: torch.Tensor, gamma: float = 0.5) -> torch.Tensor:
         """Convenience helper for training scripts."""
+        # Primary loss (trains the Laplace encoder/pseudoinverse)
         lv = self._masked_mse(aux['v_hat'], aux['v_sig'], entity_mask)
         lt = self._masked_mse(aux['t_hat'], aux['t_sig'], entity_mask)
-        return lv + lt
+        primary_loss = lv + lt
+    
+        # Auxiliary loss (trains the context branch)
+        lv_aux = self._masked_mse(aux['v_hat_aux'], aux['v_sig'], entity_mask)
+        lt_aux = self._masked_mse(aux['t_hat_aux'], aux['t_sig'], entity_mask)
+        auxiliary_loss = lv_aux + lt_aux
+    
+        # Combine the losses
+        total_loss = primary_loss + gamma * auxiliary_loss
+        return total_loss
