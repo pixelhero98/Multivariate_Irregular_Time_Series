@@ -448,6 +448,11 @@ def build_context(context_module: nn.Module,
     series_diff = T.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
     series      = V.permute(0, 2, 1, 3).to(device)  # [B,K,N,F]
     mask_bn     = mask_bn.to(device)
+    if mask_bn.dtype != torch.bool:
+        raise TypeError(f"entity_mask must be bool, got {mask_bn.dtype}")
+    mask = mask_bn[:, None, :, None].to(dtype=series.dtype, device=device)
+    series = series * mask
+    series_diff = series_diff * mask
 
     if context_module is None:
         raise AttributeError("context_module must be provided to build_context.")
@@ -455,7 +460,7 @@ def build_context(context_module: nn.Module,
     frozen = not any(p.requires_grad for p in context_module.parameters())
     grad_guard = torch.enable_grad if (requires_grad or not frozen) else torch.no_grad
     with grad_guard():
-        cond_summary, _ = context_module(x=series, ctx_diff=series_diff, entity_mask=mask_bn)
+        cond_summary, _ = context_module(x=series, ctx_diff=series_diff)
     if norm:
         cond_summary = normalize_cond_per_batch(cond_summary)
 
