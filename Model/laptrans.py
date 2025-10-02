@@ -136,23 +136,14 @@ class LaplaceTransformEncoder(nn.Module):
 
         alpha = self.s_real.to(x.dtype)
         omega = self.s_imag.clamp(-self.omega_max, self.omega_max).to(x.dtype)
+        s = torch.complex(-alpha, omega)  # Pole: s = -α + iω
 
-        proj_feats = self.proj(x)  # Shape: [B, T, k]
+        proj_feats = self.proj(x)  # [B, T, k]
 
-        # --- Basis Calculation ---
         time_index = torch.arange(seq_len, device=x.device, dtype=x.dtype).unsqueeze(1)
+        basis = torch.exp(time_index * s.unsqueeze(0))  # [T, k]
+        cos_basis, sin_basis = basis.real, basis.imag
 
-        # Deconstruct the complex exponentiation using Euler's formula and torch.sincos.
-        # This avoids creating a ComplexHalf tensor and is more efficient.
-        # e^(t*s) = e^(t*(-α+iω)) = e^(-tα) * (cos(tω) + i*sin(tω))
-        t_alpha = time_index * alpha.unsqueeze(0)
-        t_omega = time_index * omega.unsqueeze(0)
-
-        exp_decay = torch.exp(-t_alpha)
-        cos_basis = exp_decay * torch.cos(t_omega)
-        sin_basis = exp_decay * torch.sin(t_omega)
-
-        # --- Calculate Final Response ---
         cosine_response = proj_feats * cos_basis.unsqueeze(0)
         sine_response = proj_feats * sin_basis.unsqueeze(0)
         return torch.cat([cosine_response, sine_response], dim=2).contiguous()
