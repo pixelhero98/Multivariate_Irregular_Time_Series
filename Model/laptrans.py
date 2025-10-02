@@ -136,13 +136,14 @@ class LaplaceTransformEncoder(nn.Module):
 
         alpha = self.s_real.to(x.dtype)
         omega = self.s_imag.clamp(-self.omega_max, self.omega_max).to(x.dtype)
-        s = torch.complex(-alpha, omega)  # Pole: s = -α + iω
 
         proj_feats = self.proj(x)  # [B, T, k]
 
         time_index = torch.arange(seq_len, device=x.device, dtype=x.dtype).unsqueeze(1)
-        basis = torch.exp(time_index * s.unsqueeze(0))  # [T, k]
-        cos_basis, sin_basis = basis.real, basis.imag
+        decay = torch.exp(-alpha.unsqueeze(0) * time_index)
+        angle = omega.unsqueeze(0) * time_index
+        cos_basis = decay * torch.cos(angle)
+        sin_basis = decay * torch.sin(angle)
 
         cosine_response = proj_feats * cos_basis.unsqueeze(0)
         sine_response = proj_feats * sin_basis.unsqueeze(0)
