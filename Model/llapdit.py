@@ -10,7 +10,6 @@ from Model.lapformer import LapFormer
 class LLapDiT(nn.Module):
     """Latent Laplace-DiT for multivariate time series with global conditioning.
 
-    - Uses UnifiedGlobalSummarizer for multi-entity context (mode tied to LapFormer).
     Expects an external (typically frozen) context module whose summaries are
     passed in explicitly during training and sampling.
     """
