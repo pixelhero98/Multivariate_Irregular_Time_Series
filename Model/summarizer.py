@@ -62,8 +62,8 @@ class LaplaceAE(nn.Module):
         self.t_head = TVHead(self.D, tv_hidden)
 
         # 1-layer parallel Laplace encoders for V and T signals
-        self.lap_v = LaplaceTransformEncoder(k=self.K, feat_dim=self.N, mode="parallel")
-        self.lap_t = LaplaceTransformEncoder(k=self.K, feat_dim=self.N, mode="parallel")
+        self.lap_v = LaplaceTransformEncoder(k=self.K, feat_dim=self.N, mode="effective")
+        self.lap_t = LaplaceTransformEncoder(k=self.K, feat_dim=self.N, mode="effective")
 
         # It learns to reconstruct the signals from the final context summary.
         self.aux_decoder = nn.Sequential(
@@ -73,8 +73,8 @@ class LaplaceAE(nn.Module):
         )
 
         # Matching 1-layer inverses
-        self.inv_v = LaplacePseudoInverse (self.lap_v)
-        self.inv_t = LaplacePseudoInverse (self.lap_t)
+        self.inv_v = LaplacePseudoInverse(self.lap_v)
+        self.inv_t = LaplacePseudoInverse(self.lap_t)
 
         # Simple token projection from concatenated Laplace features
         self.token_proj = nn.Sequential(
