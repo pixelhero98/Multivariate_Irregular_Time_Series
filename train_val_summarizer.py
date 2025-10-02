@@ -245,8 +245,6 @@ def run(
             print(f"\nEarly stopping at epoch {epoch}: validation loss plateaued.")
             break
 
-    save_ckpt(ckpt_path.with_suffix(".final.pt"), model, {"best_val": best_val, "best_epoch": best_epoch})
-
     if ckpt_path.exists():
         state = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(state["model"])
@@ -266,7 +264,6 @@ def run(
         "best_val": best_val,
         "test_loss": test_loss,
         "checkpoint": str(ckpt_path),
-        "final_checkpoint": str(ckpt_path.with_suffix(".final.pt")),
     }
 
 

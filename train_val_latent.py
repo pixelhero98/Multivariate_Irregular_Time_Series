@@ -193,8 +193,6 @@ def run(
 
     model_dir = Path(config.VAE_DIR)
     model_dir.mkdir(parents=True, exist_ok=True)
-    last_ckpt = model_dir / "last.pt"
-
     best_val_elbo = float("inf")
     best_val_recon = float("inf")
     best_elbo_path: Optional[Path] = None
@@ -251,27 +249,30 @@ def run(
             torch.save(model.state_dict(), best_recon_path)
             print("  -> Saved best reconstruction checkpoint")
 
-        torch.save(model.state_dict(), last_ckpt)
-
         patience_counter = 0 if improved_elbo else (patience_counter + 1)
         if patience_counter >= max_patience:
             print(f"\nEarly stopping at epoch {epoch}: β·ELBO hasn't improved in {max_patience} epochs.")
             break
 
-    checkpoint_to_load: Path = (best_elbo_path or best_recon_path or last_ckpt)
-    print(f"Loading checkpoint: {checkpoint_to_load}")
-    vae = LatentVAE(
-        seq_len=config.PRED,
-        latent_dim=config.VAE_LATENT_DIM,
-        latent_channel=config.VAE_LATENT_CHANNELS,
-        enc_layers=config.VAE_LAYERS,
-        enc_heads=config.VAE_HEADS,
-        enc_ff=config.VAE_FF,
-        dec_layers=config.VAE_LAYERS,
-        dec_heads=config.VAE_HEADS,
-        dec_ff=config.VAE_FF,
-    ).to(device)
-    vae.load_state_dict(torch.load(checkpoint_to_load, map_location=device))
+    checkpoint_to_load: Optional[Path] = best_elbo_path or best_recon_path
+    if checkpoint_to_load is not None:
+        print(f"Loading checkpoint: {checkpoint_to_load}")
+        vae = LatentVAE(
+            seq_len=config.PRED,
+            latent_dim=config.VAE_LATENT_DIM,
+            latent_channel=config.VAE_LATENT_CHANNELS,
+            enc_layers=config.VAE_LAYERS,
+            enc_heads=config.VAE_HEADS,
+            enc_ff=config.VAE_FF,
+            dec_layers=config.VAE_LAYERS,
+            dec_heads=config.VAE_HEADS,
+            dec_ff=config.VAE_FF,
+        ).to(device)
+        vae.load_state_dict(torch.load(checkpoint_to_load, map_location=device))
+    else:
+        print("No improved checkpoints saved; using the final training state.")
+        vae = model
+
     vae.eval()
 
     for param in vae.encoder.parameters():
@@ -301,7 +302,7 @@ def run(
         "sizes": sizes,
         "best_elbo_path": str(best_elbo_path) if best_elbo_path else None,
         "best_recon_path": str(best_recon_path) if best_recon_path else None,
-        "loaded_checkpoint": str(checkpoint_to_load),
+        "loaded_checkpoint": str(checkpoint_to_load) if checkpoint_to_load else None,
         "model": vae,
     }
 
