@@ -27,7 +27,7 @@ class LLapDiT(nn.Module):
                  dropout: float = 0.0,
                  attn_dropout: float = 0.0,
                  self_conditioning: bool = False,
-                 lap_mode_main: str = 'recurrent'
+                 lap_mode_main: str = 'effective'
                  ):
         super().__init__()
         assert predict_type in ('eps', 'v')
