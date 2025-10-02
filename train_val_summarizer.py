@@ -55,39 +55,54 @@ def _apply_entity_mask(series: torch.Tensor, mask_bn: torch.Tensor) -> torch.Ten
     return series * mask
 
 
-def run() -> None:
+def run(
+    train_loader=None,
+    val_loader=None,
+    test_loader=None,
+    sizes=None,
+    config=crypto_config,
+) -> Dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ---- Hyper-parameters ----
-    lap_k = crypto_config.SUM_LAPLACE_K
-    out_len = crypto_config.SUM_CONTEXT_LEN
-    ctx_dim = crypto_config.SUM_CONTEXT_DIM
-    tv_hidden = crypto_config.SUM_TV_HIDDEN
-    dropout = crypto_config.SUM_DROPOUT
+    lap_k = config.SUM_LAPLACE_K
+    out_len = config.SUM_CONTEXT_LEN
+    ctx_dim = config.SUM_CONTEXT_DIM
+    tv_hidden = config.SUM_TV_HIDDEN
+    dropout = config.SUM_DROPOUT
 
-    lr = crypto_config.SUM_LR
-    wd = crypto_config.SUM_WEIGHT_DECAY
-    epochs = crypto_config.SUM_EPOCHS
-    grad_clip = crypto_config.GRAD_CLIP
-    amp = crypto_config.SUM_AMP
-    patience = crypto_config.SUM_PATIENCE
-    min_delta = crypto_config.SUM_MIN_DELTA
+    lr = config.SUM_LR
+    wd = config.SUM_WEIGHT_DECAY
+    epochs = config.SUM_EPOCHS
+    grad_clip = config.GRAD_CLIP
+    amp = config.SUM_AMP
+    patience = config.SUM_PATIENCE
+    min_delta = config.SUM_MIN_DELTA
 
-    model_dir = crypto_config.SUM_DIR
-    ckpt_path = Path(model_dir) / f"{crypto_config.PRED}-{crypto_config.VAE_LATENT_CHANNELS}-summarizer.pt"
+    model_dir = config.SUM_DIR
+    ckpt_path = Path(model_dir) / f"{config.PRED}-{config.VAE_LATENT_CHANNELS}-summarizer.pt"
 
-    set_seed(crypto_config.SEED)
+    set_seed(config.SEED)
 
-    # ---- Data loaders ----
-    train_loader, val_loader, test_loader, sizes = run_experiment(
-        data_dir=crypto_config.DATA_DIR,
-        date_batching=crypto_config.date_batching,
-        dates_per_batch=crypto_config.BATCH_SIZE,
-        K=crypto_config.WINDOW,
-        H=crypto_config.PRED,
-        coverage=crypto_config.COVERAGE,
-    )
-    print('sizes:', sizes)
+    if any(loader is None for loader in (train_loader, val_loader, test_loader)):
+        train_loader, val_loader, test_loader, sizes = run_experiment(
+            data_dir=config.DATA_DIR,
+            date_batching=config.date_batching,
+            dates_per_batch=config.BATCH_SIZE,
+            K=config.WINDOW,
+            H=config.PRED,
+            coverage=config.COVERAGE,
+        )
+    elif sizes is None:
+        try:
+            sizes = tuple(len(dl.dataset) for dl in (train_loader, val_loader, test_loader))
+        except Exception:
+            sizes = None
+
+    if sizes is not None:
+        print('sizes:', sizes)
+    else:
+        print('sizes: (unknown)')
 
     # Probe one batch for dims
     (xb, yb, meta0) = next(iter(train_loader))
@@ -99,7 +114,7 @@ def run() -> None:
     model = LaplaceAE(
         num_entities=N0,
         feat_dim=F0,
-        window_size=crypto_config.WINDOW,
+        window_size=config.WINDOW,
         lap_k=lap_k,
         tv_hidden=tv_hidden,
         out_len=out_len,
@@ -187,7 +202,7 @@ def run() -> None:
             f"best {best_val:.6f} @ {best_epoch:03d} | patience {patience_ctr}/{patience} | {elapsed:.1f}s"
         )
 
-    # Final save for reference
+        # Final save for reference
         if patience_ctr >= patience:
             print(f"\nEarly stopping at epoch {epoch}: validation loss plateaued.")
             break
@@ -224,6 +239,17 @@ def run() -> None:
 
     test_loss = test_sum / test_elems if test_elems > 0 else float("nan")
     print(f"Best val loss: {best_val:.6f} | Test loss: {test_loss:.6f}")
+
+    return {
+        "train_loader": train_loader,
+        "val_loader": val_loader,
+        "test_loader": test_loader,
+        "sizes": sizes,
+        "best_val": best_val,
+        "test_loss": test_loss,
+        "checkpoint": ckpt_path,
+        "final_checkpoint": ckpt_path.with_suffix(".final.pt"),
+    }
 
 
 
