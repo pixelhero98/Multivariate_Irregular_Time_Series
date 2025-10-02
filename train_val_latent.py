@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
@@ -107,6 +108,8 @@ def _epoch_pass(
         "kl_count": 0,
     }
 
+    grad_ctx_factory = nullcontext if is_train else torch.no_grad
+
     for (_, yb, meta) in loader:
         y = yb.to(device)
         mask = meta["entity_mask"].to(device)
@@ -117,13 +120,14 @@ def _epoch_pass(
         if is_train:
             optimizer.zero_grad(set_to_none=True)
 
-        with autocast(enabled=amp_enabled):
-            y_hat, mu, logvar = model(y_in)
-            recon_loss = F.mse_loss(y_hat, y_in, reduction="mean")
-            kl_elem = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
-            kl_per_sample = kl_elem.sum(dim=-1)
-            kl_loss = kl_per_sample.mean()
-            loss = recon_loss + beta * kl_loss
+        with grad_ctx_factory():
+            with autocast(enabled=amp_enabled):
+                y_hat, mu, logvar = model(y_in)
+                recon_loss = F.mse_loss(y_hat, y_in, reduction="mean")
+                kl_elem = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+                kl_per_sample = kl_elem.sum(dim=-1)
+                kl_loss = kl_per_sample.mean()
+                loss = recon_loss + beta * kl_loss
 
         if is_train:
             if scaler is None:
