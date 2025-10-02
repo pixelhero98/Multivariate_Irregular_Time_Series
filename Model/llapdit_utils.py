@@ -1,34 +1,68 @@
+"""Utility helpers used by LLapDiT diffusion models."""
+
 import math
 from typing import List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 
+
 # ============================LLapDiT utils============================
-def set_torch():
+def set_torch() -> torch.device:
+    """Configure PyTorch defaults and return the active device.
+
+    TF32 is enabled whenever CUDA is available and PyTorch exposes the relevant
+    hooks.  The helper returns the device so callers can immediately cache it.
+    """
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    if device.type == "cuda":
+    cuda_backend = getattr(torch.backends, "cuda", None)
+    if cuda_backend is not None and hasattr(cuda_backend, "is_built") and cuda_backend.is_built():
+        cuda_backend.matmul.allow_tf32 = True
+    if device.type == "cuda" and hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
     return device
 
 
-def sample_t_uniform(scheduler, n: int, device: torch.device) -> torch.Tensor:
+def sample_t_uniform(scheduler: "NoiseScheduler", n: int, device: torch.device) -> torch.Tensor:
+    """Sample ``n`` discrete timesteps uniformly from ``[0, T)``."""
+
     return torch.randint(0, scheduler.timesteps, (n,), device=device)
 
 
-def make_warmup_cosine(optimizer, total_steps, warmup_frac=0.05, base_lr=5e-4, min_lr=1e-6):
+def make_warmup_cosine(
+    optimizer: torch.optim.Optimizer,
+    total_steps: int,
+    warmup_frac: float = 0.05,
+    base_lr: float = 5e-4,
+    min_lr: float = 1e-6,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Return a cosine scheduler with linear warmup.
+
+    Args:
+        optimizer: Optimizer whose learning rate should be scheduled.
+        total_steps: Total number of training steps.
+        warmup_frac: Fraction of steps to spend in the warmup phase.
+        base_lr: The learning rate reached after warmup.
+        min_lr: Floor on the cosine annealed learning rate.
+    """
+
     warmup_steps = max(1, int(total_steps * warmup_frac))
 
-    def lr_lambda(step):
+    def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return (step + 1) / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return max(min_lr / max(base_lr, 1e-12), 0.5 * (1.0 + math.cos(math.pi * progress)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        floor = min_lr / max(base_lr, 1e-12)
+        return max(floor, cosine)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def _cosine_alpha_bar(ts: torch.Tensor, s: float = 0.008) -> torch.Tensor:
+    """Cosine cumulative noise schedule from Nichol & Dhariwal (2021)."""
+
     return torch.cos(((ts + s) / (1.0 + s)) * math.pi * 0.5).pow(2)
 
 
@@ -72,25 +106,43 @@ class NoiseScheduler(nn.Module):
                 betas[1:] = betas[1:].clamp(min=1e-8, max=0.999)
 
         # Register buffers
-        self.register_buffer("betas", betas)                              # [T]
-        alphas = (1.0 - betas).clamp(1e-12, 1.0)                          # [T]
+        self.register_buffer("betas", betas)  # [T]
+        alphas = (1.0 - betas).clamp(1e-12, 1.0)  # [T]
         self.register_buffer("alphas", alphas)
-        alpha_bars = torch.cumprod(alphas, dim=0)                         # [T]
+        alpha_bars = torch.cumprod(alphas, dim=0)  # [T]
         self.register_buffer("alpha_bars", alpha_bars)
 
         # Precompute common roots
         ab = alpha_bars.clamp(0.0, 1.0)
         self.register_buffer("sqrt_alphas", torch.sqrt(alphas))
         self.register_buffer("sqrt_alpha_bars", torch.sqrt(ab))
-        self.register_buffer("sqrt_one_minus_alpha_bars", torch.sqrt((1.0 - ab).clamp(0.0, 1.0)))
+        self.register_buffer(
+            "sqrt_one_minus_alpha_bars",
+            torch.sqrt((1.0 - ab).clamp(0.0, 1.0)),
+        )
 
     @torch.no_grad()
     def timesteps_desc(self) -> torch.Tensor:
-        return torch.arange(self.timesteps - 1, -1, -1, dtype=torch.long, device=self.alpha_bars.device)
+        """Return timesteps in reverse order as ``[T-1, ..., 0]``."""
+
+        return torch.arange(
+            self.timesteps - 1,
+            -1,
+            -1,
+            dtype=torch.long,
+            device=self.alpha_bars.device,
+        )
 
     def _gather(self, buf: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Safely gather discrete values from a buffer for (possibly) float ``t``."""
+
         t_idx = t.clamp(min=0, max=self.timesteps - 1).to(device=buf.device, dtype=torch.long)
         return buf.gather(0, t_idx)
+
+    def _expand_like(self, buf: torch.Tensor, t: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        """Gather ``buf`` at ``t`` and reshape to broadcast with ``ref``."""
+
+        return self._gather(buf, t).view(-1, *([1] * (ref.dim() - 1)))
 
     @torch.no_grad()
     def alpha_bar_at(self, t: torch.Tensor) -> torch.Tensor:
@@ -111,43 +163,52 @@ class NoiseScheduler(nn.Module):
         abar = self.alpha_bar_at(t).clamp(1e-6, 1.0 - 1e-6)
         return abar / (1.0 - abar)
 
-    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None):
+    def q_sample(
+        self,
+        x0: torch.Tensor,
+        t: torch.Tensor,
+        noise: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample ``x_t`` from the forward process and return the noise used."""
+
         if noise is None:
             noise = torch.randn_like(x0)
-        sqrt_ab = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x0.dim() - 1)))
-        sqrt_1_ab = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x0.dim() - 1)))
+        sqrt_ab = self._expand_like(self.sqrt_alpha_bars, t, x0)
+        sqrt_1_ab = self._expand_like(self.sqrt_one_minus_alpha_bars, t, x0)
         x_t = sqrt_ab * x0 + sqrt_1_ab * noise
         return x_t, noise  # noise is ε_true
 
     def pred_x0_from_eps(self, x_t: torch.Tensor, t: torch.Tensor, eps: torch.Tensor):
-        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))   # √ᾱ
-        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))  # √(1-ᾱ)
+        alpha = self._expand_like(self.sqrt_alpha_bars, t, x_t)  # √ᾱ
+        sigma = self._expand_like(self.sqrt_one_minus_alpha_bars, t, x_t)  # √(1-ᾱ)
         return (x_t - sigma * eps) / (alpha + 1e-12)
 
     def pred_eps_from_x0(self, x_t: torch.Tensor, t: torch.Tensor, x0: torch.Tensor):
-        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
-        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
+        alpha = self._expand_like(self.sqrt_alpha_bars, t, x_t)
+        sigma = self._expand_like(self.sqrt_one_minus_alpha_bars, t, x_t)
         return (x_t - alpha * x0) / (sigma + 1e-12)
 
     def pred_x0_from_v(self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor):
         # x0 = α x_t − σ v
-        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
-        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
+        alpha = self._expand_like(self.sqrt_alpha_bars, t, x_t)
+        sigma = self._expand_like(self.sqrt_one_minus_alpha_bars, t, x_t)
         return alpha * x_t - sigma * v
 
     def pred_eps_from_v(self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor):
         # ε = σ x_t + α v
-        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
-        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
+        alpha = self._expand_like(self.sqrt_alpha_bars, t, x_t)
+        sigma = self._expand_like(self.sqrt_one_minus_alpha_bars, t, x_t)
         return sigma * x_t + alpha * v
 
     def v_from_eps(self, x_t: torch.Tensor, t: torch.Tensor, eps: torch.Tensor):
         # v = (ε − σ x_t) / α
-        alpha = self._gather(self.sqrt_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
-        sigma = self._gather(self.sqrt_one_minus_alpha_bars, t).view(-1, *([1] * (x_t.dim() - 1)))
+        alpha = self._expand_like(self.sqrt_alpha_bars, t, x_t)
+        sigma = self._expand_like(self.sqrt_one_minus_alpha_bars, t, x_t)
         return (eps - sigma * x_t) / (alpha + 1e-12)
 
     def to_x0(self, x_t: torch.Tensor, t: torch.Tensor, pred: torch.Tensor, param_type: str):
+        """Convert a model prediction to the ``x0`` parameterization."""
+
         if param_type == "eps":
             return self.pred_x0_from_eps(x_t, t, pred)
         elif param_type == "v":
@@ -158,6 +219,8 @@ class NoiseScheduler(nn.Module):
             raise ValueError("param_type must be 'eps', 'v', or 'x0'")
 
     def to_eps(self, x_t: torch.Tensor, t: torch.Tensor, pred: torch.Tensor, param_type: str):
+        """Convert a model prediction to the ``eps`` parameterization."""
+
         if param_type == "eps":
             return pred
         elif param_type == "v":
@@ -171,8 +234,11 @@ class NoiseScheduler(nn.Module):
     def ddim_sigma(self, t: torch.Tensor, t_prev: torch.Tensor, eta: float) -> torch.Tensor:
         ab_t = self._gather(self.alpha_bars, t).clamp(1e-12, 1.0)
         ab_prev = self._gather(self.alpha_bars, t_prev).clamp(1e-12, 1.0)
-        sigma = eta * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t)) \
-                  * torch.sqrt((1.0 - (ab_t / (ab_prev + 1e-12))).clamp_min(0.0))
+        sigma = (
+            eta
+            * torch.sqrt((1.0 - ab_prev) / (1.0 - ab_t))
+            * torch.sqrt((1.0 - (ab_t / (ab_prev + 1e-12))).clamp_min(0.0))
+        )
         return sigma.view(-1)
 
     @torch.no_grad()
@@ -189,7 +255,7 @@ class NoiseScheduler(nn.Module):
         if noise is None:
             noise = torch.randn_like(x_t)
 
-        ab_prev = self._gather(self.alpha_bars, t_prev).view(-1, *([1] * (x_t.dim() - 1))).clamp(1e-12, 1.0)
+        ab_prev = self._expand_like(self.alpha_bars, t_prev, x_t).clamp(1e-12, 1.0)
         sigma = self.ddim_sigma(t, t_prev, eta).view(-1, *([1] * (x_t.dim() - 1)))
 
         x0_pred = self.to_x0(x_t, t, pred, param_type)
