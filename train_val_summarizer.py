@@ -1,23 +1,37 @@
+"""Training and evaluation loop for the LaplaceAE summarizer model."""
+
+from __future__ import annotations
+
 import math
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable, Optional, Sequence, Tuple
+
 import crypto_config
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
+
 from Dataset.fin_dataset import run_experiment
 from Model.summarizer import LaplaceAE
 
 
+LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
+
+
 def set_seed(seed: int = 42) -> None:
     """Seed all relevant RNGs for reproducible runs."""
+
     import random
+
     import numpy as np
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def count_params(module: nn.Module) -> int:
@@ -29,61 +43,13 @@ def save_ckpt(path: Path, model: nn.Module, stats: Dict) -> None:
     torch.save({"model": model.state_dict(), "stats": stats}, path)
 
 
-def _batch_elements(mask: torch.Tensor, steps: int) -> float:
-    """Return number of valid entity/time elements represented by ``mask``."""
-
-    # mask: [B, N] bool
-    valid_entities = mask.float().sum().item()
-    return valid_entities * float(steps)
-
-
-def _permute_to_seq_first(x: torch.Tensor) -> torch.Tensor:
-    """Convert tensors from ``[B, N, K, F]`` to ``[B, K, N, F]`` layout."""
-    return x.permute(0, 2, 1, 3).contiguous()
-
-
-def _apply_entity_mask(series: torch.Tensor, mask_bn: torch.Tensor) -> torch.Tensor:
-    """Broadcast ``mask_bn`` over ``series`` assuming layout ``[B, K, N, ...]``."""
-
-    if mask_bn.dtype != torch.bool:
-        raise TypeError(f"entity_mask must be bool, got {mask_bn.dtype}")
-    if mask_bn.shape[0] != series.shape[0] or mask_bn.shape[1] != series.shape[2]:
-        raise ValueError(
-            f"Mask shape {tuple(mask_bn.shape)} incompatible with series shape {tuple(series.shape)}"
-        )
-    mask = mask_bn[:, None, :, None].to(device=series.device, dtype=series.dtype)
-    return series * mask
-
-
-def run(
-    train_loader=None,
-    val_loader=None,
-    test_loader=None,
-    sizes=None,
+def _ensure_loaders(
+    train_loader: Optional[DataLoader],
+    val_loader: Optional[DataLoader],
+    test_loader: Optional[DataLoader],
+    sizes: Optional[Sequence[int]],
     config=crypto_config,
-) -> Dict:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # ---- Hyper-parameters ----
-    lap_k = config.SUM_LAPLACE_K
-    out_len = config.SUM_CONTEXT_LEN
-    ctx_dim = config.SUM_CONTEXT_DIM
-    tv_hidden = config.SUM_TV_HIDDEN
-    dropout = config.SUM_DROPOUT
-
-    lr = config.SUM_LR
-    wd = config.SUM_WEIGHT_DECAY
-    epochs = config.SUM_EPOCHS
-    grad_clip = config.GRAD_CLIP
-    amp = config.SUM_AMP
-    patience = config.SUM_PATIENCE
-    min_delta = config.SUM_MIN_DELTA
-
-    model_dir = config.SUM_DIR
-    ckpt_path = Path(model_dir) / f"{config.PRED}-{config.VAE_LATENT_CHANNELS}-summarizer.pt"
-
-    set_seed(config.SEED)
-
+) -> Tuple[LoaderTuple, Optional[Tuple[int, int, int]]]:
     if any(loader is None for loader in (train_loader, val_loader, test_loader)):
         train_loader, val_loader, test_loader, sizes = run_experiment(
             data_dir=config.DATA_DIR,
@@ -99,33 +65,145 @@ def run(
         except Exception:
             sizes = None
 
+    if train_loader is None or val_loader is None or test_loader is None:
+        raise RuntimeError("Failed to obtain train/val/test dataloaders.")
+
+    return (train_loader, val_loader, test_loader), sizes
+
+
+def _summarize_dataset(train_loader: DataLoader, sizes: Optional[Sequence[int]]) -> Tuple[int, int]:
     if sizes is not None:
-        print('sizes:', sizes)
+        print(f"sizes: {tuple(sizes)}")
     else:
-        print('sizes: (unknown)')
+        print("sizes: (unknown)")
 
-    # Probe one batch for dims
-    (xb, yb, meta0) = next(iter(train_loader))
-    V0, T0 = xb
-    _, N0, _, F0 = V0.shape
-    print("V:", V0.shape, "T:", T0.shape, "y:", yb.shape)
+    try:
+        (xb, yb, meta) = next(iter(train_loader))
+    except StopIteration as exc:  # pragma: no cover - defensive
+        raise RuntimeError("Training dataloader produced no batches.") from exc
 
-    # ---- Model ----
+    V, T = xb
+    _, num_entities, _, feat_dim = V.shape
+    print("V:", tuple(V.shape), "T:", tuple(T.shape), "y:", tuple(yb.shape))
+    return num_entities, feat_dim
+
+
+def _permute_to_seq_first(x: torch.Tensor) -> torch.Tensor:
+    return x.permute(0, 2, 1, 3).contiguous()
+
+
+def _apply_entity_mask(series: torch.Tensor, mask_bn: torch.Tensor) -> torch.Tensor:
+    if mask_bn.dtype != torch.bool:
+        mask_bn = mask_bn.to(dtype=torch.bool)
+    if mask_bn.shape[0] != series.shape[0] or mask_bn.shape[1] != series.shape[2]:
+        raise ValueError(
+            f"Mask shape {tuple(mask_bn.shape)} incompatible with series shape {tuple(series.shape)}"
+        )
+    mask = mask_bn[:, None, :, None].to(device=series.device, dtype=series.dtype)
+    return series * mask
+
+
+def _batch_elements(mask: torch.Tensor, steps: int) -> float:
+    return mask.float().sum().item() * float(steps)
+
+
+def _prepare_batch(
+    batch: Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]],
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    (V, T), _, meta = batch
+    V = _permute_to_seq_first(V).to(device)
+    T = _permute_to_seq_first(T).to(device)
+    mask = meta["entity_mask"].to(device=device, dtype=torch.bool)
+    V = _apply_entity_mask(V, mask)
+    T = _apply_entity_mask(T, mask)
+    elems = _batch_elements(mask, V.size(1))
+    return V, T, mask, elems
+
+
+def _run_epoch(
+    loader: Iterable,
+    model: LaplaceAE,
+    device: torch.device,
+    *,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scaler: Optional[GradScaler] = None,
+    grad_clip: float = 0.0,
+    amp: bool = False,
+) -> float:
+    is_train = optimizer is not None
+    total_loss = 0.0
+    total_elems = 0.0
+
+    for batch in loader:
+        V, T, mask, elems = _prepare_batch(batch, device)
+        if elems == 0.0:
+            continue
+
+        if is_train:
+            if scaler is None:
+                raise ValueError("GradScaler must be provided when training.")
+            optimizer.zero_grad(set_to_none=True)
+
+        with autocast(enabled=amp):
+            _, aux = model(V, ctx_diff=T)
+            loss = model.recon_loss(aux, mask)
+
+        if is_train:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            if grad_clip and grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+
+        total_loss += loss.item() * elems
+        total_elems += elems
+
+    if total_elems == 0.0:
+        return 0.0 if is_train else float("inf")
+    return total_loss / total_elems
+
+
+def run(
+    train_loader: Optional[DataLoader] = None,
+    val_loader: Optional[DataLoader] = None,
+    test_loader: Optional[DataLoader] = None,
+    sizes: Optional[Sequence[int]] = None,
+    config=crypto_config,
+) -> Dict[str, object]:
+    (train_loader, val_loader, test_loader), sizes = _ensure_loaders(
+        train_loader, val_loader, test_loader, sizes, config
+    )
+    num_entities, feat_dim = _summarize_dataset(train_loader, sizes)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp = bool(config.SUM_AMP and device.type == "cuda")
+    grad_clip = getattr(config, "GRAD_CLIP", 0.0)
+    print(f"Using device: {device}")
+
+    set_seed(config.SEED)
+
     model = LaplaceAE(
-        num_entities=N0,
-        feat_dim=F0,
+        num_entities=num_entities,
+        feat_dim=feat_dim,
         window_size=config.WINDOW,
-        lap_k=lap_k,
-        tv_hidden=tv_hidden,
-        out_len=out_len,
-        context_dim=ctx_dim,
-        dropout=dropout,
+        lap_k=config.SUM_LAPLACE_K,
+        tv_hidden=config.SUM_TV_HIDDEN,
+        out_len=config.SUM_CONTEXT_LEN,
+        context_dim=config.SUM_CONTEXT_DIM,
+        dropout=config.SUM_DROPOUT,
     ).to(device)
+    print(f"Model params: {count_params(model) / 1e6:.2f}M")
 
-    print(f"Model params: {count_params(model)/1e6:.2f}M")
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.SUM_LR, weight_decay=config.SUM_WEIGHT_DECAY)
     scaler = GradScaler(enabled=amp)
+
+    epochs = config.SUM_EPOCHS
+    patience = config.SUM_PATIENCE
+    min_delta = config.SUM_MIN_DELTA
+
+    ckpt_path = Path(config.SUM_DIR) / f"{config.PRED}-{config.VAE_LATENT_CHANNELS}-summarizer.pt"
 
     best_val = math.inf
     best_epoch = 0
@@ -134,58 +212,19 @@ def run(
     for epoch in range(1, epochs + 1):
         epoch_start = time.time()
         model.train()
-        train_sum = 0.0
-        train_elems = 0.0
+        train_loss = _run_epoch(
+            train_loader,
+            model,
+            device,
+            optimizer=optimizer,
+            scaler=scaler,
+            grad_clip=grad_clip,
+            amp=amp,
+        )
 
-        for (V, T), _, meta in train_loader:
-            V = _permute_to_seq_first(V).to(device)
-            T = _permute_to_seq_first(T).to(device)
-            mask = meta["entity_mask"].to(device)
-            V = _apply_entity_mask(V, mask)
-            T = _apply_entity_mask(T, mask)
-            elems = _batch_elements(mask, V.size(1))
-            if elems == 0.0:  # no valid entities
-                continue
-
-            optimizer.zero_grad(set_to_none=True)
-            with autocast(enabled=amp):
-                _, aux = model(V, ctx_diff=T)
-                loss = model.recon_loss(aux, mask)
-            scaler.scale(loss).backward()
-            if grad_clip and grad_clip > 0:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-
-            train_sum += loss.item() * elems
-            train_elems += elems
-
-        train_loss = train_sum / train_elems if train_elems > 0 else 0.0
-
-        # ---- Validation ----
         model.eval()
-        val_sum = 0.0
-        val_elems = 0.0
         with torch.no_grad():
-            for (V, T), _, meta in val_loader:
-                V = _permute_to_seq_first(V).to(device)
-                T = _permute_to_seq_first(T).to(device)
-                mask = meta["entity_mask"].to(device)
-                V = _apply_entity_mask(V, mask)
-                T = _apply_entity_mask(T, mask)
-                elems = _batch_elements(mask, V.size(1))
-                if elems == 0.0:
-                    continue
-
-                with autocast(enabled=amp):
-                    _, aux = model(V, ctx_diff=T)
-                    loss = model.recon_loss(aux, mask)
-
-                val_sum += loss.item() * elems
-                val_elems += elems
-
-        val_loss = val_sum / val_elems if val_elems > 0 else float("inf")
+            val_loss = _run_epoch(val_loader, model, device, amp=amp)
 
         elapsed = time.time() - epoch_start
         improved = val_loss < (best_val - min_delta)
@@ -202,42 +241,21 @@ def run(
             f"best {best_val:.6f} @ {best_epoch:03d} | patience {patience_ctr}/{patience} | {elapsed:.1f}s"
         )
 
-        # Final save for reference
         if patience_ctr >= patience:
             print(f"\nEarly stopping at epoch {epoch}: validation loss plateaued.")
             break
 
-    # Always save a final snapshot for reproducibility
     save_ckpt(ckpt_path.with_suffix(".final.pt"), model, {"best_val": best_val, "best_epoch": best_epoch})
 
-    # Reload the best checkpoint for downstream evaluation convenience
     if ckpt_path.exists():
         state = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(state["model"])
         best_val = state.get("stats", {}).get("val_loss", best_val)
 
     model.eval()
-    test_sum = 0.0
-    test_elems = 0.0
     with torch.no_grad():
-        for (V, T), _, meta in test_loader:
-            V = _permute_to_seq_first(V).to(device)
-            T = _permute_to_seq_first(T).to(device)
-            mask = meta["entity_mask"].to(device)
-            V = _apply_entity_mask(V, mask)
-            T = _apply_entity_mask(T, mask)
-            elems = _batch_elements(mask, V.size(1))
-            if elems == 0.0:
-                continue
+        test_loss = _run_epoch(test_loader, model, device, amp=amp)
 
-            with autocast(enabled=amp):
-                _, aux = model(V, ctx_diff=T)
-                loss = model.recon_loss(aux, mask)
-
-            test_sum += loss.item() * elems
-            test_elems += elems
-
-    test_loss = test_sum / test_elems if test_elems > 0 else float("nan")
     print(f"Best val loss: {best_val:.6f} | Test loss: {test_loss:.6f}")
 
     return {
@@ -247,11 +265,10 @@ def run(
         "sizes": sizes,
         "best_val": best_val,
         "test_loss": test_loss,
-        "checkpoint": ckpt_path,
-        "final_checkpoint": ckpt_path.with_suffix(".final.pt"),
+        "checkpoint": str(ckpt_path),
+        "final_checkpoint": str(ckpt_path.with_suffix(".final.pt")),
     }
 
 
-
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     run()
