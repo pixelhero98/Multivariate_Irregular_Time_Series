@@ -1,6 +1,7 @@
+from typing import List, Optional, Union
 import torch
 import torch.nn as nn
-from Model.laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
+from Model.laptrans import LaplacePseudoInverse, LaplaceTransformEncoder
 from Model.pos_time_emb import get_sinusoidal_pos_emb
 
 
