@@ -25,27 +25,28 @@ VAE_DIR = './ldt/vae/saved_model/' + MKT
 VAE_CKPT = VAE_DIR + f"/pred-{PRED}_ch-{VAE_LATENT_CHANNELS}_elbo.pt"
 # --- VAE Fine-Tuning (Optional, after diffusion training) ---
 # Set DECODER_FT_EPOCHS = 0 to disable this step.
-VAE_LEARNING_RATE = 2e-4
-VAE_WEIGHT_DECAY = 5e-4
+VAE_LEARNING_RATE = 1e-4
+VAE_WEIGHT_DECAY = 1e-4
 VAE_WARMUP_EPOCHS = 5
-VAE_BETA = 0.005
+VAE_BETA = 0.09
 VAE_MAX_PATIENCE = 6
 DECODER_FT_EPOCHS = 30
 DECODER_FT_LR = 2e-4
 # ======================= Summarizer (LaplaceAE) =======================
-SUM_DIR = "./ldt/SUMMARIZER_EFF/saved_model/" + MKT
+SUM_DIR = "./ldt/summarizer/saved_model/" + MKT
 SUM_LAPLACE_K = 512
 SUM_CONTEXT_LEN = PRED
 SUM_CONTEXT_DIM = 256
 SUM_TV_HIDDEN = 16
 SUM_DROPOUT = 0.0
-SUM_LR = 2e-4
+SUM_LR = 5e-4
 SUM_WEIGHT_DECAY = 1e-4
 SUM_EPOCHS = 200
 SUM_GRAD_CLIP = 1.0
 SUM_AMP = True
-SUM_PATIENCE = 25
+SUM_PATIENCE = 10
 SUM_MIN_DELTA = 1e-6
+SUM_GAMMA = 1.0
 SUM_CKPT = SUM_DIR + f"/{PRED}-{VAE_LATENT_CHANNELS}-summarizer.pt"
 # ============================ Diffusion Model (LLapDiT) ============================
 CKPT_DIR = "./ldt/checkpoints/" + MKT
@@ -60,14 +61,14 @@ PREDICT_TYPE  = "v"          # ["v", "eps"]
 # 'weighted_min_snr' is highly recommended. Set to 'none' to disable.
 LOSS_WEIGHT_SCHEME = 'weighted_min_snr'
 # The gamma parameter for min-SNR weighting. A value of 5.0 is a common starting point.
-MINSNR_GAMMA = 5.0
+MINSNR_GAMMA = 6.0
 
 # --- LLapDiT Architecture ---
 MODEL_WIDTH   = SUM_CONTEXT_DIM
-NUM_LAYERS    = 5
+NUM_LAYERS    = 8
 NUM_HEADS     = 4
 LAPLACE_K     = 256
-LAP_MODE     = 'parallel'   # 'parallel' or 'recurrent (support irregular sampling interval, with time-varying Lap basis updates)'
+LAP_MODE     = 'effective'   # 'parallel' or 'recurrent (support irregular sampling interval, with time-varying Lap basis updates)'
 CONTEXT_LEN   = SUM_CONTEXT_LEN
 # ============================ Training Hyperparameters ============================
 EPOCHS = 650
@@ -93,7 +94,7 @@ USE_EMA_EVAL = True
 EMA_DECAY    = 0.999
 
 # --- Generation Parameters ---
-GEN_STEPS = 64
+GEN_STEPS = 42
 NUM_EVAL_SAMPLES = 10
 GUIDANCE_STRENGTH = (1.0, 2.0)
 GUIDANCE_POWER = 1.0
