@@ -29,26 +29,27 @@ class TVHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-
         return self.net(x).squeeze(-1)
 
 
 class LaplaceAE(nn.Module):
 
     def __init__(
-        self,
-        num_entities: int,
-        feat_dim: int,
-        *,
-        lap_k: int = 8,
-        tv_hidden: int = 32,
-        out_len: int = 16,
-        context_dim: int = 256,
-        dropout: float = 0.0,
+            self,
+            num_entities: int,
+            feat_dim: int,
+            window_size: int,
+            *,
+            lap_k: int = 8,
+            tv_hidden: int = 32,
+            out_len: int = 16,
+            context_dim: int = 256,
+            dropout: float = 0.0,
     ):
         super().__init__()
         self.N = num_entities
         self.D = feat_dim
+        self.window_size = window_size
         self.K = lap_k
         self.Hc = context_dim
         self.S = out_len
@@ -60,14 +61,14 @@ class LaplaceAE(nn.Module):
         # 1-layer parallel Laplace encoders for V and T signals
         self.lap_v = LearnableLaplaceBasis(k=self.K, feat_dim=self.N, mode="parallel")
         self.lap_t = LearnableLaplaceBasis(k=self.K, feat_dim=self.N, mode="parallel")
-        
+
         # It learns to reconstruct the signals from the final context summary.
         self.aux_decoder = nn.Sequential(
             nn.Linear(self.Hc, self.Hc * 2),
             nn.GELU(),
-            nn.Linear(self.Hc * 2, self.K * self.N * 2) # Project to shape [K, N*2]
+            nn.Linear(self.Hc * 2, self.window_size * self.N * 2)  # Project to shape [K, N*2]
         )
-        
+
         # Matching 1-layer inverses
         self.inv_v = LearnablepesudoInverse(self.lap_v)
         self.inv_t = LearnablepesudoInverse(self.lap_t)
@@ -91,12 +92,12 @@ class LaplaceAE(nn.Module):
         return se.sum() / denom
 
     def forward(
-        self,
-        x: torch.Tensor,                    # [B,K,N,D]   (V series)
-        pad_mask: Optional[torch.Tensor] = None,  # unused (keep signature)
-        dt: Optional[torch.Tensor] = None,        #
-        ctx_diff: Optional[torch.Tensor] = None,  # [B,K,N,D] (T series)
-        entity_mask: Optional[torch.Tensor] = None,
+            self,
+            x: torch.Tensor,  # [B,K,N,D]   (V series)
+            pad_mask: Optional[torch.Tensor] = None,  # unused (keep signature)
+            dt: Optional[torch.Tensor] = None,  #
+            ctx_diff: Optional[torch.Tensor] = None,  # [B,K,N,D] (T series)
+            entity_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if entity_mask is None:
             raise ValueError("entity_mask must be provided: [B,N] bool")
@@ -112,7 +113,7 @@ class LaplaceAE(nn.Module):
             )
         if entity_mask.shape != (B, N):
             raise ValueError(
-                f"entity_mask must be of shape [B,N]={B,N}, got {tuple(entity_mask.shape)}"
+                f"entity_mask must be of shape [B,N]={B, N}, got {tuple(entity_mask.shape)}"
             )
         assert N == self.N and D == self.D, f"Got (N,D)=({N},{D}), expected ({self.N},{self.D})"
 
@@ -132,43 +133,43 @@ class LaplaceAE(nn.Module):
         t_hat = self.inv_t(t_lap) * mask  # [B,K,N]
 
         # ---- Lightweight context tokens (for downstream conditioning) ----
-        fused = torch.cat([v_lap, t_lap], dim=-1)          # [B,K,4K]
+        fused = torch.cat([v_lap, t_lap], dim=-1)  # [B,K,4K]
         # First compress back to 2K before projection (keeps param count modest)
         fused = fused.view(B, K, 2, 2 * self.K).sum(dim=2)  # [B,K,2K]
-        tokens = self.token_proj(fused)                     # [B,K,Hc]
+        tokens = self.token_proj(fused)  # [B,K,Hc]
         # Pool K→S with learned queries via simple attention scores
         # (no expensive MHA; just content-based pooling)
-        q = self.queries[None, :, :]                        # [1,S,Hc]
+        q = self.queries[None, :, :]  # [1,S,Hc]
         att = torch.einsum('bkh,bsh->bks', self.norm(tokens), self.norm(q)) / math.sqrt(self.Hc)
-        att = att.softmax(dim=1)                            # softmax over K
-        context = torch.einsum('bks,bkh->bsh', att, tokens) # [B,S,Hc]
-        context_pooled = context.mean(dim=1) # Shape: [B, Hc]
-        aux_recon = self.aux_decoder(context_pooled) # Shape: [B, K*N*2]
-        aux_recon = aux_recon.view(B, self.K, self.N * 2) # Reshape to [B, K, N*2]
-        
+        att = att.softmax(dim=1)  # softmax over K
+        context = torch.einsum('bks,bkh->bsh', att, tokens)  # [B,S,Hc]
+        context_pooled = context.mean(dim=1)  # Shape: [B, Hc]
+        aux_recon = self.aux_decoder(context_pooled)  # Shape: [B, K*N*2]
+        aux_recon = aux_recon.view(B, self.window_size, self.N * 2)  # Reshape to [B, K, N*2]
+
         # Split into auxiliary v_hat and t_hat
-        v_hat_aux, t_hat_aux = torch.chunk(aux_recon, 2, dim=-1) # Both [B, K, N]
-        
+        v_hat_aux, t_hat_aux = torch.chunk(aux_recon, 2, dim=-1)  # Both [B, K, N]
+
         # --- Modify the aux dictionary ---
         aux = {
             'v_sig': v_sig, 't_sig': t_sig,
             'v_hat': v_hat, 't_hat': t_hat,
-            'v_hat_aux': v_hat_aux, 't_hat_aux': t_hat_aux, # Add the new reconstructions
+            'v_hat_aux': v_hat_aux, 't_hat_aux': t_hat_aux,  # Add the new reconstructions
         }
         return context, aux
 
-    def recon_loss(self, aux: Dict[str, torch.Tensor], entity_mask: torch.Tensor, gamma: float = 0.5) -> torch.Tensor:
+    def recon_loss(self, aux: Dict[str, torch.Tensor], entity_mask: torch.Tensor, gamma: float = 1.0) -> torch.Tensor:
         """Convenience helper for training scripts."""
         # Primary loss (trains the Laplace encoder/pseudoinverse)
         lv = self._masked_mse(aux['v_hat'], aux['v_sig'], entity_mask)
         lt = self._masked_mse(aux['t_hat'], aux['t_sig'], entity_mask)
         primary_loss = lv + lt
-    
+
         # Auxiliary loss (trains the context branch)
         lv_aux = self._masked_mse(aux['v_hat_aux'], aux['v_sig'], entity_mask)
         lt_aux = self._masked_mse(aux['t_hat_aux'], aux['t_sig'], entity_mask)
         auxiliary_loss = lv_aux + lt_aux
-    
+
         # Combine the losses
         total_loss = primary_loss + gamma * auxiliary_loss
         return total_loss
