@@ -14,8 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from Model.laptrans import LearnableLaplaceBasis, LearnablepesudoInverse  # note: class name spelled as in repo
-
+from Model.laptrans import LaplaceTransformEncoder, LaplacePseudoInverse 
 
 class TVHead(nn.Module):
     """Single-hidden-layer MLP that projects features to scalar signals."""
@@ -63,8 +62,8 @@ class LaplaceAE(nn.Module):
         self.t_head = TVHead(self.D, tv_hidden)
 
         # 1-layer parallel Laplace encoders for V and T signals
-        self.lap_v = LearnableLaplaceBasis(k=self.K, feat_dim=self.N, mode="parallel")
-        self.lap_t = LearnableLaplaceBasis(k=self.K, feat_dim=self.N, mode="parallel")
+        self.lap_v = LaplaceTransformEncoder(k=self.K, feat_dim=self.N, mode="parallel")
+        self.lap_t = LaplaceTransformEncoder(k=self.K, feat_dim=self.N, mode="parallel")
 
         # It learns to reconstruct the signals from the final context summary.
         self.aux_decoder = nn.Sequential(
@@ -74,8 +73,8 @@ class LaplaceAE(nn.Module):
         )
 
         # Matching 1-layer inverses
-        self.inv_v = LearnablepesudoInverse(self.lap_v)
-        self.inv_t = LearnablepesudoInverse(self.lap_t)
+        self.inv_v = LaplacePseudoInverse (self.lap_v)
+        self.inv_t = LaplacePseudoInverse (self.lap_t)
 
         # Simple token projection from concatenated Laplace features
         self.token_proj = nn.Sequential(
