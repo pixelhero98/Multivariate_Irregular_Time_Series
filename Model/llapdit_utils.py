@@ -267,10 +267,11 @@ class NoiseScheduler(nn.Module):
 
 
 # ============================ Laplace pole logging ============================
-def iter_laplace_bases(module):
-    from Model.laptrans import LearnableLaplaceBasis
+def iter_laplace_bases(module: nn.Module):
+    from Model.laptrans import LaplaceTransformEncoder
+
     for m in module.modules():
-        if isinstance(m, LearnableLaplaceBasis):
+        if isinstance(m, LaplaceTransformEncoder):
             yield m
 
 
