@@ -30,18 +30,18 @@ VAE_WEIGHT_DECAY = 5e-4
 VAE_WARMUP_EPOCHS = 5
 VAE_BETA = 0.005
 VAE_MAX_PATIENCE = 6
-DECODER_FT_EPOCHS = 25
+DECODER_FT_EPOCHS = 30
 DECODER_FT_LR = 2e-4
 # ======================= Summarizer (LaplaceAE) =======================
 SUM_DIR = "./ldt/SUMMARIZER_EFF/saved_model/" + MKT
-SUM_LAPLACE_K = 256
-SUM_CONTEXT_LEN = 32
+SUM_LAPLACE_K = 512
+SUM_CONTEXT_LEN = PRED
 SUM_CONTEXT_DIM = 256
-SUM_TV_HIDDEN = 32
+SUM_TV_HIDDEN = 16
 SUM_DROPOUT = 0.0
 SUM_LR = 2e-4
 SUM_WEIGHT_DECAY = 1e-4
-SUM_EPOCHS = 150
+SUM_EPOCHS = 200
 SUM_GRAD_CLIP = 1.0
 SUM_AMP = True
 SUM_PATIENCE = 25
@@ -51,7 +51,7 @@ SUM_CKPT = SUM_DIR + f"/{PRED}-{VAE_LATENT_CHANNELS}-summarizer.pt"
 CKPT_DIR = "./ldt/checkpoints/" + MKT
 
 # --- Diffusion Process ---
-TIMESTEPS     = 1500
+TIMESTEPS     = 1000
 # Recommended to try "cosine", as it pairs well with v-prediction.
 SCHEDULE      = "cosine"     # ["cosine", "linear"]
 PREDICT_TYPE  = "v"          # ["v", "eps"]
@@ -66,33 +66,26 @@ MINSNR_GAMMA = 5.0
 MODEL_WIDTH   = SUM_CONTEXT_DIM
 NUM_LAYERS    = 5
 NUM_HEADS     = 4
-LAPLACE_K     = 128
-GLOBAL_K      = SUM_LAPLACE_K
-LAP_MODE_main      = 'recurrent'   # 'parallel' or 'recurrent (support irregular sampling interval, with time-varying Lap basis updates)'
-LAP_MODE_cond      = 'parallel'
-zero_first_step = False
-add_guidance_tokens = True
+LAPLACE_K     = 256
+LAP_MODE     = 'parallel'   # 'parallel' or 'recurrent (support irregular sampling interval, with time-varying Lap basis updates)'
 CONTEXT_LEN   = SUM_CONTEXT_LEN
 # ============================ Training Hyperparameters ============================
-EPOCHS = 500
-BASE_LR = 5e-4
-MIN_LR = 0.5e-5
-WARMUP_FRAC = 0.08
+EPOCHS = 650
+BASE_LR = 6e-4
+MIN_LR = 5e-6
+WARMUP_FRAC = 0.09
 WEIGHT_DECAY = 1e-4
 GRAD_CLIP = 1.0
 EARLY_STOP = 100
 DROPOUT       = 0.0
 ATTN_DROPOUT  = 0.0
-DROP_COND_P   = 0.2
-FREEZE_SUMMARIZER_ON_PLATEAU = True
-COND_GAP_PATIENCE = 20
-COND_GAP_TOL = 1e-4
+DROP_COND_P   = 0.19
 # --- Self-Conditioning ---
 SELF_COND     = False
 SELF_COND_P   = 0.5
 # Recommended to lower this to see benefits earlier in training.
-SELF_COND_START_EPOCH = 210
-TRAINED_LLapDiT = ""
+SELF_COND_START_EPOCH = 450
+TRAINED_LLapDiT = "" #"./ldt/checkpoints/CRYPTO_130/"
 downstream = False
 # ============================ Evaluation & Sampling ============================
 # Use Exponential Moving Average of model weights for evaluation.
@@ -100,10 +93,10 @@ USE_EMA_EVAL = True
 EMA_DECAY    = 0.999
 
 # --- Generation Parameters ---
-GEN_STEPS = 36
+GEN_STEPS = 64
 NUM_EVAL_SAMPLES = 10
-GUIDANCE_STRENGTH = (1.5, 3.0)
+GUIDANCE_STRENGTH = (1.0, 2.0)
 GUIDANCE_POWER = 1.0
-DECODER_FT_ANCHOR = 0.08 # 0.1
+DECODER_FT_ANCHOR = 0.1 # 0.1
 
 OUT_DIR = "./ldt/output"
