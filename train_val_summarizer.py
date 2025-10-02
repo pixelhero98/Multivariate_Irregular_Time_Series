@@ -42,6 +42,19 @@ def _permute_to_seq_first(x: torch.Tensor) -> torch.Tensor:
     return x.permute(0, 2, 1, 3).contiguous()
 
 
+def _apply_entity_mask(series: torch.Tensor, mask_bn: torch.Tensor) -> torch.Tensor:
+    """Broadcast ``mask_bn`` over ``series`` assuming layout ``[B, K, N, ...]``."""
+
+    if mask_bn.dtype != torch.bool:
+        raise TypeError(f"entity_mask must be bool, got {mask_bn.dtype}")
+    if mask_bn.shape[0] != series.shape[0] or mask_bn.shape[1] != series.shape[2]:
+        raise ValueError(
+            f"Mask shape {tuple(mask_bn.shape)} incompatible with series shape {tuple(series.shape)}"
+        )
+    mask = mask_bn[:, None, :, None].to(device=series.device, dtype=series.dtype)
+    return series * mask
+
+
 def run() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -113,13 +126,15 @@ def run() -> None:
             V = _permute_to_seq_first(V).to(device)
             T = _permute_to_seq_first(T).to(device)
             mask = meta["entity_mask"].to(device)
+            V = _apply_entity_mask(V, mask)
+            T = _apply_entity_mask(T, mask)
             elems = _batch_elements(mask, V.size(1))
             if elems == 0.0:  # no valid entities
                 continue
 
             optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=amp):
-                _, aux = model(V, ctx_diff=T, entity_mask=mask)
+                _, aux = model(V, ctx_diff=T)
                 loss = model.recon_loss(aux, mask)
             scaler.scale(loss).backward()
             if grad_clip and grad_clip > 0:
@@ -142,12 +157,14 @@ def run() -> None:
                 V = _permute_to_seq_first(V).to(device)
                 T = _permute_to_seq_first(T).to(device)
                 mask = meta["entity_mask"].to(device)
+                V = _apply_entity_mask(V, mask)
+                T = _apply_entity_mask(T, mask)
                 elems = _batch_elements(mask, V.size(1))
                 if elems == 0.0:
                     continue
 
                 with autocast(enabled=amp):
-                    _, aux = model(V, ctx_diff=T, entity_mask=mask)
+                    _, aux = model(V, ctx_diff=T)
                     loss = model.recon_loss(aux, mask)
 
                 val_sum += loss.item() * elems
@@ -192,12 +209,14 @@ def run() -> None:
             V = _permute_to_seq_first(V).to(device)
             T = _permute_to_seq_first(T).to(device)
             mask = meta["entity_mask"].to(device)
+            V = _apply_entity_mask(V, mask)
+            T = _apply_entity_mask(T, mask)
             elems = _batch_elements(mask, V.size(1))
             if elems == 0.0:
                 continue
 
             with autocast(enabled=amp):
-                _, aux = model(V, ctx_diff=T, entity_mask=mask)
+                _, aux = model(V, ctx_diff=T)
                 loss = model.recon_loss(aux, mask)
 
             test_sum += loss.item() * elems
