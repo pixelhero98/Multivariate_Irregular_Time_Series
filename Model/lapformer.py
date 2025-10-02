@@ -1,5 +1,8 @@
+from typing import List, Optional, Union
+
 import torch
 import torch.nn as nn
+
 from Model.laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
 from Model.pos_time_emb import get_sinusoidal_pos_emb
 
@@ -14,6 +17,7 @@ def _canon_mode(mode: str) -> str:
 
 class AdaLayerNorm(nn.Module):
     """LayerNorm with feature-wise affine parameters conditioned on input."""
+
     def __init__(self, normalized_shape: int, cond_dim: int):
         super().__init__()
         self.norm = nn.LayerNorm(normalized_shape, elementwise_affine=False)
@@ -24,10 +28,20 @@ class AdaLayerNorm(nn.Module):
         nn.init.zeros_(self.to_ss[-1].weight)
         nn.init.zeros_(self.to_ss[-1].bias)
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-        """Apply normalisation followed by conditioned scale and bias."""
+    def forward(self, x: torch.Tensor, c: Optional[torch.Tensor]) -> torch.Tensor:
+        """Apply normalisation followed by conditioned scale and bias.
+
+        If ``c`` is ``None`` the block falls back to standard layer normalisation
+        with unit scale and zero bias, which is convenient when conditioning is
+        temporarily unavailable (e.g. unconditional guidance passes).
+        """
+
         h = self.norm(x)
-        scale, bias = self.to_ss(c).chunk(2, dim=-1)
+        if c is None:
+            scale = torch.zeros(h.size(0), h.size(-1), device=h.device, dtype=h.dtype)
+            bias = torch.zeros_like(scale)
+        else:
+            scale, bias = self.to_ss(c).chunk(2, dim=-1)
         return (1 + scale).unsqueeze(1) * h + bias.unsqueeze(1)
 
 
@@ -192,7 +206,20 @@ class LaplaceSandwichBlock(nn.Module):
         sc_add_H: Optional[torch.Tensor] = None,
         dt: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Process temporal tokens through Laplace and attention stacks."""
+        """Process temporal tokens through Laplace and attention stacks.
+
+        Args:
+            x_time: Input sequence ``[B, T, D]`` in the data space.
+            pos_emb: Positional encodings aligned with ``x_time``.
+            t_vec: Conditioning vector ``[B, H]`` (typically a time embedding).
+            attn_bias: Optional pre-computed attention bias for the self-attn block.
+            summary_kv_H: Optional context tokens ``[B, S, H]`` for cross-attention.
+            sc_add_H: Optional additive self-conditioning feature in the hidden space.
+            dt: Optional inter-sample spacing for the "exact" Laplace backbone.
+
+        Returns:
+            Updated time-domain representation with the same shape as ``x_time``.
+        """
 
         # Laplace analysis (the exact variant incorporates variable step sizes).
         if self.mode == "exact":
@@ -314,7 +341,18 @@ class LapFormer(nn.Module):
         sc_feat: Optional[torch.Tensor] = None,
         dt: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Execute the full LapFormer stack on an input sequence."""
+        """Execute the full LapFormer stack on an input sequence.
+
+        Args:
+            x_tokens: Input tokens ``[B, T, D]`` (typically noisy samples).
+            t_vec: Global conditioning vector ``[B, H]`` (e.g. time embedding).
+            cond_summary: Optional context tokens ``[B, S, H]`` from a summariser.
+            sc_feat: Optional self-conditioning tensor in the data space.
+            dt: Optional per-step spacing for the "exact" Laplace backbone.
+
+        Returns:
+            Processed tokens with the same shape as ``x_tokens``.
+        """
 
         batch, seq_len, _ = x_tokens.shape
         device = x_tokens.device
