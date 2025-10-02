@@ -86,6 +86,7 @@ def run() -> None:
     model = LaplaceAE(
         num_entities=N0,
         feat_dim=F0,
+        window_size=crypto_config.WINDOW,
         lap_k=lap_k,
         tv_hidden=tv_hidden,
         out_len=out_len,
