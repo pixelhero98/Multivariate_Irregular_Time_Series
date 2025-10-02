@@ -234,8 +234,8 @@ def run(
             f"Val β·ELBO {val_elbo_beta:.6f} [Recon {val_recon:.6f}, KL/sample {val_kl:.6f}]"
         )
 
-        improved_elbo = val_elbo_beta < 0.95 * best_val_elbo
-        improved_recon = val_recon < 0.95 * best_val_recon
+        improved_elbo = val_elbo_beta < 0.99 * best_val_elbo
+        improved_recon = val_recon < 0.99 * best_val_recon
 
         if improved_elbo:
             best_val_elbo = val_elbo_beta
