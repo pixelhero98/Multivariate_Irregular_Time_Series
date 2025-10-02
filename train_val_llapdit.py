@@ -56,6 +56,7 @@ else:
 laplace_summarizer = LaplaceAE(
     num_entities=N0,
     feat_dim=Fv,
+    window_size=crypto_config.WINDOW,
     lap_k=sum_lap_k,
     tv_hidden=sum_tv_hidden,
     out_len=sum_ctx_len,
@@ -73,11 +74,6 @@ else:
 laplace_summarizer.eval()
 for p in laplace_summarizer.parameters():
     p.requires_grad = False
-
-if crypto_config.MODEL_WIDTH != sum_ctx_dim:
-    raise ValueError(
-        f"crypto_config.MODEL_WIDTH ({crypto_config.MODEL_WIDTH}) must match SUM_CONTEXT_DIM ({sum_ctx_dim})"
-    )
 
 # ---- Estimate global latent stats (uses same window-normalization) ----
 vae = LatentVAE(
@@ -108,7 +104,7 @@ diff_model = LLapDiT(
     timesteps=crypto_config.TIMESTEPS, schedule=crypto_config.SCHEDULE,
     dropout=crypto_config.DROPOUT, attn_dropout=crypto_config.ATTN_DROPOUT,
     self_conditioning=crypto_config.SELF_COND,
-    lap_mode_main=crypto_config.LAP_MODE_main
+    lap_mode_main=crypto_config.LAP_MODE
 ).to(device)
 
 # ---- Calculate the variance of the v-prediction target ----
@@ -219,7 +215,7 @@ def train_one_epoch(epoch: int):
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
 
-        if getattr(crypto_config, "GRAD_CLIP", 0.0) and crypto_config.GRAD_CLIP > 0:
+        if crypto_config.GRAD_CLIP and crypto_config.GRAD_CLIP > 0:
             nn.utils.clip_grad_norm_(diff_model.parameters(), crypto_config.GRAD_CLIP)
         scaler.step(optimizer)
         scaler.update()
@@ -321,10 +317,7 @@ if skip_with_trained_model and os.path.exists(skip_with_trained_model) and crypt
 else:
     # --- TRAINING LOOP ---
     if skip_with_trained_model:
-        lr_sched = make_warmup_cosine(optimizer, crypto_config.EPOCHS * max(1, len(train_dl)),
-                                      warmup_frac=crypto_config.FT_WARMUP_FRAC,
-                                      base_lr=crypto_config.FT_BASE_LR,
-                                      min_lr=crypto_config.FT_MIN_LR)
+
         ckpt = torch.load(skip_with_trained_model, map_location=device)
 
         # Load model weights
@@ -384,7 +377,8 @@ else:
 
             ckpt_path = os.path.join(
                 crypto_config.CKPT_DIR,
-                f"mode-{crypto_config.LAP_MODE_main}-pred-{crypto_config.PRED}_ch-{crypto_config.VAE_LATENT_CHANNELS}_val_{val_loss:.6f}_cond_{cond_gap * Z:.6f}_ratio_{ratio_str}.pt"
+                f"mode-{crypto_config.LAP_MODE}-pred-{crypto_config.PRED}"
+                f"-val-{val_loss:.6f}-cond-{cond_gap * Z:.6f}-ratio-{ratio_str}.pt"
             )
             save_payload = {
                 "epoch": epoch,
@@ -400,7 +394,6 @@ else:
                 save_payload["ema_state"] = ema.state_dict()
                 save_payload["ema_decay"] = crypto_config.EMA_DECAY
             torch.save(save_payload, ckpt_path)
-            # print("Saved:", ckpt_path)
             current_best_path = ckpt_path
         else:
             patience += 1
@@ -420,7 +413,6 @@ def finetune_vae_decoder(
         *,
         mu_mean,
         mu_std,
-        config,
         ema=None,
         epochs: int = 3,
         lr: float = 1e-4,
@@ -669,7 +661,6 @@ if True:
         finetune_vae_decoder(
             vae, diff_model, train_dl, val_dl, device,
             mu_mean=mu_mean, mu_std=mu_std,
-            config=crypto_config,  # Pass config object
             ema=ema,
             epochs=crypto_config.DECODER_FT_EPOCHS,
             lr=crypto_config.DECODER_FT_LR,  # CRITICAL BUG FIX
