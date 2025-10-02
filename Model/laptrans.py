@@ -6,21 +6,25 @@ import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 
 """
-This module implements a learnable Laplace transform encoder and a corresponding
-decoder, based on the theory of dt-marginalization.
+This module implements a learnable Laplace transform encoder and a matching
+decoder based on dt-marginalisation.
 
-- LearnableLaplaceTrans: Can operate in two modes:
-    1. 'effective': A fast, parallel, dt-agnostic path that projects onto a
-       basis of damped exponentials defined by "effective" poles. These poles
-       have statistically absorbed the effect of irregular time gaps.
-    2. 'exact': A slower, recurrent path that computes the exact Zero-Order-Hold
-       (ZOH) solution for each specific time gap, making it dt-sensitive.
+- :class:`LaplaceTransformEncoder`:
+    1. ``"effective"`` – a dt-agnostic, parallel encoder that projects onto a
+       basis of damped exponentials whose poles have absorbed statistics of the
+       sampling gaps.
+    2. ``"exact"`` – a dt-sensitive, sequential encoder that integrates the
+       Zero-Order-Hold (ZOH) solution for each provided time step.
 
-- PseudoInverse: A complex-aware linear head that maps the Laplace features
-  from the encoder back to the original feature space.
+- :class:`LaplacePseudoInverse`: A complex-aware linear head (optionally
+  augmented by an MLP) that maps the Laplace-domain representation back to the
+  original feature space.
 """
 
-class LearnableLaplaceTrans(nn.Module):
+__all__ = ["LaplaceTransformEncoder", "LaplacePseudoInverse"]
+
+
+class LaplaceTransformEncoder(nn.Module):
     """
     Learnable Laplace transform basis producing 2*k channels (cos & sin).
 
@@ -98,102 +102,146 @@ class LearnableLaplaceTrans(nn.Module):
         x: torch.Tensor,
         dt: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert x.dim() == 3 and x.size(-1) == self.feat_dim, f"x must be [B, T, {self.feat_dim}]"
+        """Encodes an input sequence into Laplace-domain features.
+
+        Args:
+            x: Input tensor of shape ``[B, T, D]`` where ``D`` equals
+                ``feat_dim``.
+            dt: Optional tensor describing the timestep between successive
+                samples. Supported shapes are ``[B, T]``, ``[B, T, 1]``,
+                ``[T]`` or ``[T, 1]``. When ``None`` a uniform grid is assumed.
+
+        Returns:
+            Tensor of shape ``[B, T, 2k]`` containing stacked cosine and sine
+            responses for each pole.
+        """
+
+        if x.dim() != 3 or x.size(-1) != self.feat_dim:
+            raise ValueError(f"x must be of shape [B, T, {self.feat_dim}]")
+
         B, T, _ = x.shape
         k = self.k
 
-        # --------------------------------------------------------------------
-        # --- 'effective' mode: dt-agnostic parallel projection (Fast Path) ---
-        # --------------------------------------------------------------------
         if self.mode == "effective":
-            # This path models the system using effective poles that have
-            # absorbed the statistics of the time gaps (dt-marginalization).
-            # It is dt-agnostic at runtime and computes in parallel.
-            alpha = self.s_real.to(x.dtype)
-            omega = self.s_imag.clamp(-self.omega_max, self.omega_max).to(x.dtype)
-            s = torch.complex(-alpha, omega)  # Pole: s = -α + iω
+            return self._forward_effective(x, T)
 
-            # Create the exponential basis functions: exp(s*t)
-            t_idx = torch.arange(T, device=x.device, dtype=x.dtype).unsqueeze(1)
-            expo_basis = torch.exp(t_idx * s.unsqueeze(0)) # [T, k]
-            re_basis, im_basis = expo_basis.real, expo_basis.imag
+        return self._forward_exact(x, dt, B, T, k)
 
-            # Project input onto the basis.
-            proj_feats = self.proj(x)  # [B, T, k]
-            
-            # Real part is projection on cosine, Imaginary part on sine.
-            C = proj_feats * re_basis.unsqueeze(0)
-            S = proj_feats * im_basis.unsqueeze(0)
-            return torch.cat([C, S], dim=2).contiguous()
+    # ------------------------------------------------------------------
+    # --- helper paths -------------------------------------------------
+    # ------------------------------------------------------------------
+    def _forward_effective(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Parallel, dt-agnostic projection using effective poles."""
 
-        # ------------------------------------------------------------------
-        # --- 'exact' mode: dt-sensitive recurrent update (Precise Path) ---
-        # ------------------------------------------------------------------
-        # This path computes the exact Zero-Order Hold (ZOH) solution for
-        # each irregular time step dt. It is computationally
-        # more expensive due to its sequential nature.
+        alpha = self.s_real.to(x.dtype)
+        omega = self.s_imag.clamp(-self.omega_max, self.omega_max).to(x.dtype)
+        s = torch.complex(-alpha, omega)  # Pole: s = -α + iω
+
+        proj_feats = self.proj(x)  # [B, T, k]
+
+        time_index = torch.arange(seq_len, device=x.device, dtype=x.dtype).unsqueeze(1)
+        basis = torch.exp(time_index * s.unsqueeze(0))  # [T, k]
+        cos_basis, sin_basis = basis.real, basis.imag
+
+        cosine_response = proj_feats * cos_basis.unsqueeze(0)
+        sine_response = proj_feats * sin_basis.unsqueeze(0)
+        return torch.cat([cosine_response, sine_response], dim=2).contiguous()
+
+    def _forward_exact(
+        self,
+        x: torch.Tensor,
+        dt: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        num_poles: int,
+    ) -> torch.Tensor:
+        """Sequential, dt-sensitive Zero-Order Hold rollout."""
+
+        dtype = x.dtype
+
         tau = F.softplus(self._tau) + 1e-3
-        alpha = (self.s_real * tau).to(x.dtype)
-        omega = (self.s_imag * tau).clamp(-self.omega_max, self.omega_max).to(x.dtype)
+        alpha = (self.s_real * tau).to(dtype)
+        omega = (self.s_imag * tau).clamp(-self.omega_max, self.omega_max).to(dtype)
 
-        # Prepare dt to be [B, T, 1] for broadcasting.
+        dt = self._prepare_dt(dt, batch_size, seq_len, dtype, x.device)
+
+        drive = self.proj(x)  # [B, T, k]
+
+        alpha = alpha.view(1, 1, num_poles)
+        omega = omega.view(1, 1, num_poles)
+
+        rho = torch.exp(-alpha * dt)
+        theta = omega * dt
+        cos_theta, sin_theta = torch.cos(theta), torch.sin(theta)
+
+        denom = (alpha.square() + omega.square()).clamp_min(1e-6)
+
+        psi_cos = (-omega + rho * (alpha * sin_theta + omega * cos_theta)) / denom
+        psi_sin = (alpha - rho * (alpha * cos_theta - omega * sin_theta)) / denom
+
+        gain = F.softplus(self.b_param).to(dtype) + 1e-8
+        drive = drive * gain
+
+        cos_hist, sin_hist = [], []
+        cos_state = torch.zeros(batch_size, num_poles, device=x.device, dtype=dtype)
+        sin_state = torch.zeros(batch_size, num_poles, device=x.device, dtype=dtype)
+
+        for t in range(seq_len):
+            cos_new = rho[:, t] * (cos_state * cos_theta[:, t] - sin_state * sin_theta[:, t])
+            sin_new = rho[:, t] * (cos_state * sin_theta[:, t] + sin_state * cos_theta[:, t])
+
+            cos_state = cos_new + psi_cos[:, t] * drive[:, t]
+            sin_state = sin_new + psi_sin[:, t] * drive[:, t]
+
+            cos_hist.append(cos_state)
+            sin_hist.append(sin_state)
+
+        cosine_response = torch.stack(cos_hist, dim=1)
+        sine_response = torch.stack(sin_hist, dim=1)
+        return torch.cat([cosine_response, sine_response], dim=2).contiguous()
+
+    def _prepare_dt(
+        self,
+        dt: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Normalises dt tensors to the broadcastable ``[B, T, 1]`` shape."""
+
         if dt is None:
-            dt_val = 1.0 / max(T - 1, 1)
-            dt = x.new_full((B, T, 1), dt_val)
+            default_dt = 1.0 / max(seq_len - 1, 1)
+            return torch.full((batch_size, seq_len, 1), default_dt, dtype=dtype, device=device)
+
+        dt = dt.to(dtype=dtype, device=device)
+
+        if dt.dim() == 1:
+            dt = dt.view(1, seq_len, 1)
+        elif dt.dim() == 2:
+            dt = dt.view(dt.size(0), seq_len, 1)
+        elif dt.dim() == 3:
+            if dt.size(-1) != 1:
+                raise ValueError("dt tensors must have last dimension equal to 1")
+            dt = dt.view(dt.size(0), seq_len, 1)
         else:
-            dt = dt.to(x.dtype).view(dt.shape[0] if dt.dim() > 1 else 1, T, 1)
-            if dt.shape[0] == 1: dt = dt.expand(B, -1, -1)
-        
-        # Per-timestep drive signal.
-        u = self.proj(x)  # [B, T, k]
+            raise ValueError("dt must have 1, 2 or 3 dimensions")
 
-        # Step-wise decay (rho) and rotation (theta) based on exact dt.
-        rho = torch.exp(-alpha.view(1, 1, k) * dt)
-        theta = omega.view(1, 1, k) * dt
-        cos_t, sin_t = torch.cos(theta), torch.sin(theta)
+        if dt.size(0) == 1 and batch_size > 1:
+            dt = dt.expand(batch_size, -1, -1)
+        elif dt.size(0) != batch_size:
+            raise ValueError("dt batch dimension must either be 1 or match x")
 
-        # Calculate the exact ZOH input map coefficients (Psi).
-        alpha_sq = alpha**2
-        omega_sq = omega**2
-        den = (alpha_sq + omega_sq).clamp_min(1e-6).view(1, 1, k)
-        
-        # This corresponds to integrating exp(A*t)*B from 0 to dt.
-        psi_c = (-omega + rho * (alpha * sin_t + omega * cos_t)) / den
-        psi_s = ( alpha - rho * (alpha * cos_t - omega * sin_t)) / den
+        return dt
 
-        # Apply nonnegative input gain.
-        b = F.softplus(self.b_param).to(x.dtype) + 1e-8
-        u_eff = u * b
 
-        # Sequential rollout.
-        c_hist, s_hist = [], []
-        c = torch.zeros(B, k, device=x.device, dtype=x.dtype)
-        s = torch.zeros(B, k, device=x.device, dtype=x.dtype)
-        
-        for t in range(T):
-            # Homogeneous part: state evolution without input.
-            c_new = rho[:, t] * (c * cos_t[:, t] - s * sin_t[:, t])
-            s_new = rho[:, t] * (c * sin_t[:, t] + s * cos_t[:, t])
-            # Input part: add the effect of the input over the interval.
-            c = c_new + psi_c[:, t] * u_eff[:, t]
-            s = s_new + psi_s[:, t] * u_eff[:, t]
-            c_hist.append(c)
-            s_hist.append(s)
-
-        C = torch.stack(c_hist, dim=1)
-        S = torch.stack(s_hist, dim=1)
-        return torch.cat([C, S], dim=2).contiguous()
-
-# =====================================
-# PseudoInverser (NOT a strict inverse)
-# =====================================
-class PseudoInverse(nn.Module):
+class LaplacePseudoInverse(nn.Module):
     """
     Decoder that maps Laplace features back to the original feature space.
-    This acts as a pseudo-inverse to the LearnableLaplaceTrans.
+    This acts as a pseudo-inverse to the :class:`LaplaceTransformEncoder`.
 
     Args:
-        encoder:          The paired LearnableLaplaceTrans instance.
+        encoder:          The paired :class:`LaplaceTransformEncoder` instance.
         hidden_dim:       Width of the optional residual MLP.
         num_layers:       Depth of the optional residual MLP.
         use_mlp_residual: If True, adds an MLP on top of the linear head.
@@ -201,7 +249,7 @@ class PseudoInverse(nn.Module):
 
     def __init__(
         self,
-        encoder: LearnableLaplaceTrans,
+        encoder: LaplaceTransformEncoder,
         hidden_dim: Optional[int] = None,
         num_layers: int = 2,
         use_mlp_residual: bool = True,
@@ -240,12 +288,18 @@ class PseudoInverse(nn.Module):
             nn.init.kaiming_uniform_(self.head_s.weight, a=math.sqrt(5))
 
     def forward(self, lap_feats: torch.Tensor) -> torch.Tensor:
-        """
+        """Decodes Laplace-domain features back to the data space.
+
         Args:
-            lap_feats: [B, T, 2k] tensor from the LaplaceEncoder.
+            lap_feats: ``[B, T, 2k]`` tensor produced by the encoder.
+
         Returns:
-            y: [B, T, D] tensor in the original feature space.
+            ``[B, T, D]`` tensor in the original feature space.
         """
+
+        if lap_feats.dim() != 3 or lap_feats.size(-1) != 2 * self.encoder.k:
+            raise ValueError("lap_feats must be of shape [B, T, 2k]")
+
         k = self.encoder.k
         C, S = lap_feats.chunk(2, dim=-1)  # Split into cos/sin channels
 
