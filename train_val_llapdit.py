@@ -184,8 +184,8 @@ def run(
             for xb, yb, meta in train_dl:
                 V, T = xb
                 mask_bn = meta["entity_mask"]
-    
-                cond_summary = build_context(summarizer, V, T, mask_bn, device)
+
+                cond_summary = build_context(laplace_summarizer, V, T, mask_bn, device)
                 y_in, batch_ids = flatten_targets(yb, mask_bn, device)
                 if y_in is None:
                     continue
@@ -279,7 +279,7 @@ def run(
             V, T = xb
             mask_bn = meta["entity_mask"]
     
-            cond_summary = build_context(summarizer, V, T, mask_bn, device)
+            cond_summary = build_context(laplace_summarizer, V, T, mask_bn, device)
             y_in, batch_ids = flatten_targets(yb, mask_bn, device)
             if y_in is None:
                 continue
