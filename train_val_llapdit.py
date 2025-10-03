@@ -1,7 +1,10 @@
 import os, torch, math
-import crypto_config
 from pathlib import Path
+from typing import Dict, Optional, Sequence, Tuple
+
+import crypto_config
 from torch import nn
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from torch.cuda.amp import GradScaler, autocast
 from Dataset.data_gen import run_experiment
@@ -15,398 +18,462 @@ from Model.llapdit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_ma
                                  sample_t_uniform, decode_latents_with_vae
                                  )
 
-# ============================ Training setup ============================
-# Baseline variance for validation comparisons (populated after initial computation)
-BASELINE_V_VARIANCE = None
-device = set_torch()
-
-train_dl, val_dl, test_dl, sizes = run_experiment(
-    data_dir=crypto_config.DATA_DIR,
-    date_batching=crypto_config.date_batching,
-    dates_per_batch=crypto_config.BATCH_SIZE,
-    K=crypto_config.WINDOW,
-    H=crypto_config.PRED,
-    coverage=crypto_config.COVERAGE
-)
-print("sizes:", sizes)
-
-# infer dims from one batch
-xb0, yb0, meta0 = next(iter(train_dl))
-V0, T0 = xb0
-B0, N0, K0, Fv = V0.shape
-Ft = T0.shape[-1]
-H = yb0.shape[-1]
-assert Fv == Ft, f"Expected Fv == Ft, got {Fv} vs {Ft}"
-print("V:", V0.shape, "T:", T0.shape, "y:", yb0.shape)
-
-# ---- Load pretrained Laplace summarizer (shared with standalone training) ----
-sum_lap_k = crypto_config.SUM_LAPLACE_K
-sum_ctx_len = crypto_config.SUM_CONTEXT_LEN
-sum_ctx_dim = crypto_config.SUM_CONTEXT_DIM
-sum_tv_hidden = crypto_config.SUM_TV_HIDDEN
-sum_dropout = crypto_config.SUM_DROPOUT
-
-summarizer_ckpt = crypto_config.SUM_CKPT
-if summarizer_ckpt is None:
-    summarizer_dir = crypto_config.SUM_DIR
-    summarizer_ckpt = Path(summarizer_dir) / f"{crypto_config.PRED}-{crypto_config.VAE_LATENT_CHANNELS}-summarizer.pt"
-else:
-    summarizer_ckpt = Path(summarizer_ckpt)
-
-laplace_summarizer = LaplaceAE(
-    num_entities=N0,
-    feat_dim=Fv,
-    window_size=crypto_config.WINDOW,
-    lap_k=sum_lap_k,
-    tv_hidden=sum_tv_hidden,
-    out_len=sum_ctx_len,
-    context_dim=sum_ctx_dim,
-    dropout=sum_dropout,
-).to(device)
-
-if summarizer_ckpt.exists():
-    state = torch.load(summarizer_ckpt, map_location="cpu")
-    laplace_summarizer.load_state_dict(state.get("model", state))
-    print(f"Loaded summarizer checkpoint: {summarizer_ckpt}")
-else:
-    print(f"[warn] Summarizer checkpoint not found at {summarizer_ckpt}; using randomly initialised weights.")
-
-laplace_summarizer.eval()
-for p in laplace_summarizer.parameters():
-    p.requires_grad = False
-
-# ---- Estimate global latent stats (uses same window-normalization) ----
-vae = LatentVAE(
-    seq_len=crypto_config.PRED,
-    latent_dim=crypto_config.VAE_LATENT_DIM,
-    latent_channel=crypto_config.VAE_LATENT_CHANNELS,
-    enc_layers=crypto_config.VAE_LAYERS, enc_heads=crypto_config.VAE_HEADS, enc_ff=crypto_config.VAE_FF,
-    dec_layers=crypto_config.VAE_LAYERS, dec_heads=crypto_config.VAE_HEADS, dec_ff=crypto_config.VAE_FF
-).to(device)
-
-if os.path.isfile(crypto_config.VAE_CKPT):
-    ckpt = torch.load(crypto_config.VAE_CKPT, map_location=device)
-    sd = ckpt.get("state_dict", ckpt)
-    vae.load_state_dict(sd)
-    print("Loaded VAE checkpoint:", crypto_config.VAE_CKPT)
-
-vae.eval()
-for p in vae.parameters():
-    p.requires_grad = False
-
-mu_mean, mu_std = compute_latent_stats(vae, train_dl, device)
-
-# ---- Conditional diffusion model ----
-diff_model = LLapDiT(
-    data_dim=crypto_config.VAE_LATENT_CHANNELS, hidden_dim=crypto_config.MODEL_WIDTH,
-    num_layers=crypto_config.NUM_LAYERS, num_heads=crypto_config.NUM_HEADS,
-    predict_type=crypto_config.PREDICT_TYPE, laplace_k=crypto_config.LAPLACE_K,
-    timesteps=crypto_config.TIMESTEPS, schedule=crypto_config.SCHEDULE,
-    dropout=crypto_config.DROPOUT, attn_dropout=crypto_config.ATTN_DROPOUT,
-    self_conditioning=crypto_config.SELF_COND,
-    lap_mode_main=crypto_config.LAP_MODE
-).to(device)
-
-# ---- Calculate the variance of the v-prediction target ----
-v_variance = calculate_v_variance(
-    scheduler=diff_model.scheduler,
-    dataloader=val_dl,
-    vae=vae,
-    device=device,
-    latent_stats=(mu_mean, mu_std)
-)
-print(f"calculated V-Prediction Target Variance: {v_variance:.4f}")
-print("=========================================================")
-BASELINE_V_VARIANCE = float(v_variance)
-
-ema = EMA(diff_model, decay=crypto_config.EMA_DECAY) if crypto_config.USE_EMA_EVAL else None
-
-scheduler = diff_model.scheduler
-optimizer = torch.optim.AdamW(diff_model.parameters(),
-                              lr=crypto_config.BASE_LR,
-                              weight_decay=crypto_config.WEIGHT_DECAY)
-lr_sched = make_warmup_cosine(optimizer, crypto_config.EPOCHS * max(1, len(train_dl)),
-                              warmup_frac=crypto_config.WARMUP_FRAC,
-                              base_lr=crypto_config.BASE_LR,
-                              min_lr=crypto_config.MIN_LR)
-scaler = GradScaler(enabled=(device.type == "cuda"))
+LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
 
 
-# ============================ train/val loops ============================
-def train_one_epoch(epoch: int):
-    diff_model.train()
-    running_loss = 0.0
-    num_samples = 0
-    global global_step
-
-    for xb, yb, meta in train_dl:
-        V, T = xb
-        mask_bn = meta["entity_mask"]
-
-        cond_summary = build_context(laplace_summarizer, V, T, mask_bn, device)
-        y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-        if y_in is None:
-            continue
-
-        cond_summary_flat = cond_summary[batch_ids]  # [Beff,S,Hm]
-        mu_norm = encode_mu_norm(
-            vae, y_in,
-            mu_mean=mu_mean, mu_std=mu_std
+def _ensure_loaders(
+    train_dl: Optional[DataLoader],
+    val_dl: Optional[DataLoader],
+    test_dl: Optional[DataLoader],
+    sizes: Optional[Sequence[int]],
+    config=crypto_config,
+) -> Tuple[LoaderTuple, Optional[Tuple[int, int, int]]]:
+    if any(loader is None for loader in (train_dl, val_dl, test_dl)):
+        train_dl, val_dl, test_dl, sizes = run_experiment(
+            data_dir=config.DATA_DIR,
+            date_batching=config.date_batching,
+            dates_per_batch=config.BATCH_SIZE,
+            K=config.WINDOW,
+            H=config.PRED,
+            coverage=config.COVERAGE
         )
+    elif sizes is None:
+        try:
+            sizes = tuple(len(dl.dataset) for dl in (train_dl, val_dl, test_dl))
+        except Exception:
+            sizes = None
 
-        # --------- per-sample classifier-free dropout mask ---------
-        Beff = mu_norm.size(0)
-        p_drop = float(crypto_config.DROP_COND_P)
-        m_cond = (torch.rand(Beff, device=device) >= p_drop)
-        idx_c = m_cond.nonzero(as_tuple=False).squeeze(1)
-        idx_u = (~m_cond).nonzero(as_tuple=False).squeeze(1)
+    if train_dl is None or val_dl is None or test_dl is None:
+        raise RuntimeError("Failed to obtain train/val/test dataloaders.")
 
-        # shared t / noise / q_sample for the whole batch
-        t = sample_t_uniform(scheduler, Beff, device)
-        noise = torch.randn_like(mu_norm)
-        x_t, eps_true = scheduler.q_sample(mu_norm, t, noise)
-
-        # --------- self-conditioning per branch (optional) ---------
-        sc_feat_c = sc_feat_u = None
-        use_sc = (epoch >= crypto_config.SELF_COND_START_EPOCH
-                  and torch.rand(()) < crypto_config.SELF_COND_P) and crypto_config.SELF_COND
-        if use_sc:
-            with torch.no_grad():
-                if idx_c.numel() > 0:
-                    pred_ng_c = diff_model(x_t[idx_c], t[idx_c], cond_summary=cond_summary_flat[idx_c], sc_feat=None)
-                    sc_feat_c = scheduler.to_x0(x_t[idx_c], t[idx_c], pred_ng_c, crypto_config.PREDICT_TYPE).detach()
-                if idx_u.numel() > 0:
-                    pred_ng_u = diff_model(x_t[idx_u], t[idx_u], cond_summary=None, sc_feat=None)
-                    sc_feat_u = scheduler.to_x0(x_t[idx_u], t[idx_u], pred_ng_u, crypto_config.PREDICT_TYPE).detach()
-
-        # --------- compute losses on each subset, weighted by fraction ---------
-        optimizer.zero_grad(set_to_none=True)
-        loss = 0.0
-
-        with autocast(enabled=(device.type == "cuda")):
-            if idx_c.numel() > 0:
-                loss_c = diffusion_loss(
-                    diff_model, scheduler, mu_norm[idx_c], t[idx_c],
-                    cond_summary=cond_summary_flat[idx_c], predict_type=crypto_config.PREDICT_TYPE,
-                    weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
-                    minsnr_gamma=crypto_config.MINSNR_GAMMA,
-                    sc_feat=sc_feat_c,
-                    reuse_xt_eps=(x_t[idx_c], eps_true[idx_c]),
-                )
-                loss = loss + loss_c * (idx_c.numel() / Beff)
-
-            if idx_u.numel() > 0:
-                loss_u = diffusion_loss(
-                    diff_model, scheduler, mu_norm[idx_u], t[idx_u],
-                    cond_summary=None, predict_type=crypto_config.PREDICT_TYPE,
-                    weight_scheme=crypto_config.LOSS_WEIGHT_SCHEME,
-                    minsnr_gamma=crypto_config.MINSNR_GAMMA,
-                    sc_feat=sc_feat_u,
-                    reuse_xt_eps=(x_t[idx_u], eps_true[idx_u]),
-                )
-                loss = loss + loss_u * (idx_u.numel() / Beff)
-
-        # guard for numerical issues
-        if not torch.isfinite(loss):
-            print("[warn] non-finite loss detected; skipping step")
-            optimizer.zero_grad(set_to_none=True)
-            continue
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-
-        if crypto_config.GRAD_CLIP and crypto_config.GRAD_CLIP > 0:
-            nn.utils.clip_grad_norm_(diff_model.parameters(), crypto_config.GRAD_CLIP)
-        scaler.step(optimizer)
-        scaler.update()
-        if ema is not None:
-            ema.update(diff_model)
-        lr_sched.step()
-
-        running_loss += float(loss.item()) * Beff
-        num_samples += Beff
-
-    return running_loss / max(1, num_samples)
+    return (train_dl, val_dl, test_dl), sizes
 
 
-@torch.inference_mode()
-def validate():
-    diff_model.eval()
-    total, count = 0.0, 0
-    cond_gap_accum, cond_gap_batches = 0.0, 0
-
-    if ema is not None:
-        ema.store(diff_model)
-        ema.copy_to(diff_model)
-
-    for xb, yb, meta in val_dl:
-        V, T = xb
-        mask_bn = meta["entity_mask"]
-
-        cond_summary = build_context(laplace_summarizer, V, T, mask_bn, device)
-        y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-        if y_in is None:
-            continue
-        cond_summary_flat = cond_summary[batch_ids]
-        mu_norm = encode_mu_norm(
-            vae, y_in,
-            mu_mean=mu_mean, mu_std=mu_std
-        )
-
-        # main validation loss
-        t = sample_t_uniform(scheduler, mu_norm.size(0), device)
-        loss = diffusion_loss(
-            diff_model, scheduler, mu_norm, t,
-            cond_summary=cond_summary_flat, predict_type=crypto_config.PREDICT_TYPE
-        )
-        total += loss.item() * mu_norm.size(0)
-        count += mu_norm.size(0)
-
-        # low-variance cond_gap probe: reuse same (t, x_t, eps) for both branches
-        probe_n = min(128, mu_norm.size(0))
-        if probe_n > 0:
-            mu_p = mu_norm[:probe_n]
-            cs_p = cond_summary_flat[:probe_n]
-            t_p = sample_t_uniform(scheduler, probe_n, device)
-            noise_p = torch.randn_like(mu_p)
-            x_t_p, eps_p = scheduler.q_sample(mu_p, t_p, noise_p)
-
-            loss_cond = diffusion_loss(
-                diff_model, scheduler, mu_p, t_p,
-                cond_summary=cs_p, predict_type=crypto_config.PREDICT_TYPE,
-                reuse_xt_eps=(x_t_p, eps_p)
-            ).item()
-
-            loss_unco = diffusion_loss(
-                diff_model, scheduler, mu_p, t_p,
-                cond_summary=None, predict_type=crypto_config.PREDICT_TYPE,
-                reuse_xt_eps=(x_t_p, eps_p)
-            ).item()
-
-            cond_gap_accum += (loss_unco - loss_cond)
-            cond_gap_batches += 1
-
-    if ema is not None:
-        ema.restore(diff_model)
-
-    avg_val = total / max(1, count)
-    cond_gap = (cond_gap_accum / cond_gap_batches) if cond_gap_batches > 0 else float("nan")
-    return avg_val, cond_gap
-
-
-# ============================ run ============================
-skip_with_trained_model = crypto_config.TRAINED_LLapDiT
-
-if skip_with_trained_model and os.path.exists(skip_with_trained_model) and crypto_config.downstream:
-    print(f"Skipping training. Loading model from: {skip_with_trained_model}")
-    ckpt = torch.load(skip_with_trained_model, map_location=device)
-
-    # Load model weights
-    diff_model.load_state_dict(ckpt["model_state"])
-    print("Loaded model state.")
-
-    # Load EMA weights if they exist in the checkpoint and are enabled
-    if ema is not None and "ema_state" in ckpt:
-        ema.load_state_dict(ckpt["ema_state"])
-        print("Loaded EMA state.")
-
-    # Load stats needed for downstream tasks
-    mu_mean = ckpt["mu_mean"].to(device)
-    mu_std = ckpt["mu_std"].to(device)
-
-else:
-    # --- TRAINING LOOP ---
-    if skip_with_trained_model:
-
-        ckpt = torch.load(skip_with_trained_model, map_location=device)
-
-        # Load model weights
-        diff_model.load_state_dict(ckpt["model_state"])
-        print("Loaded model state.")
-
-        # Load EMA weights if they exist in the checkpoint and are enabled
-        if ema is not None and "ema_state" in ckpt:
-            ema.load_state_dict(ckpt["ema_state"])
-            print("Loaded EMA state.")
+def _summarize_dataset(train_dl: DataLoader, sizes: Optional[Sequence[int]]) -> Tuple[int, int, int, int]:
+    if sizes is not None:
+        print("sizes:", tuple(sizes))
     else:
-        print(f"Model path not found: {skip_with_trained_model}. Starting training from scratch.")
+        print("sizes: (unknown)")
 
-    best_val = float("inf")
+    try:
+        xb0, yb0, meta0 = next(iter(train_dl))
+    except StopIteration as exc:  # pragma: no cover - defensive
+        raise RuntimeError("Training dataloader produced no batches.") from exc
+
+    V0, T0 = xb0
+    B0, N0, K0, Fv = V0.shape
+    Ft = T0.shape[-1]
+    H = yb0.shape[-1]
+    assert Fv == Ft, f"Expected Fv == Ft, got {Fv} vs {Ft}"
+    print("V:", V0.shape, "T:", T0.shape, "y:", yb0.shape)
+    return B0, N0, K0, Fv
+
+
+def run(
+    train_dl: Optional[DataLoader] = None,
+    val_dl: Optional[DataLoader] = None,
+    test_dl: Optional[DataLoader] = None,
+    sizes: Optional[Sequence[int]] = None,
+    config=crypto_config,
+) -> Dict[str, object]:
+    (train_dl, val_dl, test_dl), sizes = _ensure_loaders(train_dl, val_dl, test_dl, sizes, config)
+    device = set_torch()
+
+    _, N0, _, Fv = _summarize_dataset(train_dl, sizes)
+
+    # ---- Load pretrained Laplace summarizer (shared with standalone training) ----
+    sum_lap_k = config.SUM_LAPLACE_K
+    sum_ctx_len = config.SUM_CONTEXT_LEN
+    sum_ctx_dim = config.SUM_CONTEXT_DIM
+    sum_tv_hidden = config.SUM_TV_HIDDEN
+    sum_dropout = config.SUM_DROPOUT
+
+    summarizer_ckpt = config.SUM_CKPT
+    if summarizer_ckpt is None:
+        summarizer_dir = config.SUM_DIR
+        summarizer_ckpt = Path(summarizer_dir) / f"{config.PRED}-{config.VAE_LATENT_CHANNELS}-summarizer.pt"
+    else:
+        summarizer_ckpt = Path(summarizer_ckpt)
+
+    laplace_summarizer = LaplaceAE(
+        num_entities=N0,
+        feat_dim=Fv,
+        window_size=config.WINDOW,
+        lap_k=sum_lap_k,
+        tv_hidden=sum_tv_hidden,
+        out_len=sum_ctx_len,
+        context_dim=sum_ctx_dim,
+        dropout=sum_dropout,
+    ).to(device)
+
+    if summarizer_ckpt.exists():
+        state = torch.load(summarizer_ckpt, map_location="cpu")
+        laplace_summarizer.load_state_dict(state.get("model", state))
+        print(f"Loaded summarizer checkpoint: {summarizer_ckpt}")
+    else:
+        print(f"[warn] Summarizer checkpoint not found at {summarizer_ckpt}; using randomly initialised weights.")
+
+    laplace_summarizer.eval()
+    for p in laplace_summarizer.parameters():
+        p.requires_grad = False
+
+    # ---- Estimate global latent stats (uses same window-normalization) ----
+    vae = LatentVAE(
+        seq_len=config.PRED,
+        latent_dim=config.VAE_LATENT_DIM,
+        latent_channel=config.VAE_LATENT_CHANNELS,
+        enc_layers=config.VAE_LAYERS, enc_heads=config.VAE_HEADS, enc_ff=config.VAE_FF,
+        dec_layers=config.VAE_LAYERS, dec_heads=config.VAE_HEADS, dec_ff=config.VAE_FF
+    ).to(device)
+
+    if os.path.isfile(config.VAE_CKPT):
+        ckpt = torch.load(config.VAE_CKPT, map_location=device)
+        sd = ckpt.get("state_dict", ckpt)
+        vae.load_state_dict(sd)
+        print("Loaded VAE checkpoint:", config.VAE_CKPT)
+    else:
+        print(f"[warn] VAE checkpoint not found at {config.VAE_CKPT}; using randomly initialised weights.")
+
+    vae.eval()
+    for p in vae.parameters():
+        p.requires_grad = False
+
+    mu_mean, mu_std = compute_latent_stats(vae, train_dl, device)
+
+    # ---- Conditional diffusion model ----
+    diff_model = LLapDiT(
+        data_dim=config.VAE_LATENT_CHANNELS, hidden_dim=config.MODEL_WIDTH,
+        num_layers=config.NUM_LAYERS, num_heads=config.NUM_HEADS,
+        predict_type=config.PREDICT_TYPE, laplace_k=config.LAPLACE_K,
+        timesteps=config.TIMESTEPS, schedule=config.SCHEDULE,
+        dropout=config.DROPOUT, attn_dropout=config.ATTN_DROPOUT,
+        self_conditioning=config.SELF_COND,
+        lap_mode_main=config.LAP_MODE
+    ).to(device)
+
+    # ---- Calculate the variance of the v-prediction target ----
+    v_variance = calculate_v_variance(
+        scheduler=diff_model.scheduler,
+        dataloader=val_dl,
+        vae=vae,
+        device=device,
+        latent_stats=(mu_mean, mu_std)
+    )
+    print(f"calculated V-Prediction Target Variance: {v_variance:.4f}")
+    print("=========================================================")
+    baseline_v_variance = float(v_variance)
+
+    ema = EMA(diff_model, decay=config.EMA_DECAY) if config.USE_EMA_EVAL else None
+
+    scheduler = diff_model.scheduler
+    optimizer = torch.optim.AdamW(diff_model.parameters(),
+                                  lr=config.BASE_LR,
+                                  weight_decay=config.WEIGHT_DECAY)
+    lr_sched = make_warmup_cosine(optimizer, config.EPOCHS * max(1, len(train_dl)),
+                                  warmup_frac=config.WARMUP_FRAC,
+                                  base_lr=config.BASE_LR,
+                                  min_lr=config.MIN_LR)
+    scaler = GradScaler(enabled=(device.type == "cuda"))
+
+    # ============================ train/val loops ============================
+    def train_one_epoch(epoch: int) -> float:
+            diff_model.train()
+            running_loss = 0.0
+            num_samples = 0
+    
+            for xb, yb, meta in train_dl:
+                V, T = xb
+                mask_bn = meta["entity_mask"]
+    
+                cond_summary = build_context(summarizer, V, T, mask_bn, device)
+                y_in, batch_ids = flatten_targets(yb, mask_bn, device)
+                if y_in is None:
+                    continue
+    
+                cond_summary_flat = cond_summary[batch_ids]
+                mu_norm = encode_mu_norm(
+                    vae, y_in,
+                    mu_mean=mu_mean, mu_std=mu_std
+                )
+    
+                Beff = mu_norm.size(0)
+                p_drop = float(config.DROP_COND_P)
+                m_cond = (torch.rand(Beff, device=device) >= p_drop)
+                idx_c = m_cond.nonzero(as_tuple=False).squeeze(1)
+                idx_u = (~m_cond).nonzero(as_tuple=False).squeeze(1)
+    
+                t = sample_t_uniform(scheduler, Beff, device)
+                noise = torch.randn_like(mu_norm)
+                x_t, eps_true = scheduler.q_sample(mu_norm, t, noise)
+    
+                sc_feat_c = sc_feat_u = None
+                use_sc = (epoch >= config.SELF_COND_START_EPOCH and torch.rand(()) < config.SELF_COND_P) and config.SELF_COND
+                if use_sc:
+                    with torch.no_grad():
+                        if idx_c.numel() > 0:
+                            pred_ng_c = diff_model(x_t[idx_c], t[idx_c], cond_summary=cond_summary_flat[idx_c], sc_feat=None)
+                            sc_feat_c = scheduler.to_x0(x_t[idx_c], t[idx_c], pred_ng_c, config.PREDICT_TYPE).detach()
+                        if idx_u.numel() > 0:
+                            pred_ng_u = diff_model(x_t[idx_u], t[idx_u], cond_summary=None, sc_feat=None)
+                            sc_feat_u = scheduler.to_x0(x_t[idx_u], t[idx_u], pred_ng_u, config.PREDICT_TYPE).detach()
+    
+                optimizer.zero_grad(set_to_none=True)
+                loss = 0.0
+    
+                with autocast(enabled=(device.type == "cuda")):
+                    if idx_c.numel() > 0:
+                        loss_c = diffusion_loss(
+                            diff_model, scheduler, mu_norm[idx_c], t[idx_c],
+                            cond_summary=cond_summary_flat[idx_c], predict_type=config.PREDICT_TYPE,
+                            weight_scheme=config.LOSS_WEIGHT_SCHEME,
+                            minsnr_gamma=config.MINSNR_GAMMA,
+                            sc_feat=sc_feat_c,
+                            reuse_xt_eps=(x_t[idx_c], eps_true[idx_c]),
+                        )
+                        loss = loss + loss_c * (idx_c.numel() / Beff)
+    
+                    if idx_u.numel() > 0:
+                        loss_u = diffusion_loss(
+                            diff_model, scheduler, mu_norm[idx_u], t[idx_u],
+                            cond_summary=None, predict_type=config.PREDICT_TYPE,
+                            weight_scheme=config.LOSS_WEIGHT_SCHEME,
+                            minsnr_gamma=config.MINSNR_GAMMA,
+                            sc_feat=sc_feat_u,
+                            reuse_xt_eps=(x_t[idx_u], eps_true[idx_u]),
+                        )
+                        loss = loss + loss_u * (idx_u.numel() / Beff)
+    
+                if not torch.isfinite(loss):
+                    print("[warn] non-finite loss detected; skipping step")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+    
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+    
+                if config.GRAD_CLIP and config.GRAD_CLIP > 0:
+                    nn.utils.clip_grad_norm_(diff_model.parameters(), config.GRAD_CLIP)
+                scaler.step(optimizer)
+                scaler.update()
+                if ema is not None:
+                    ema.update(diff_model)
+                lr_sched.step()
+    
+                running_loss += float(loss.item()) * Beff
+                num_samples += Beff
+    
+            return running_loss / max(1, num_samples)
+    
+    
+    @torch.inference_mode()
+    def validate() -> Tuple[float, float]:
+        diff_model.eval()
+        total, count = 0.0, 0
+        cond_gap_accum, cond_gap_batches = 0.0, 0
+    
+        if ema is not None:
+            ema.store(diff_model)
+            ema.copy_to(diff_model)
+    
+        for xb, yb, meta in val_dl:
+            V, T = xb
+            mask_bn = meta["entity_mask"]
+    
+            cond_summary = build_context(summarizer, V, T, mask_bn, device)
+            y_in, batch_ids = flatten_targets(yb, mask_bn, device)
+            if y_in is None:
+                continue
+            cond_summary_flat = cond_summary[batch_ids]
+            mu_norm = encode_mu_norm(
+                vae, y_in,
+                mu_mean=mu_mean, mu_std=mu_std
+            )
+    
+            # main validation loss
+            t = sample_t_uniform(scheduler, mu_norm.size(0), device)
+            loss = diffusion_loss(
+                diff_model, scheduler, mu_norm, t,
+                cond_summary=cond_summary_flat, predict_type=config.PREDICT_TYPE
+            )
+            total += loss.item() * mu_norm.size(0)
+            count += mu_norm.size(0)
+    
+            # low-variance cond_gap probe: reuse same (t, x_t, eps) for both branches
+            probe_n = min(128, mu_norm.size(0))
+            if probe_n > 0:
+                mu_p = mu_norm[:probe_n]
+                cs_p = cond_summary_flat[:probe_n]
+                t_p = sample_t_uniform(scheduler, probe_n, device)
+                noise_p = torch.randn_like(mu_p)
+                x_t_p, eps_p = scheduler.q_sample(mu_p, t_p, noise_p)
+    
+                loss_cond = diffusion_loss(
+                    diff_model, scheduler, mu_p, t_p,
+                    cond_summary=cs_p, predict_type=config.PREDICT_TYPE,
+                    reuse_xt_eps=(x_t_p, eps_p)
+                ).item()
+    
+                loss_unco = diffusion_loss(
+                    diff_model, scheduler, mu_p, t_p,
+                    cond_summary=None, predict_type=config.PREDICT_TYPE,
+                    reuse_xt_eps=(x_t_p, eps_p)
+                ).item()
+    
+                cond_gap_accum += (loss_unco - loss_cond)
+                cond_gap_batches += 1
+    
+        if ema is not None:
+            ema.restore(diff_model)
+    
+        avg_val = total / max(1, count)
+        cond_gap = (cond_gap_accum / cond_gap_batches) if cond_gap_batches > 0 else float("nan")
+        return avg_val, cond_gap
+    
+    
+    # ============================ training control ============================
+    skip_with_trained_model = config.TRAINED_LLapDiT
+    loaded_checkpoint: Optional[str] = None
+    best_checkpoint: Optional[str] = None
+    best_val = float('inf')
     patience = 0
-    current_best_path = None
-    os.makedirs(crypto_config.CKPT_DIR, exist_ok=True)
 
-    for epoch in tqdm(range(1, crypto_config.EPOCHS + 1), desc="Epochs"):
-        train_loss = train_one_epoch(epoch)
-        val_loss, cond_gap = validate()
-        Z = crypto_config.VAE_LATENT_CHANNELS
-        val_vs_baseline = (
-            val_loss / BASELINE_V_VARIANCE
-            if BASELINE_V_VARIANCE and BASELINE_V_VARIANCE > 0
-            else float("inf")
-        )
-        improvement = (
-            BASELINE_V_VARIANCE - val_loss
-            if BASELINE_V_VARIANCE is not None
-            else float("nan")
-        )
-        cond_gap_scaled = cond_gap * Z if math.isfinite(cond_gap) else float("nan")
-        print(
-            f"Epoch {epoch:03d} | train: {train_loss:.6f} "
-            f"| val: {val_loss:.6f} | cond_gap: {cond_gap_scaled:.6f} "
-            f"| val/v_var: {val_vs_baseline:.6f} | improvement: {improvement:.6f}"
-        )
-
-        # checkpoint best (with EMA state)
-        if val_loss < best_val:
-            best_val = val_loss;
-            patience = 0
-            if current_best_path and os.path.exists(current_best_path):
-                os.remove(current_best_path)
-
+    if skip_with_trained_model and os.path.exists(skip_with_trained_model) and config.downstream:
+        print(f"Skipping training. Loading model from: {skip_with_trained_model}")
+        ckpt = torch.load(skip_with_trained_model, map_location=device)
+        diff_model.load_state_dict(ckpt['model_state'])
+        if ema is not None and 'ema_state' in ckpt:
+            ema.load_state_dict(ckpt['ema_state'])
+        mu_mean = ckpt['mu_mean'].to(device)
+        mu_std = ckpt['mu_std'].to(device)
+        loaded_checkpoint = skip_with_trained_model
+    else:
+        os.makedirs(config.CKPT_DIR, exist_ok=True)
+        for epoch in tqdm(range(1, config.EPOCHS + 1), desc='Epochs'):
+            train_loss = train_one_epoch(epoch)
+            val_loss, cond_gap = validate()
+            Z = config.VAE_LATENT_CHANNELS
             val_vs_baseline = (
-                val_loss / BASELINE_V_VARIANCE
-                if BASELINE_V_VARIANCE and BASELINE_V_VARIANCE > 0
-                else float("inf")
+                val_loss / baseline_v_variance
+                if baseline_v_variance and baseline_v_variance > 0
+                else float('inf')
             )
-            ratio_str = (
-                f"{val_vs_baseline:.6f}"
-                if math.isfinite(val_vs_baseline)
-                else ("inf" if val_vs_baseline > 0 else "nan")
+            improvement = (
+                baseline_v_variance - val_loss
+                if baseline_v_variance is not None
+                else float('nan')
+            )
+            cond_gap_scaled = cond_gap * Z if math.isfinite(cond_gap) else float('nan')
+            print(
+                f"Epoch {epoch:03d} | train: {train_loss:.6f} "
+                f"| val: {val_loss:.6f} | cond_gap: {cond_gap_scaled:.6f} "
+                f"| val/v_var: {val_vs_baseline:.6f} | improvement: {improvement:.6f}"
             )
 
-            ckpt_path = os.path.join(
-                crypto_config.CKPT_DIR,
-                f"mode-{crypto_config.LAP_MODE}-pred-{crypto_config.PRED}"
-                f"-val-{val_loss:.6f}-cond-{cond_gap * Z:.6f}-ratio-{ratio_str}.pt"
-            )
-            save_payload = {
-                "epoch": epoch,
-                "model_state": diff_model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "mu_mean": mu_mean.detach().cpu(),
-                "mu_std": mu_std.detach().cpu(),
-                "predict_type": crypto_config.PREDICT_TYPE,
-                "timesteps": crypto_config.TIMESTEPS,
-                "schedule": crypto_config.SCHEDULE,
-            }
-            if ema is not None:
-                save_payload["ema_state"] = ema.state_dict()
-                save_payload["ema_decay"] = crypto_config.EMA_DECAY
-            torch.save(save_payload, ckpt_path)
-            current_best_path = ckpt_path
-        else:
-            patience += 1
-            if patience >= crypto_config.EARLY_STOP:
-                print("Early stopping.")
-                break
+            if val_loss < best_val:
+                best_val = val_loss
+                patience = 0
+                if best_checkpoint and os.path.exists(best_checkpoint):
+                    os.remove(best_checkpoint)
 
+                ratio_str = (
+                    f"{val_vs_baseline:.6f}"
+                    if math.isfinite(val_vs_baseline)
+                    else ('inf' if val_vs_baseline > 0 else 'nan')
+                )
+                ckpt_path = os.path.join(
+                    config.CKPT_DIR,
+                    f"mode-{config.LAP_MODE}-pred-{config.PRED}"
+                    f"-val-{val_loss:.6f}-cond-{cond_gap * Z:.6f}-ratio-{ratio_str}.pt"
+                )
+                save_payload = {
+                    'epoch': epoch,
+                    'model_state': diff_model.state_dict(),
+                    'optimizer_state': optimizer.state_dict(),
+                    'mu_mean': mu_mean.detach().cpu(),
+                    'mu_std': mu_std.detach().cpu(),
+                    'predict_type': config.PREDICT_TYPE,
+                    'timesteps': config.TIMESTEPS,
+                    'schedule': config.SCHEDULE,
+                    'val_loss': float(val_loss),
+                }
+                if ema is not None:
+                    save_payload['ema_state'] = ema.state_dict()
+                    save_payload['ema_decay'] = config.EMA_DECAY
+                torch.save(save_payload, ckpt_path)
+                best_checkpoint = ckpt_path
+            else:
+                patience += 1
+                if patience >= config.EARLY_STOP:
+                    print('Early stopping.')
+                    break
 
-# ============================ Decoder finetune + regression eval ============================
+        if best_checkpoint is not None:
+            print(f"Loading best checkpoint: {best_checkpoint}")
+            ckpt = torch.load(best_checkpoint, map_location=device)
+            diff_model.load_state_dict(ckpt['model_state'])
+            if ema is not None and 'ema_state' in ckpt:
+                ema.load_state_dict(ckpt['ema_state'])
+            mu_mean = ckpt['mu_mean'].to(device)
+            mu_std = ckpt['mu_std'].to(device)
+            loaded_checkpoint = best_checkpoint
+
+    eval_stats = None
+    if config.DECODER_FT_EPOCHS > 0:
+        torch.manual_seed(42)
+        finetune_vae_decoder(
+            vae,
+            diff_model,
+            laplace_summarizer,
+            train_dl,
+            val_dl,
+            device,
+            mu_mean=mu_mean,
+            mu_std=mu_std,
+            ema=ema,
+            epochs=config.DECODER_FT_EPOCHS,
+            lr=config.DECODER_FT_LR,
+            gen_steps=config.GEN_STEPS,
+            guidance_strength=config.GUIDANCE_STRENGTH,
+            guidance_power=config.GUIDANCE_POWER,
+            lambda_rec_anchor=config.DECODER_FT_ANCHOR,
+            self_cond=config.SELF_COND,
+        )
+
+    eval_stats = evaluate_regression(
+        diff_model,
+        vae,
+        laplace_summarizer,
+        test_dl,
+        device,
+        mu_mean,
+        mu_std,
+        config=config,
+        ema=ema,
+        self_cond=config.SELF_COND,
+        steps=config.GEN_STEPS,
+        guidance_strength=config.GUIDANCE_STRENGTH,
+        guidance_power=config.GUIDANCE_POWER,
+        aggregation_method='mean',
+        quantiles=(0.1, 0.5, 0.9),
+    )
+
+    return {
+        'train_loader': train_dl,
+        'val_loader': val_dl,
+        'test_loader': test_dl,
+        'sizes': sizes,
+        'baseline_v_variance': baseline_v_variance,
+        'best_val': best_val if math.isfinite(best_val) else None,
+        'best_checkpoint': best_checkpoint,
+        'loaded_checkpoint': loaded_checkpoint,
+        'eval_stats': eval_stats,
+    }
+
 
 def finetune_vae_decoder(
         vae,
         diff_model,
+        summarizer,
         train_dl,
         val_dl,
         device,
@@ -421,6 +488,7 @@ def finetune_vae_decoder(
         guidance_strength: float = 2.0,
         guidance_power: float = 0.3,
         lambda_rec_anchor: float = 0.25,
+        self_cond: bool = False,
 ):
     """
     Fine-tune ONLY the VAE decoder to adapt to the diffusion model's generated latent x0_norm.
@@ -453,7 +521,7 @@ def finetune_vae_decoder(
         for xb, yb, meta in loader:
             V, T = xb
             mask_bn = meta["entity_mask"]
-            cs_full = build_context(laplace_summarizer, V, T, mask_bn, device)
+            cs_full = build_context(summarizer, V, T, mask_bn, device)
             y_true, batch_ids = _flatten_for_mask(yb, mask_bn, device)
             if y_true is None:
                 continue
@@ -466,7 +534,7 @@ def finetune_vae_decoder(
                 x0_norm_gen = diff_model.generate(
                     shape=(Beff, Hcur, Z), steps=gen_steps,
                     guidance_strength=guidance_strength, guidance_power=guidance_power,
-                    cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
+                    cond_summary=cs, self_cond=self_cond, cfg_rescale=True,
                 )
 
                 # ---- Forward decoder on generated latents ----
@@ -512,7 +580,8 @@ def finetune_vae_decoder(
 
 @torch.inference_mode()
 def evaluate_regression(
-        diff_model, vae, dataloader, device, mu_mean, mu_std, config, ema=None,
+        diff_model, vae, summarizer, dataloader, device, mu_mean, mu_std, config, ema=None,
+        self_cond: bool = False,
         steps: int = 36, guidance_strength: float = 2.0, guidance_power: float = 0.3,
         aggregation_method: str = 'mean',
         quantiles: tuple = (0.1, 0.5, 0.9),
@@ -565,7 +634,7 @@ def evaluate_regression(
         V, T = xb
         mask_bn = meta["entity_mask"]
 
-        cond_summary = build_context(laplace_summarizer, V, T, mask_bn, device)
+        cond_summary = build_context(summarizer, V, T, mask_bn, device)
         y_in, batch_ids = _flatten_for_mask(yb, mask_bn, device)
         if y_in is None:
             continue
@@ -580,7 +649,7 @@ def evaluate_regression(
             x0_norm = diff_model.generate(
                 shape=(Beff, Hcur, Z), steps=steps,
                 guidance_strength=guidance_strength, guidance_power=guidance_power,
-                cond_summary=cs, self_cond=crypto_config.SELF_COND, cfg_rescale=True,
+                cond_summary=cs, self_cond=self_cond, cfg_rescale=True,
             )
 
             y_hat_sample = decode_latents_with_vae(
@@ -652,31 +721,5 @@ def evaluate_regression(
     }
 
 
-# ---------- Run decoder FT + test regression once training stops ----------
-if True:
-    # It's good practice to pass the whole config object
-    # to avoid long argument lists and make adding new parameters easier.
-    if crypto_config.DECODER_FT_EPOCHS > 0:
-        torch.manual_seed(42)
-        finetune_vae_decoder(
-            vae, diff_model, train_dl, val_dl, device,
-            mu_mean=mu_mean, mu_std=mu_std,
-            ema=ema,
-            epochs=crypto_config.DECODER_FT_EPOCHS,
-            lr=crypto_config.DECODER_FT_LR,  # CRITICAL BUG FIX
-            gen_steps=crypto_config.GEN_STEPS,
-            guidance_strength=crypto_config.GUIDANCE_STRENGTH,
-            guidance_power=crypto_config.GUIDANCE_POWER,
-            lambda_rec_anchor=crypto_config.DECODER_FT_ANCHOR
-        )
-
-    # Evaluate conditional regression on test set
-    evaluate_regression(
-        diff_model, vae, test_dl, device, mu_mean, mu_std,
-        config=crypto_config,  # Pass config object
-        steps=crypto_config.GEN_STEPS,
-        guidance_strength=crypto_config.GUIDANCE_STRENGTH,
-        guidance_power=crypto_config.GUIDANCE_POWER,
-        aggregation_method='mean',
-        quantiles=(0.1, 0.5, 0.9)
-    )
+if __name__ == "__main__":  # pragma: no cover
+    run()
