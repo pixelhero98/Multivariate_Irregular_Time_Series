@@ -1,11 +1,12 @@
 """BMS (Beijing Multi-Site) air quality dataset utilities.
 
 This module mirrors the public APIs exposed by :mod:`fin_dataset` so the rest of
-the training pipeline can treat financial and air-quality data interchangeably.
-In particular it produces the same compact cache layout consisting of per-entity
-feature/target arrays accompanied by a global window index. The resulting cache
-can therefore be consumed by the existing ratio-split dataloader from
-``fin_dataset`` which also yields the familiar ``entity_mask`` metadata.
+the training pipeline can treat financial and air-quality data
+interchangeably. In particular it produces the same compact cache layout
+consisting of per-entity feature/target arrays accompanied by a global window
+index. The resulting cache can therefore be consumed by the existing
+ratio-split dataloader from :mod:`fin_dataset`, which also yields the familiar
+``entity_mask`` metadata.
 
 Targets ``Y`` correspond to future values of the ``PM2.5`` pollutant while the
 context tensors (``V`` levels and ``T`` temporal first-differences) include the
@@ -21,7 +22,7 @@ import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -65,23 +66,11 @@ class BMSCacheConfig:
 # ---------------------------------------------------------------------------
 # Downloading & ingestion utilities
 
-def download_bms_air_dataset(dest_path: PathLike = "./bms_air_quality_data",
-                             url: str = DATA_URL) -> Path:
-    """Download and extract the raw dataset if it is not already present.
-
-    Parameters
-    ----------
-    dest_path:
-        Directory where the archive should be unpacked. The extracted CSV files
-        will live under ``<dest_path> / ARCHIVE_ROOT``.
-    url:
-        Download location for the zipped dataset. Overridable for testing.
-
-    Returns
-    -------
-    Path
-        Path pointing to the extracted directory that contains all CSV files.
-    """
+def download_bms_air_dataset(
+    dest_path: PathLike = "./bms_air_quality_data",
+    url: str = DATA_URL,
+) -> Path:
+    """Download and extract the raw dataset if it is not already present."""
 
     dest = Path(dest_path).expanduser().resolve()
     extracted = dest / ARCHIVE_ROOT
@@ -119,9 +108,9 @@ def load_raw_bms_frames(data_dir: PathLike) -> pd.DataFrame:
 def _encode_wind_direction(series: pd.Series) -> pd.Series:
     """Convert cardinal wind direction strings into stable float codes."""
 
-    codes = series.astype("category").cat.codes.astype(np.float32)
+    codes = series.astype("category").cat.codes
     codes = codes.replace(-1, np.nan)
-    return codes
+    return codes.astype(np.float32)
 
 
 def clean_bms_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -164,8 +153,11 @@ def clean_bms_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _build_station_frames(df: pd.DataFrame, freq: str = "H",
-                          stations: Optional[Sequence[str]] = None) -> Dict[str, pd.DataFrame]:
+def _build_station_frames(
+    df: pd.DataFrame,
+    freq: str = "H",
+    stations: Optional[Sequence[str]] = None,
+) -> Dict[str, pd.DataFrame]:
     """Transform the long dataframe into per-station panels aligned on time."""
 
     if stations is not None:
@@ -192,6 +184,96 @@ def _build_station_frames(df: pd.DataFrame, freq: str = "H",
     return panels
 
 
+class _NormStatsAccumulator:
+    """Accumulate normalization statistics for per-station or global modes."""
+
+    def __init__(self, num_assets: int, feature_dim: int, per_asset: bool) -> None:
+        self.per_asset = per_asset
+        self.num_assets = int(num_assets)
+        self.feature_dim = int(feature_dim)
+
+        if per_asset:
+            self.mean_x: List[Optional[np.ndarray]] = [None] * self.num_assets
+            self.std_x: List[Optional[np.ndarray]] = [None] * self.num_assets
+            self.mean_y: List[Optional[float]] = [None] * self.num_assets
+            self.std_y: List[Optional[float]] = [None] * self.num_assets
+        else:
+            self.count = 0
+            self.sum_x = np.zeros(self.feature_dim, dtype=np.float64)
+            self.sumsq_x = np.zeros(self.feature_dim, dtype=np.float64)
+            self.total_y = 0.0
+            self.total_y_sq = 0.0
+            self.total_y_count = 0
+
+    def update(self, aid: int, features: np.ndarray, targets: np.ndarray) -> None:
+        if self.per_asset:
+            f64 = features.astype(np.float64, copy=False)
+            t64 = targets.astype(np.float64, copy=False)
+            mx = f64.mean(axis=0)
+            sx = f64.std(axis=0)
+            sx = np.where(sx == 0.0, 1.0, sx)
+            my = float(t64.mean()) if t64.size else 0.0
+            sy = float(t64.std()) if t64.size else 1.0
+            sy = 1.0 if sy == 0.0 else sy
+            self.mean_x[aid] = mx.reshape(1, 1, -1).astype(np.float32)
+            self.std_x[aid] = sx.reshape(1, 1, -1).astype(np.float32)
+            self.mean_y[aid] = my
+            self.std_y[aid] = sy
+        else:
+            f64 = features.astype(np.float64, copy=False)
+            t64 = targets.astype(np.float64, copy=False)
+            self.count += f64.shape[0]
+            self.sum_x += f64.sum(axis=0)
+            self.sumsq_x += np.square(f64).sum(axis=0)
+            self.total_y += float(t64.sum())
+            self.total_y_sq += float(np.square(t64).sum())
+            self.total_y_count += t64.shape[0]
+
+    def finalize(self, assets: Iterable[str]) -> Dict[str, object]:
+        assets_list = list(assets)
+        if self.per_asset:
+            if not all(
+                m is not None and s is not None and my is not None and sy is not None
+                for m, s, my, sy in zip(self.mean_x, self.std_x, self.mean_y, self.std_y)
+            ):
+                raise RuntimeError("Normalization statistics missing for some assets.")
+            return {
+                "per_ticker": True,
+                "assets": assets_list,
+                "mean_x": [mx.tolist() for mx in self.mean_x],
+                "std_x": [sx.tolist() for sx in self.std_x],
+                "mean_y": [float(my) for my in self.mean_y],
+                "std_y": [float(sy) for sy in self.std_y],
+            }
+
+        if self.count == 0:
+            raise RuntimeError("Unable to compute normalization statistics (no samples).")
+
+        mean_x = (self.sum_x / self.count).astype(np.float32)
+        var_x = (self.sumsq_x / self.count) - np.square(mean_x.astype(np.float64))
+        var_x = np.maximum(var_x, 1e-12)
+        std_x = np.sqrt(var_x).astype(np.float32)
+        std_x[std_x == 0.0] = 1.0
+
+        if self.total_y_count > 0:
+            mean_y = float(self.total_y / self.total_y_count)
+            var_y = max((self.total_y_sq / self.total_y_count) - (mean_y ** 2), 1e-12)
+            std_y = float(np.sqrt(var_y))
+            std_y = 1.0 if std_y == 0.0 else std_y
+        else:
+            mean_y = 0.0
+            std_y = 1.0
+
+        return {
+            "per_ticker": False,
+            "assets": assets_list,
+            "mean_x": mean_x.reshape(1, 1, -1).tolist(),
+            "std_x": std_x.reshape(1, 1, -1).tolist(),
+            "mean_y": mean_y,
+            "std_y": std_y,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Cache builder
 
@@ -210,10 +292,11 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
         raise ValueError("window must be a positive integer")
     if cfg.horizon < 0:
         raise ValueError("horizon must be non-negative")
+    keep_time_meta = cfg.keep_time_meta.lower()
+    if keep_time_meta not in {"full", "end", "none"}:
+        raise ValueError("keep_time_meta must be one of {'full', 'end', 'none'}")
 
-    raw_root = cfg.raw_data_dir
-    if raw_root is None:
-        raw_root = "./bms_air_quality_data"
+    raw_root = cfg.raw_data_dir or "./bms_air_quality_data"
     raw_path = download_bms_air_dataset(raw_root)
     raw_df = load_raw_bms_frames(raw_path)
     clean_df = clean_bms_data(raw_df)
@@ -235,11 +318,24 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
         shutil.rmtree(paths.cache_root)
     paths.ensure()
 
-    # Persist per-station arrays.
+    pairs: List[np.ndarray] = []
+    end_times: List[np.ndarray] = []
+    start_times: List[np.datetime64] = []
+    stop_times: List[np.datetime64] = []
+
+    # Normalization statistics accumulator.
+    feature_dim = len(feature_cols)
+    norm_acc = _NormStatsAccumulator(
+        num_assets=len(assets),
+        feature_dim=feature_dim,
+        per_asset=cfg.normalize_per_station,
+    )
+
     for asset in assets:
         aid = asset_to_id[asset]
         panel = panels[asset][feature_cols]
-        if panel.shape[0] < cfg.window + cfg.horizon:
+        total_rows = panel.shape[0]
+        if total_rows < cfg.window + cfg.horizon:
             raise ValueError(
                 f"Station '{asset}' has insufficient history for the requested window/horizon."
             )
@@ -248,24 +344,21 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
         targets = panel[TARGET_COLUMN].to_numpy(dtype=np.float32, copy=True)
         times = panel.index.to_numpy(dtype="datetime64[ns]")
 
-        np.save(paths.features / f"{aid}.npy", features.astype(np.float16))
-        np.save(paths.targets / f"{aid}.npy", targets.astype(np.float16))
+        np.save(paths.features / f"{aid}.npy", features.astype(np.float16, copy=False))
+        np.save(paths.targets / f"{aid}.npy", targets.astype(np.float16, copy=False))
         np.save(paths.times / f"{aid}.npy", times)
 
-    # Construct the global window index.
-    pairs: List[np.ndarray] = []
-    end_times: List[np.ndarray] = []
-    for asset in assets:
-        aid = asset_to_id[asset]
-        times = np.load(paths.times / f"{aid}.npy")
-        total = times.shape[0]
-        max_start = total - (cfg.window + cfg.horizon) + 1
+        norm_acc.update(aid, features, targets)
+
+        max_start = total_rows - (cfg.window + cfg.horizon) + 1
         if max_start <= 0:
             continue
         starts = np.arange(0, max_start, dtype=np.int32)
-        ends = times[starts + cfg.window - 1].astype("datetime64[ns]")
+        window_end_times = times[starts + cfg.window - 1].astype("datetime64[ns]")
         pairs.append(np.stack([np.full_like(starts, aid), starts], axis=1))
-        end_times.append(ends)
+        end_times.append(window_end_times)
+        start_times.append(times[0])
+        stop_times.append(times[-1])
 
     if not pairs:
         raise RuntimeError("No valid context windows available across stations.")
@@ -275,87 +368,26 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
     np.save(paths.windows / "global_pairs.npy", global_pairs)
     np.save(paths.windows / "end_times.npy", global_end_times)
 
-    # Compute normalization statistics (per-station or global).
-    norm_stats: Dict[str, object]
-    if cfg.normalize_per_station:
-        norm_stats = {
-            "per_ticker": True,
-            "assets": assets,
-            "mean_x": [],
-            "std_x": [],
-            "mean_y": [],
-            "std_y": [],
-        }
-        for asset in assets:
-            aid = asset_to_id[asset]
-            features = np.load(paths.features / f"{aid}.npy").astype(np.float32)
-            targets = np.load(paths.targets / f"{aid}.npy").astype(np.float32)
-            mx = features.mean(axis=0, dtype=np.float64)
-            sx = features.std(axis=0, dtype=np.float64)
-            sx = np.where(sx == 0.0, 1.0, sx)
-            my = float(targets.mean(dtype=np.float64))
-            sy = float(targets.std(dtype=np.float64))
-            sy = 1.0 if sy == 0.0 else sy
-            norm_stats["mean_x"].append(mx.reshape(1, 1, -1).astype(np.float32).tolist())
-            norm_stats["std_x"].append(sx.reshape(1, 1, -1).astype(np.float32).tolist())
-            norm_stats["mean_y"].append(my)
-            norm_stats["std_y"].append(sy)
-    else:
-        total_count = 0
-        sum_x = None
-        sumsq_x = None
-        total_y = 0.0
-        total_y_sq = 0.0
-        total_y_count = 0
-        for asset in assets:
-            aid = asset_to_id[asset]
-            features = np.load(paths.features / f"{aid}.npy").astype(np.float32)
-            targets = np.load(paths.targets / f"{aid}.npy").astype(np.float32)
-            if sum_x is None:
-                sum_x = np.zeros(features.shape[1], dtype=np.float64)
-                sumsq_x = np.zeros(features.shape[1], dtype=np.float64)
-            sum_x += features.sum(axis=0, dtype=np.float64)
-            sumsq_x += np.square(features.astype(np.float64)).sum(axis=0)
-            total_count += features.shape[0]
-            total_y += float(targets.sum(dtype=np.float64))
-            total_y_sq += float(np.square(targets.astype(np.float64)).sum())
-            total_y_count += targets.shape[0]
+    norm_stats = norm_acc.finalize(assets)
 
-        if total_count == 0:
-            raise RuntimeError("Unable to compute normalization statistics (no samples).")
-
-        mean_x = (sum_x / total_count).astype(np.float32)
-        var_x = (sumsq_x / total_count) - np.square(mean_x.astype(np.float64))
-        var_x = np.maximum(var_x, 1e-12)
-        std_x = np.sqrt(var_x).astype(np.float32)
-        std_x[std_x == 0.0] = 1.0
-
-        mean_y = float(total_y / max(1, total_y_count))
-        var_y = max((total_y_sq / max(1, total_y_count)) - (mean_y ** 2), 1e-12)
-        std_y = float(np.sqrt(var_y))
-        std_y = 1.0 if std_y == 0.0 else std_y
-
-        norm_stats = {
-            "per_ticker": False,
-            "assets": assets,
-            "mean_x": mean_x.reshape(1, 1, -1).tolist(),
-            "std_x": std_x.reshape(1, 1, -1).tolist(),
-            "mean_y": mean_y,
-            "std_y": std_y,
-        }
+    dataset_start = min(start_times).astype("datetime64[s]") if start_times else None
+    dataset_end = max(stop_times).astype("datetime64[s]") if stop_times else None
 
     meta = {
         "dataset": "bms_air_quality",
+        "format": "indexcache_v1",
         "assets": assets,
         "asset2id": asset_to_id,
         "feature_cols": feature_cols,
         "target_col": TARGET_COLUMN,
         "window": int(cfg.window),
         "horizon": int(cfg.horizon),
-        "keep_time_meta": cfg.keep_time_meta,
+        "keep_time_meta": keep_time_meta,
         "normalize_per_ticker": cfg.normalize_per_station,
         "clamp_sigma": cfg.clamp_sigma,
         "freq": cfg.freq,
+        "start": str(dataset_start) if dataset_start is not None else None,
+        "end": str(dataset_end) if dataset_end is not None else None,
     }
 
     with paths.meta.open("w") as f:
