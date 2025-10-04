@@ -1,23 +1,33 @@
+"""Utilities for preparing and loading financial time-series datasets.
+
+The compact cache produced by :func:`prepare_features_and_index_cache` stores data
+under ``<data_dir>/cache_ratio_index`` using the following layout::
+
+    features_fp16/<asset_id>.npy   # [T, F] float16 feature matrix
+    targets_fp16/<asset_id>.npy    # [T] float16 target series
+    times/<asset_id>.npy           # [T] datetime64[ns] index
+    windows/global_pairs.npy       # [M, 2] int32 (asset_id, start_idx)
+    windows/end_times.npy          # [M] datetime64[ns] context end timestamps
+    meta.json                      # schema + feature configuration
+    norm_stats.json                # per-ticker or global normalization stats
 """
-Drop-in path names (under data_dir):
-    cache_ratio_index/
-      ├── features_fp16/<asset_id>.npy        # [T,F] float16
-      ├── targets_fp16/<asset_id>.npy         # [T]   float16 (target series)
-      ├── times/<asset_id>.npy                # [T]   datetime64[ns]
-      ├── windows/global_pairs.npy            # [M,2] int32: (asset_id, start_idx)
-      ├── windows/end_times.npy               # [M]   datetime64[ns] (end-of-context)
-      ├── meta.json                           # schema + feature cols + etc
-      └── norm_stats.json                     # per-ticker mean/std for X & Y
-"""
+
 from __future__ import annotations
+
+import gc
+import json
+import os
 from dataclasses import dataclass, field
-import os, json, gc
 from math import ceil as _ceil
-from typing import Dict, List, Optional, Sequence, Tuple
-import pandas as pd
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
 import numpy as np
+import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler as _Sampler
+from torch.utils.data import DataLoader, Dataset, Sampler as _Sampler
+
+PathLike = Union[str, os.PathLike[str]]
 
 # --------------------- Public configs (kept compatible) ---------------------
 
@@ -53,35 +63,88 @@ class FeatureConfig:
     include_entity_id_feature: bool = False
 
     def __post_init__(self) -> None:
-            """Ensure calendar configuration respects the calendar toggle."""
-            if self.if_calendar:
-                if self.calendar is None:
-                    self.calendar = CalendarConfig()
-            else:
-                self.calendar = None
+        """Ensure calendar configuration respects the calendar toggle."""
+        if self.if_calendar:
+            if self.calendar is None:
+                self.calendar = CalendarConfig()
+        else:
+            self.calendar = None
+
+
+@dataclass(frozen=True)
+class CachePaths:
+    """Helper for managing paths in the compact on-disk cache."""
+
+    data_dir: Path
+
+    @classmethod
+    def from_dir(cls, data_dir: PathLike) -> "CachePaths":
+        return cls(Path(data_dir).expanduser())
+
+    @property
+    def cache_root(self) -> Path:
+        return self.data_dir / "cache_ratio_index"
+
+    @property
+    def features(self) -> Path:
+        return self.cache_root / "features_fp16"
+
+    @property
+    def targets(self) -> Path:
+        return self.cache_root / "targets_fp16"
+
+    @property
+    def times(self) -> Path:
+        return self.cache_root / "times"
+
+    @property
+    def windows(self) -> Path:
+        return self.cache_root / "windows"
+
+    @property
+    def meta(self) -> Path:
+        return self.cache_root / "meta.json"
+
+    @property
+    def norm_stats(self) -> Path:
+        return self.cache_root / "norm_stats.json"
+
+    def ensure(self) -> None:
+        """Create all cache directories if they do not already exist."""
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+        self.features.mkdir(parents=True, exist_ok=True)
+        self.targets.mkdir(parents=True, exist_ok=True)
+        self.times.mkdir(parents=True, exist_ok=True)
+        self.windows.mkdir(parents=True, exist_ok=True)
             
 # --------------------- Lightweight stores ---------------------
 
-def _indexcache_dir(data_dir: str) -> str:
-    return os.path.join(data_dir, "cache_ratio_index")
+def _indexcache_dir(data_dir: PathLike) -> Path:
+    return CachePaths.from_dir(data_dir).cache_root
 
-def _features_dir(data_dir: str) -> str:
-    return os.path.join(_indexcache_dir(data_dir), "features_fp16")
 
-def _targets_dir(data_dir: str) -> str:
-    return os.path.join(_indexcache_dir(data_dir), "targets_fp16")
+def _features_dir(data_dir: PathLike) -> Path:
+    return CachePaths.from_dir(data_dir).features
 
-def _times_dir(data_dir: str) -> str:
-    return os.path.join(_indexcache_dir(data_dir), "times")
 
-def _windows_dir(data_dir: str) -> str:
-    return os.path.join(_indexcache_dir(data_dir), "windows")
+def _targets_dir(data_dir: PathLike) -> Path:
+    return CachePaths.from_dir(data_dir).targets
 
-def _meta_path(data_dir: str) -> str:
-    return os.path.join(_indexcache_dir(data_dir), "meta.json")
 
-def _norm_path(data_dir: str) -> str:
-    return os.path.join(_indexcache_dir(data_dir), "norm_stats.json")
+def _times_dir(data_dir: PathLike) -> Path:
+    return CachePaths.from_dir(data_dir).times
+
+
+def _windows_dir(data_dir: PathLike) -> Path:
+    return CachePaths.from_dir(data_dir).windows
+
+
+def _meta_path(data_dir: PathLike) -> Path:
+    return CachePaths.from_dir(data_dir).meta
+
+
+def _norm_path(data_dir: PathLike) -> Path:
+    return CachePaths.from_dir(data_dir).norm_stats
 
 # --------------------- Feature engineering (same semantics) ---------------------
 
@@ -149,7 +212,7 @@ def prepare_features_and_index_cache(
     window: int,
     horizon: int,
     data_dir: str = "./data",
-    feature_cfg: FeatureConfig = FeatureConfig(),
+    feature_cfg: Optional[FeatureConfig] = None,
     normalize_per_ticker: bool = True,
     clamp_sigma: float = 5.0,
     min_obs_buffer: int = 50,
@@ -171,14 +234,12 @@ def prepare_features_and_index_cache(
     except Exception as e:
         raise ImportError("pandas + yfinance required to prepare cache. pip install pandas yfinance") from e
 
+    feature_cfg = feature_cfg or FeatureConfig()
+
     rng = np.random.RandomState(seed)
-    os.makedirs(data_dir, exist_ok=True)
-    root = _indexcache_dir(data_dir)
-    os.makedirs(root, exist_ok=True)
-    os.makedirs(_features_dir(data_dir), exist_ok=True)
-    os.makedirs(_targets_dir(data_dir), exist_ok=True)
-    os.makedirs(_times_dir(data_dir), exist_ok=True)
-    os.makedirs(_windows_dir(data_dir), exist_ok=True)
+    paths = CachePaths.from_dir(data_dir)
+    paths.data_dir.mkdir(parents=True, exist_ok=True)
+    paths.ensure()
 
     # ---- download / load features per ticker (reuses your feature logic) ----
     need_price_cols = set(feature_cfg.price_fields) | {feature_cfg.target_field}
@@ -319,9 +380,9 @@ def prepare_features_and_index_cache(
         Y = df[target_col].to_numpy(dtype=np.float32, copy=False)
         times = df.index.to_numpy()
         # Write as float16 (2× smaller) – okay post-normalization/standardization
-        np.save(os.path.join(_features_dir(data_dir), f"{asset2id[a]}.npy"), X.astype(np.float16))
-        np.save(os.path.join(_targets_dir(data_dir),  f"{asset2id[a]}.npy"), Y.astype(np.float16))
-        np.save(os.path.join(_times_dir(data_dir),    f"{asset2id[a]}.npy"), times.astype('datetime64[ns]'))
+        np.save(paths.features / f"{asset2id[a]}.npy", X.astype(np.float16))
+        np.save(paths.targets / f"{asset2id[a]}.npy", Y.astype(np.float16))
+        np.save(paths.times / f"{asset2id[a]}.npy", times.astype("datetime64[ns]"))
 
     # ---- Precompute a *global* window index (small) ----
     # This is optional but speeds up loader start; also lets us cap max_windows_per_ticker deterministically
@@ -329,7 +390,7 @@ def prepare_features_and_index_cache(
     ends:  List[np.ndarray] = []   # end-of-context times
     for a in assets:
         aid = asset2id[a]
-        times = np.load(os.path.join(_times_dir(data_dir), f"{aid}.npy"))
+        times = np.load(paths.times / f"{aid}.npy")
         T = times.shape[0]
         if T < (window + horizon):
             continue
@@ -347,8 +408,8 @@ def prepare_features_and_index_cache(
     end_times    = np.concatenate(ends,  axis=0).astype('datetime64[ns]')  # [M]
 
     # Persist tiny index
-    np.save(os.path.join(_windows_dir(data_dir), "global_pairs.npy"), global_pairs)
-    np.save(os.path.join(_windows_dir(data_dir), "end_times.npy"), end_times)
+    np.save(paths.windows / "global_pairs.npy", global_pairs)
+    np.save(paths.windows / "end_times.npy", end_times)
 
     # ---- Norm stats (per-ticker, scalar Y) ----
     norm_stats = {
@@ -360,8 +421,8 @@ def prepare_features_and_index_cache(
     if normalize_per_ticker:
         for a in assets:
             aid = asset2id[a]
-            Xf = np.load(os.path.join(_features_dir(data_dir), f"{aid}.npy"), mmap_mode='r')
-            Yf = np.load(os.path.join(_targets_dir(data_dir),  f"{aid}.npy"), mmap_mode='r')
+            Xf = np.load(paths.features / f"{aid}.npy", mmap_mode="r")
+            Yf = np.load(paths.targets / f"{aid}.npy", mmap_mode="r")
             mx = Xf.astype(np.float32).mean(axis=0, keepdims=True)[None, ...]   # [1,1,F]
             sx = Xf.astype(np.float32).std(axis=0, keepdims=True)[None, ...]
             sx[sx == 0] = 1.0
@@ -374,8 +435,8 @@ def prepare_features_and_index_cache(
         Xs, Ys = [], []
         for a in assets:
             aid = asset2id[a]
-            Xs.append(np.load(os.path.join(_features_dir(data_dir), f"{aid}.npy"), mmap_mode='r').astype(np.float32))
-            Ys.append(np.load(os.path.join(_targets_dir(data_dir),  f"{aid}.npy"), mmap_mode='r').astype(np.float32))
+            Xs.append(np.load(paths.features / f"{aid}.npy", mmap_mode="r").astype(np.float32))
+            Ys.append(np.load(paths.targets / f"{aid}.npy", mmap_mode="r").astype(np.float32))
         Xcat = np.concatenate(Xs, axis=0)
         Ycat = np.concatenate(Ys, axis=0)
         mx = Xcat.mean(axis=0, keepdims=True)[None, ...]
@@ -384,7 +445,7 @@ def prepare_features_and_index_cache(
         norm_stats['mean_x'] = mx.tolist(); norm_stats['std_x'] = sx.tolist()
         norm_stats['mean_y'] = my;           norm_stats['std_y'] = sy
         del Xcat, Ycat
-    with open(_norm_path(data_dir), 'w') as f:
+    with paths.norm_stats.open("w") as f:
         json.dump(norm_stats, f)
 
     # ---- Meta
@@ -418,7 +479,7 @@ def prepare_features_and_index_cache(
         'seed': int(seed),
         'keep_time_meta': keep_time_meta,
     }
-    with open(_meta_path(data_dir), 'w') as f:
+    with paths.meta.open("w") as f:
         json.dump(meta, f, indent=2)
 
     # Free big refs
@@ -443,19 +504,19 @@ def rebuild_window_index_only(
     Returns the total number of indexed windows.
     """
     import shutil
-    base = _indexcache_dir(data_dir)
-    times_dir = _times_dir(data_dir)
-    windows_dir = _windows_dir(data_dir)
-    meta_path = _meta_path(data_dir)
+    paths = CachePaths.from_dir(data_dir)
+    times_dir = paths.times
+    windows_dir = paths.windows
+    meta_path = paths.meta
 
-    with open(meta_path, "r") as f:
+    with meta_path.open("r") as f:
         meta = json.load(f)
     assets = meta["assets"]
 
     pairs_list, ends_list = [], []
     for aid in range(len(assets)):
-        tp = os.path.join(times_dir, f"{aid}.npy")
-        if not os.path.exists(tp):
+        tp = times_dir / f"{aid}.npy"
+        if not tp.exists():
             continue
         times = np.load(tp)  # datetime64[ns]
         T = int(times.shape[0])
@@ -474,13 +535,13 @@ def rebuild_window_index_only(
     global_pairs = np.concatenate(pairs_list, axis=0).astype(np.int32)
     end_times = np.concatenate(ends_list, axis=0).astype("datetime64[ns]")
 
-    os.makedirs(windows_dir, exist_ok=True)
-    gp_path = os.path.join(windows_dir, "global_pairs.npy")
-    et_path = os.path.join(windows_dir, "end_times.npy")
+    windows_dir.mkdir(parents=True, exist_ok=True)
+    gp_path = windows_dir / "global_pairs.npy"
+    et_path = windows_dir / "end_times.npy"
     if backup_old:
         for p in (gp_path, et_path):
-            if os.path.exists(p):
-                shutil.move(p, p + ".bak")
+            if p.exists():
+                shutil.move(str(p), str(p.with_suffix(p.suffix + ".bak")))
 
     np.save(gp_path, global_pairs)
     np.save(et_path, end_times)
@@ -488,7 +549,7 @@ def rebuild_window_index_only(
     if update_meta:
         meta["window"] = int(window)
         meta["horizon"] = int(horizon)
-        with open(meta_path, "w") as f:
+        with meta_path.open("w") as f:
             json.dump(meta, f, indent=2)
 
     return int(global_pairs.shape[0])
@@ -628,6 +689,7 @@ class _IndexBackedDataset(Dataset):
         self.pairs = pairs
         self.assets = assets
         self.data_dir = data_dir
+        self.paths = CachePaths.from_dir(data_dir)
         self.window = int(window)
         self.horizon = int(horizon)
         self.regression = bool(regression)
@@ -650,9 +712,9 @@ class _IndexBackedDataset(Dataset):
 
     def _get_arrays(self, aid: int):
         if aid not in self._X:
-            self._X[aid] = np.load(os.path.join(_features_dir(self.data_dir), f"{aid}.npy"), mmap_mode='r')
-            self._Y[aid] = np.load(os.path.join(_targets_dir(self.data_dir),  f"{aid}.npy"), mmap_mode='r')
-            self._T[aid] = np.load(os.path.join(_times_dir(self.data_dir),    f"{aid}.npy"), mmap_mode='r')
+            self._X[aid] = np.load(self.paths.features / f"{aid}.npy", mmap_mode="r")
+            self._Y[aid] = np.load(self.paths.targets / f"{aid}.npy", mmap_mode="r")
+            self._T[aid] = np.load(self.paths.times / f"{aid}.npy", mmap_mode="r")
         return self._X[aid], self._Y[aid], self._T[aid]
 
     def __getitem__(self, i: int):
@@ -742,7 +804,8 @@ def _compute_train_only_norm_stats(
     Returns a dict like norm_stats.json or None if no train rows exist.
     """
     import numpy as _np
-    import os as _os
+
+    paths = CachePaths.from_dir(data_dir)
 
     last_ctx_end = _np.full(len(assets), -1, dtype=_np.int64)
     last_label_end = _np.full(len(assets), -1, dtype=_np.int64)
@@ -771,9 +834,9 @@ def _compute_train_only_norm_stats(
         g_y_sumsq = 0.0
 
         for aid in range(len(assets)):
-            fp = _os.path.join(_features_dir(data_dir), f"{aid}.npy")
-            yp = _os.path.join(_targets_dir(data_dir),  f"{aid}.npy")
-            if not (_os.path.exists(fp) and _os.path.exists(yp)):
+            fp = paths.features / f"{aid}.npy"
+            yp = paths.targets / f"{aid}.npy"
+            if not (fp.exists() and yp.exists()):
                 mean_x.append(_np.zeros((1,1,feature_dim), dtype=_np.float32).tolist())
                 std_x.append(_np.ones((1,1,feature_dim), dtype=_np.float32).tolist())
                 mean_y.append(0.0); std_y.append(1.0)
@@ -846,8 +909,8 @@ def _compute_train_only_norm_stats(
     for aid in range(len(assets)):
         if not has_train[aid]:
             continue
-        Xf = _np.load(_os.path.join(_features_dir(data_dir), f"{aid}.npy"), mmap_mode='r').astype(_np.float32)
-        Yf = _np.load(_os.path.join(_targets_dir(data_dir),  f"{aid}.npy"), mmap_mode='r').astype(_np.float32)
+        Xf = _np.load(paths.features / f"{aid}.npy", mmap_mode='r').astype(_np.float32)
+        Yf = _np.load(paths.targets / f"{aid}.npy", mmap_mode='r').astype(_np.float32)
         upto_x = int(last_ctx_end[aid]) + 1
         upto_y = int(last_label_end[aid]) + 1 if last_label_end[aid] >= 0 else 0
         upto_y = min(upto_y, Yf.shape[0])
@@ -907,11 +970,14 @@ def load_dataloaders_with_ratio_split(
     window: Optional[int] = None,
     horizon: Optional[int] = None
 ):
+    paths = CachePaths.from_dir(data_dir)
+
     # Read meta + norm
-    with open(_meta_path(data_dir), 'r') as f:
+    with paths.meta.open('r') as f:
         meta = json.load(f)
     assets = meta['assets']
-    base_window = int(meta['window']);base_horizon = int(meta['horizon'])
+    base_window = int(meta['window'])
+    base_horizon = int(meta['horizon'])
     window = int(window if window is not None else base_window)
     horizon = int(horizon if horizon is not None else base_horizon)
     if window > base_window or horizon > base_horizon:
@@ -920,7 +986,7 @@ def load_dataloaders_with_ratio_split(
             )
 
     keep_time_meta = meta.get('keep_time_meta', 'end')
-    with open(_norm_path(data_dir), 'r') as f:
+    with paths.norm_stats.open('r') as f:
         norm_stats = json.load(f)
 
     # Collate (levels + first-diff), grouped-by-end if requested later
@@ -932,8 +998,8 @@ def load_dataloaders_with_ratio_split(
 
     
     # Load small global index
-    pairs = np.load(os.path.join(_windows_dir(data_dir), 'global_pairs.npy'))  # [M,2]
-    end_times = np.load(os.path.join(_windows_dir(data_dir), 'end_times.npy')) # [M]
+    pairs = np.load(paths.windows / 'global_pairs.npy')  # [M,2]
+    end_times = np.load(paths.windows / 'end_times.npy')  # [M]
     
     # --- Coverage pre-filter (unconditional) so ratios apply to the filtered set ---
     if coverage_per_window > 0.0:
