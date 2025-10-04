@@ -22,7 +22,7 @@ import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, TYPE_CHECKING, Union
 
 import numpy as np
 import pandas as pd
@@ -44,7 +44,12 @@ DATA_URL = (
 ARCHIVE_ROOT = "PRSA_Data_20130301-20170228"
 TARGET_COLUMN = "PM2.5"
 
-PathLike = Union[str, os.PathLike[str]]
+if TYPE_CHECKING:
+    from os import PathLike as _PathLike
+
+    PathLike = Union[str, _PathLike[str]]
+else:
+    PathLike = Union[str, os.PathLike]
 
 
 @dataclass
