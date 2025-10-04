@@ -30,6 +30,7 @@ import requests
 from .fin_dataset import (
     CachePaths,
     load_dataloaders_with_ratio_split as _load_fin_ratio_split,
+    rebuild_window_index_only as _rebuild_window_index_only,
 )
 
 # ---------------------------------------------------------------------------
@@ -378,6 +379,91 @@ def load_bms_dataloaders_with_ratio_split(
     return _load_fin_ratio_split(data_dir=data_dir, **loader_kwargs)
 
 
+def _validate_bms_cache(paths: CachePaths) -> Dict[str, object]:
+    """Read and validate the cache metadata, returning the parsed JSON."""
+
+    if not paths.meta.exists():
+        raise FileNotFoundError(
+            f"Cache meta file not found at '{paths.meta}'. Did you run prepare_bms_air_cache()?"
+        )
+
+    with paths.meta.open("r") as f:
+        meta: Dict[str, object] = json.load(f)
+
+    dataset = meta.get("dataset")
+    if dataset not in {"bms_air_quality", "bms_air_dataset"}:
+        raise ValueError(
+            f"The cache located at '{paths.cache_root}' does not correspond to the BMS "
+            "air-quality dataset."
+        )
+
+    return meta
+
+
+def run_experiment(
+    data_dir: PathLike,
+    K: int,
+    H: int,
+    *,
+    ratios=(0.7, 0.1, 0.2),
+    per_asset: bool = True,
+    date_batching: bool = True,
+    coverage: float = 0.85,
+    dates_per_batch: int = 30,
+    batch_size: int = 64,
+    norm: str = "train_only",
+    reindex: bool = True,
+    shuffle_train: bool = True,
+    num_workers: int = 0,
+    pin_memory: Optional[bool] = None,
+):
+    """Build train/val/test loaders for the prepared BMS cache.
+
+    This mirrors :func:`Dataset.fin_dataset.run_experiment` so the training
+    pipeline can swap between the financial and BMS datasets transparently.
+    """
+
+    paths = CachePaths.from_dir(data_dir)
+    meta = _validate_bms_cache(paths)
+    base_window = int(meta.get("window", K))
+    base_horizon = int(meta.get("horizon", H))
+    if K > base_window or H > base_horizon:
+        raise ValueError(
+            "Requested (window, horizon) exceed the cached configuration. "
+            "Re-run prepare_bms_air_cache with larger values first."
+        )
+
+    if reindex:
+        _rebuild_window_index_only(
+            data_dir,
+            window=K,
+            horizon=H,
+            update_meta=False,
+            backup_old=False,
+        )
+
+    train_dl, val_dl, test_dl, lengths = load_bms_dataloaders_with_ratio_split(
+        data_dir=data_dir,
+        train_ratio=ratios[0],
+        val_ratio=ratios[1],
+        test_ratio=ratios[2],
+        batch_size=batch_size,
+        regression=True,
+        per_asset=per_asset,
+        norm_scope=norm,
+        date_batching=date_batching,
+        coverage_per_window=coverage,
+        dates_per_batch=dates_per_batch,
+        window=K,
+        horizon=H,
+        shuffle_train=shuffle_train,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+    return train_dl, val_dl, test_dl, lengths
+
+
 __all__ = [
     "BMSCacheConfig",
     "download_bms_air_dataset",
@@ -385,5 +471,6 @@ __all__ = [
     "clean_bms_data",
     "prepare_bms_air_cache",
     "load_bms_dataloaders_with_ratio_split",
+    "run_experiment",
 ]
 
