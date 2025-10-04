@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -61,7 +62,14 @@ def main() -> None:
     log_path = Path("pred_performance_log.txt")
     print(f"Logging downstream performance to {log_path.resolve()}")
 
-    with log_path.open("w", encoding="utf-8") as log_file:
+    log_mode = "a" if log_path.exists() else "w"
+    with log_path.open(log_mode, encoding="utf-8") as log_file:
+        if log_path.exists() and log_path.stat().st_size > 0:
+            log_file.write("\n")
+        log_file.write(
+            f"=== Run started {datetime.utcnow().isoformat(timespec='seconds')}Z ===\n"
+        )
+        log_file.flush()
         for pred in preds:
             print("\n========================================")
             print(f"Running training pipeline for PRED={pred}")
@@ -158,6 +166,7 @@ def main() -> None:
             log_file.write(
                 f"  checkpoint={llapdit_stats.get('best_checkpoint') or llapdit_stats.get('loaded_checkpoint')}\n"
             )
+            log_file.flush()
             log_file.write(f"  eval_crps={_fmt_optional(eval_stats.get('crps'))}\n")
             log_file.write(f"  eval_mae={_fmt_optional(eval_stats.get('mae'))}\n")
             log_file.write(f"  eval_mse={_fmt_optional(eval_stats.get('mse'))}\n")
