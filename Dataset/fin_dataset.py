@@ -155,25 +155,25 @@ def _norm_path(data_dir: PathLike) -> Path:
 
 _EPS = 1e-6
 
-def _mask_nonpos(s: 'pd.Series') -> 'pd.Series':
+def _mask_nonpos(s: pd.Series) -> pd.Series:
     return s.where((s > 0) & np.isfinite(s))
 
-def _safe_log_series(s: 'pd.Series') -> 'pd.Series':
+def _safe_log_series(s: pd.Series) -> pd.Series:
     return np.log(_mask_nonpos(s))
 
-def _safe_log1p_series(s: 'pd.Series') -> 'pd.Series':
+def _safe_log1p_series(s: pd.Series) -> pd.Series:
     return np.log1p(s.clip(lower=-1 + _EPS))
 
-def _safe_pct_change(s: 'pd.Series') -> 'pd.Series':
+def _safe_pct_change(s: pd.Series) -> pd.Series:
     return s.pct_change().replace([np.inf, -np.inf], np.nan)
 
-def _log_return(s: 'pd.Series') -> 'pd.Series':
+def _log_return(s: pd.Series) -> pd.Series:
     return _safe_log_series(s).diff()
 
-def _ewma_vol(ret: 'pd.Series', span: int = 20) -> 'pd.Series':
+def _ewma_vol(ret: pd.Series, span: int = 20) -> pd.Series:
     return ret.pow(2).ewm(span=span, adjust=False).mean().pow(0.5)
 
-def _delta_log_volume(vol: 'pd.Series') -> 'pd.Series':
+def _delta_log_volume(vol: pd.Series) -> pd.Series:
     v = vol.replace([0, np.inf, -np.inf], np.nan)
     return _safe_log_series(v).diff()
 
@@ -183,7 +183,7 @@ def _cyclical_from_int(values: np.ndarray, period: int):
     return np.sin(ang).astype(np.float32), np.cos(ang).astype(np.float32)
 
 
-def build_calendar_frame(idx: 'pd.DatetimeIndex', cfg: CalendarConfig) -> 'pd.DataFrame':
+def build_calendar_frame(idx: pd.DatetimeIndex, cfg: CalendarConfig) -> pd.DataFrame:
     import pandas as pd
     cols = {}
     if cfg.include_dow:
@@ -263,7 +263,7 @@ def prepare_features_and_index_cache(
         # normalize to (field, ticker)
         raw = raw.swaplevel(0, 1, axis=1).sort_index(axis=1)
 
-    def get_ticker_df(t: str) -> 'pd.DataFrame':
+    def get_ticker_df(t: str) -> pd.DataFrame:
         if getattr(raw, "columns", None) is not None and getattr(raw.columns, "nlevels", 1) > 1:
             try:
                 df = raw.xs(t, axis=1, level=1)
@@ -283,7 +283,7 @@ def prepare_features_and_index_cache(
         except Exception:
             proxy_ret = None
 
-    def median_dollar_volume(df: 'pd.DataFrame', a: str, b: str) -> float:
+    def median_dollar_volume(df: pd.DataFrame, a: str, b: str) -> float:
         sub = df.loc[a:b]
         if 'Close' not in sub or 'Volume' not in sub:
             return 0.0
@@ -299,7 +299,7 @@ def prepare_features_and_index_cache(
         ranks.sort(key=lambda x: x[1], reverse=True)
         tickers = [t for t, _ in ranks[:top_n_by_dollar_vol]]
 
-    def build_feature_frame(df: 'pd.DataFrame') -> 'pd.DataFrame':
+    def build_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
         feat = {}
         for field in feature_cfg.price_fields:
             if field in df:
@@ -339,7 +339,7 @@ def prepare_features_and_index_cache(
         return out
 
     # ---- Build per-ticker features ----
-    per_ticker: Dict[str, 'pd.DataFrame'] = {}
+    per_ticker: Dict[str, pd.DataFrame] = {}
     min_obs = window + horizon + min_obs_buffer
     for t in tickers:
         if t == feature_cfg.market_proxy:
