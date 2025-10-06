@@ -59,13 +59,17 @@ OUTCOME_FILENAMES = {
 
 TARGET_COLUMN = "future_vital"
 
+DEFAULT_FREQ = "1H"
+MAX_WINDOW = 72
+MAX_HORIZON = 48
+
 
 @dataclass
 class PhysioNetCacheConfig:
     """Configuration used when building the compact PhysioNet cache."""
 
-    window: int
-    horizon: int
+    window: int = MAX_WINDOW
+    horizon: int = MAX_HORIZON
     data_dir: PathLike = "./physionet_cinc_cache"
     raw_data_dir: Optional[PathLike] = "./physionet_cinc_raw"
     subset: str = "set-a"
@@ -74,7 +78,7 @@ class PhysioNetCacheConfig:
     normalize_per_patient: bool = True
     clamp_sigma: float = 5.0
     keep_time_meta: str = "end"  # "full" | "end" | "none"
-    freq: str = "1H"
+    freq: str = DEFAULT_FREQ
     min_minutes: int = 60
     min_coverage: float = 0.6
     max_patients: Optional[int] = None
@@ -310,8 +314,16 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
 
     if cfg.window <= 0:
         raise ValueError("window must be a positive integer")
+    if cfg.window > MAX_WINDOW:
+        raise ValueError(
+            f"window={cfg.window} exceeds the supported maximum of {MAX_WINDOW}."
+        )
     if cfg.horizon < 0:
         raise ValueError("horizon must be non-negative")
+    if cfg.horizon > MAX_HORIZON:
+        raise ValueError(
+            f"horizon={cfg.horizon} exceeds the supported maximum of {MAX_HORIZON}."
+        )
 
     keep_time_meta = cfg.keep_time_meta.lower()
     if keep_time_meta not in {"full", "end", "none"}:
@@ -419,6 +431,8 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
         "subset": cfg.subset,
         "window": int(cfg.window),
         "horizon": int(cfg.horizon),
+        "max_window": int(MAX_WINDOW),
+        "max_horizon": int(MAX_HORIZON),
         "assets": assets,
         "feature_cols": feature_cols,
         "target_column": TARGET_COLUMN,
@@ -493,18 +507,29 @@ def run_experiment(
     meta = _validate_physionet_cache(paths)
     base_window = int(meta.get("window", K))
     base_horizon = int(meta.get("horizon", H))
-    if K > base_window or H > base_horizon:
+    max_window = int(meta.get("max_window", base_window))
+    max_horizon = int(meta.get("max_horizon", base_horizon))
+
+    if K > max_window or H > max_horizon:
         raise ValueError(
-            "Requested (window, horizon) exceed the cached configuration. Re-run prepare_physionet_cinc_cache with larger values first."
+            "Requested (window, horizon) exceed the cached configuration. "
+            "Re-run prepare_physionet_cinc_cache with larger values first."
         )
 
-    if reindex:
+    if reindex and (K != base_window or H != base_horizon):
         _rebuild_window_index_only(
             data_dir,
             window=K,
             horizon=H,
-            update_meta=False,
+            update_meta=True,
             backup_old=False,
+        )
+        base_window, base_horizon = K, H
+
+    elif not reindex and (K > base_window or H > base_horizon):
+        raise ValueError(
+            "Requested (window, horizon) exceed the currently indexed configuration. "
+            "Enable reindex=True to rebuild within the cached maximums."
         )
 
     train_dl, val_dl, test_dl, lengths = load_physionet_dataloaders_with_ratio_split(
