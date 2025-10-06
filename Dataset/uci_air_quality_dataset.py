@@ -8,11 +8,12 @@ additional glue code.
 
 The dataset contains hourly air quality measurements collected by a single
 monitoring station in an Italian city.  We model the future concentration of
-``C6H6(GT)`` (benzene) as the regression target while the context features
-include the remaining pollutant and meteorological readings provided by the
-original dataset.  Missing values are denoted with ``-200`` in the raw files;
-the cleaning pipeline replaces those entries with ``NaN`` and performs
-time-based interpolation followed by forward/backward filling.
+``NO2(GT)`` (nitrogen dioxide) as the regression target while the context
+features include the remaining pollutant and meteorological readings provided
+by the original dataset.  Missing values are denoted with ``-200`` in the raw
+files; the cleaning pipeline replaces those entries with ``NaN`` and performs
+time-based interpolation followed by forward/backward filling.  The processed
+panel is resampled at one-hour intervals by default.
 """
 
 from __future__ import annotations
@@ -49,7 +50,10 @@ else:
 
 DATA_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00360/AirQualityUCI.zip"
 ARCHIVE_CSV_NAME = "AirQualityUCI.csv"
-TARGET_COLUMN = "C6H6(GT)"
+TARGET_COLUMN = "NO2(GT)"
+DEFAULT_FREQ = "1H"
+MAX_LOOKBACK = 336
+MAX_HORIZON = 336
 DEFAULT_FEATURE_COLUMNS: Tuple[str, ...] = (
     "CO(GT)",
     "PT08.S1(CO)",
@@ -76,7 +80,7 @@ class UCIAirCacheConfig:
     horizon: int
     data_dir: PathLike = "./uci_air_cache"
     raw_data_dir: Optional[PathLike] = "./uci_air_quality_raw"
-    freq: str = "H"
+    freq: str = DEFAULT_FREQ
     target_column: str = TARGET_COLUMN
     feature_columns: Optional[Sequence[str]] = None
     normalize_per_asset: bool = False
@@ -194,7 +198,7 @@ def load_raw_uci_air_quality(data_path: PathLike) -> pd.DataFrame:
 def clean_uci_air_quality(
     df: pd.DataFrame,
     *,
-    freq: str = "H",
+    freq: str = DEFAULT_FREQ,
     feature_columns: Optional[Sequence[str]] = None,
     target_column: str = TARGET_COLUMN,
 ) -> pd.DataFrame:
@@ -332,12 +336,20 @@ class _NormStatsAccumulator:
 
 
 def prepare_uci_air_cache(cfg: UCIAirCacheConfig) -> Mapping[str, List[str]]:
-    """Prepare the compact cache with context features and benzene targets."""
+    """Prepare the compact cache with context features and nitrogen-dioxide targets."""
 
     if cfg.window <= 0:
         raise ValueError("window must be a positive integer")
     if cfg.horizon < 0:
         raise ValueError("horizon must be non-negative")
+    if cfg.window > MAX_LOOKBACK:
+        raise ValueError(
+            f"window must be less than or equal to {MAX_LOOKBACK} for the UCI Air Quality dataset"
+        )
+    if cfg.horizon > MAX_HORIZON:
+        raise ValueError(
+            f"horizon must be less than or equal to {MAX_HORIZON} for the UCI Air Quality dataset"
+        )
 
     keep_time_meta = cfg.keep_time_meta.lower()
     if keep_time_meta not in {"full", "end", "none"}:
@@ -410,6 +422,8 @@ def prepare_uci_air_cache(cfg: UCIAirCacheConfig) -> Mapping[str, List[str]]:
         "target_col": cfg.target_column,
         "window": int(cfg.window),
         "horizon": int(cfg.horizon),
+        "max_window": MAX_LOOKBACK,
+        "max_horizon": MAX_HORIZON,
         "keep_time_meta": keep_time_meta,
         "normalize_per_ticker": cfg.normalize_per_asset,
         "clamp_sigma": cfg.clamp_sigma,
@@ -479,17 +493,38 @@ def run_experiment(
 ):
     """Build train/val/test loaders for the prepared UCI Air Quality cache."""
 
+    if K <= 0:
+        raise ValueError("K (lookback window) must be a positive integer")
+    if H < 0:
+        raise ValueError("H (forecast horizon) must be non-negative")
+    if K > MAX_LOOKBACK or H > MAX_HORIZON:
+        raise ValueError(
+            f"Requested (window, horizon) must not exceed ({MAX_LOOKBACK}, {MAX_HORIZON})."
+        )
+
     paths = CachePaths.from_dir(data_dir)
     meta = _validate_uci_cache(paths)
-    base_window = int(meta.get("window", K))
-    base_horizon = int(meta.get("horizon", H))
-    if K > base_window or H > base_horizon:
+    max_window = int(meta.get("max_window", MAX_LOOKBACK))
+    max_horizon = int(meta.get("max_horizon", MAX_HORIZON))
+    if K > max_window or H > max_horizon:
         raise ValueError(
             "Requested (window, horizon) exceed the cached configuration. "
             "Re-run prepare_uci_air_cache with larger values first."
         )
 
-    if reindex:
+    base_window = int(meta.get("window", K))
+    base_horizon = int(meta.get("horizon", H))
+
+    needs_update = K != base_window or H != base_horizon
+    if needs_update:
+        _rebuild_window_index_only(
+            data_dir,
+            window=K,
+            horizon=H,
+            update_meta=True,
+            backup_old=False,
+        )
+    elif reindex:
         _rebuild_window_index_only(
             data_dir,
             window=K,
