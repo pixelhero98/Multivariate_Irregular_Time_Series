@@ -46,7 +46,7 @@ TARGET_COLUMN = "PM2.5"
 
 # Default configuration parameters required by the training pipeline.
 DEFAULT_SAMPLE_FREQ = "H"  # hourly resolution
-MAX_LOOKBACK = 168  # maximum context window (K)
+MAX_LOOKBACK = 336  # maximum context window (K)
 MAX_HORIZON = 168  # maximum forecasting horizon (H)
 
 if TYPE_CHECKING:
@@ -479,7 +479,7 @@ def _validate_bms_cache(paths: CachePaths) -> Tuple[Dict[str, object], bool]:
     max_horizon = int(meta.get("max_horizon", MAX_HORIZON))
     if max_window > MAX_LOOKBACK or max_horizon > MAX_HORIZON:
         raise ValueError(
-            "Cached maximum window/horizon exceed the supported 168 hour limit."
+            "Cached maximum window/horizon exceed the supported (336, 168) hour limit."
         )
     if meta.get("max_window") != MAX_LOOKBACK:
         meta["max_window"] = MAX_LOOKBACK
