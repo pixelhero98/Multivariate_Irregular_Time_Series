@@ -22,7 +22,7 @@ import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, TYPE_CHECKING, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, Union
 
 import numpy as np
 import pandas as pd
@@ -44,6 +44,11 @@ DATA_URL = (
 ARCHIVE_ROOT = "PRSA_Data_20130301-20170228"
 TARGET_COLUMN = "PM2.5"
 
+# Default configuration parameters required by the training pipeline.
+DEFAULT_SAMPLE_FREQ = "H"  # hourly resolution
+MAX_LOOKBACK = 168  # maximum context window (K)
+MAX_HORIZON = 168  # maximum forecasting horizon (H)
+
 if TYPE_CHECKING:
     from os import PathLike as _PathLike
 
@@ -56,14 +61,14 @@ else:
 class BMSCacheConfig:
     """Configuration used when building the compact cache."""
 
-    window: int
-    horizon: int
+    window: int = MAX_LOOKBACK
+    horizon: int = MAX_HORIZON
     data_dir: PathLike = "./bms_air_cache"
     raw_data_dir: Optional[PathLike] = "./bms_air_quality_data"
     normalize_per_station: bool = True
     clamp_sigma: float = 5.0
     keep_time_meta: str = "end"  # "full" | "end" | "none"
-    freq: str = "H"  # hourly resolution
+    freq: str = DEFAULT_SAMPLE_FREQ
     stations: Optional[Sequence[str]] = None
     overwrite: bool = False
 
@@ -160,7 +165,7 @@ def clean_bms_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def _build_station_frames(
     df: pd.DataFrame,
-    freq: str = "H",
+    freq: str = DEFAULT_SAMPLE_FREQ,
     stations: Optional[Sequence[str]] = None,
 ) -> Dict[str, pd.DataFrame]:
     """Transform the long dataframe into per-station panels aligned on time."""
@@ -297,6 +302,14 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
         raise ValueError("window must be a positive integer")
     if cfg.horizon < 0:
         raise ValueError("horizon must be non-negative")
+    if cfg.window > MAX_LOOKBACK:
+        raise ValueError(
+            f"window must be <= {MAX_LOOKBACK} for the BMS air-quality dataset"
+        )
+    if cfg.horizon > MAX_HORIZON:
+        raise ValueError(
+            f"horizon must be <= {MAX_HORIZON} for the BMS air-quality dataset"
+        )
     keep_time_meta = cfg.keep_time_meta.lower()
     if keep_time_meta not in {"full", "end", "none"}:
         raise ValueError("keep_time_meta must be one of {'full', 'end', 'none'}")
@@ -387,10 +400,12 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
         "target_col": TARGET_COLUMN,
         "window": int(cfg.window),
         "horizon": int(cfg.horizon),
+        "max_window": MAX_LOOKBACK,
+        "max_horizon": MAX_HORIZON,
         "keep_time_meta": keep_time_meta,
         "normalize_per_ticker": cfg.normalize_per_station,
         "clamp_sigma": cfg.clamp_sigma,
-        "freq": cfg.freq,
+        "freq": cfg.freq or DEFAULT_SAMPLE_FREQ,
         "start": str(dataset_start) if dataset_start is not None else None,
         "end": str(dataset_end) if dataset_end is not None else None,
     }
@@ -416,8 +431,15 @@ def load_bms_dataloaders_with_ratio_split(
     return _load_fin_ratio_split(data_dir=data_dir, **loader_kwargs)
 
 
-def _validate_bms_cache(paths: CachePaths) -> Dict[str, object]:
-    """Read and validate the cache metadata, returning the parsed JSON."""
+def _validate_bms_cache(paths: CachePaths) -> Tuple[Dict[str, object], bool]:
+    """Read and validate the cache metadata, returning the parsed JSON.
+
+    Returns
+    -------
+    Tuple[Dict[str, object], bool]
+        The parsed metadata and a flag indicating whether additional keys were
+        added during validation (meaning the metadata file should be rewritten).
+    """
 
     if not paths.meta.exists():
         raise FileNotFoundError(
@@ -434,13 +456,45 @@ def _validate_bms_cache(paths: CachePaths) -> Dict[str, object]:
             "air-quality dataset."
         )
 
-    return meta
+    target_col = meta.get("target_col")
+    needs_update = False
+    if target_col is None:
+        meta["target_col"] = TARGET_COLUMN
+        needs_update = True
+    elif target_col != TARGET_COLUMN:
+        raise ValueError(
+            "The prepared cache does not use PM2.5 as the prediction target."
+        )
+
+    freq = meta.get("freq", DEFAULT_SAMPLE_FREQ)
+    if freq != DEFAULT_SAMPLE_FREQ:
+        raise ValueError(
+            "The BMS air-quality cache must use hourly sampling intervals."
+        )
+    if "freq" not in meta:
+        meta["freq"] = DEFAULT_SAMPLE_FREQ
+        needs_update = True
+
+    max_window = int(meta.get("max_window", MAX_LOOKBACK))
+    max_horizon = int(meta.get("max_horizon", MAX_HORIZON))
+    if max_window > MAX_LOOKBACK or max_horizon > MAX_HORIZON:
+        raise ValueError(
+            "Cached maximum window/horizon exceed the supported 168 hour limit."
+        )
+    if meta.get("max_window") != MAX_LOOKBACK:
+        meta["max_window"] = MAX_LOOKBACK
+        needs_update = True
+    if meta.get("max_horizon") != MAX_HORIZON:
+        meta["max_horizon"] = MAX_HORIZON
+        needs_update = True
+
+    return meta, needs_update
 
 
 def run_experiment(
     data_dir: PathLike,
-    K: int,
-    H: int,
+    K: Optional[int] = None,
+    H: Optional[int] = None,
     *,
     ratios=(0.7, 0.1, 0.2),
     per_asset: bool = True,
@@ -461,16 +515,28 @@ def run_experiment(
     """
 
     paths = CachePaths.from_dir(data_dir)
-    meta = _validate_bms_cache(paths)
-    base_window = int(meta.get("window", K))
-    base_horizon = int(meta.get("horizon", H))
-    if K > base_window or H > base_horizon:
+    meta, meta_needs_update = _validate_bms_cache(paths)
+    max_window = int(meta.get("max_window", MAX_LOOKBACK))
+    max_horizon = int(meta.get("max_horizon", MAX_HORIZON))
+    cached_window = int(meta.get("window", max_window))
+    cached_horizon = int(meta.get("horizon", max_horizon))
+
+    if K is None:
+        K = cached_window
+    if H is None:
+        H = cached_horizon
+
+    if K > max_window or H > max_horizon:
         raise ValueError(
             "Requested (window, horizon) exceed the cached configuration. "
             "Re-run prepare_bms_air_cache with larger values first."
         )
 
-    if reindex:
+    K = int(K)
+    H = int(H)
+
+    needs_update = K != cached_window or H != cached_horizon
+    if reindex or needs_update:
         _rebuild_window_index_only(
             data_dir,
             window=K,
@@ -478,6 +544,15 @@ def run_experiment(
             update_meta=False,
             backup_old=False,
         )
+
+    if needs_update:
+        meta["window"] = K
+        meta["horizon"] = H
+        meta_needs_update = True
+
+    if meta_needs_update:
+        with paths.meta.open("w") as f:
+            json.dump(meta, f, indent=2)
 
     train_dl, val_dl, test_dl, lengths = load_bms_dataloaders_with_ratio_split(
         data_dir=data_dir,
