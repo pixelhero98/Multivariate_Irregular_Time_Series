@@ -59,9 +59,12 @@ OUTCOME_FILENAMES = {
 
 TARGET_COLUMN = "future_vital"
 
+# PhysioNet measurements are recorded every hour for the challenge; align to that by default.
 DEFAULT_FREQ = "1H"
-MAX_WINDOW = 72
-MAX_HORIZON = 48
+
+# Keep the cache bounded so ``run_experiment`` can rebuild smaller indices cheaply.
+MAX_WINDOW = 48
+MAX_HORIZON = 24
 
 
 @dataclass
@@ -309,21 +312,42 @@ class _NormStatsAccumulator:
 # ---------------------------------------------------------------------------
 # Cache preparation
 
+def _validate_window_and_horizon(window: int, horizon: int) -> Tuple[int, int]:
+    """Clamp obvious configuration errors early and return normalized values."""
+
+    if window <= 0:
+        raise ValueError("window must be a positive integer")
+    if horizon < 0:
+        raise ValueError("horizon must be non-negative")
+    if window > MAX_WINDOW:
+        raise ValueError(f"window={window} exceeds the supported maximum of {MAX_WINDOW}.")
+    if horizon > MAX_HORIZON:
+        raise ValueError(f"horizon={horizon} exceeds the supported maximum of {MAX_HORIZON}.")
+    return int(window), int(horizon)
+
+
+def _ensure_future_vital_target(panel: pd.DataFrame, target_parameter: str) -> pd.DataFrame:
+    """Append the continuous target column expected by the downstream pipeline."""
+
+    if target_parameter not in panel.columns:
+        raise ValueError(f"Target parameter '{target_parameter}' missing for patient panel.")
+
+    target_series = panel[target_parameter].ffill().bfill()
+    if target_series.isna().any():
+        raise ValueError(
+            "Target parameter contains gaps even after forward/backward filling; "
+            "cannot create a continuous future vital series."
+        )
+
+    panel = panel.drop(columns=[target_parameter])
+    panel[TARGET_COLUMN] = target_series.astype(np.float32)
+    return panel
+
+
 def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, object]:
     """Prepare the compact cache compatible with the financial pipeline."""
 
-    if cfg.window <= 0:
-        raise ValueError("window must be a positive integer")
-    if cfg.window > MAX_WINDOW:
-        raise ValueError(
-            f"window={cfg.window} exceeds the supported maximum of {MAX_WINDOW}."
-        )
-    if cfg.horizon < 0:
-        raise ValueError("horizon must be non-negative")
-    if cfg.horizon > MAX_HORIZON:
-        raise ValueError(
-            f"horizon={cfg.horizon} exceeds the supported maximum of {MAX_HORIZON}."
-        )
+    window, horizon = _validate_window_and_horizon(cfg.window, cfg.horizon)
 
     keep_time_meta = cfg.keep_time_meta.lower()
     if keep_time_meta not in {"full", "end", "none"}:
@@ -348,13 +372,7 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
 
     feature_frames: Dict[str, pd.DataFrame] = {}
     for asset in assets:
-        panel = panels[asset].copy()
-        if cfg.target_parameter not in panel.columns:
-            raise ValueError(
-                f"Target parameter '{cfg.target_parameter}' missing for patient '{asset}'."
-            )
-        panel[TARGET_COLUMN] = panel[cfg.target_parameter]
-        panel = panel.drop(columns=[cfg.target_parameter])
+        panel = _ensure_future_vital_target(panels[asset].copy(), cfg.target_parameter)
 
         if outcomes is not None and asset in outcomes.index:
             static_values = outcomes.loc[asset]
@@ -389,13 +407,14 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
         per_asset=cfg.normalize_per_patient,
     )
 
-    min_required = cfg.window + cfg.horizon
+    min_required = window + horizon
     for asset in assets:
         aid = asset_to_id[asset]
         panel = feature_frames[asset][feature_cols]
         if panel.shape[0] < min_required:
             raise ValueError(
-                f"Patient '{asset}' has insufficient length ({panel.shape[0]} rows) for window={cfg.window} and horizon={cfg.horizon}."
+                f"Patient '{asset}' has insufficient length ({panel.shape[0]} rows) "
+                f"for window={window} and horizon={horizon}."
             )
 
         features = panel.to_numpy(dtype=np.float32, copy=True)
@@ -410,7 +429,7 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
 
         max_start = panel.shape[0] - min_required + 1
         starts = np.arange(0, max_start, dtype=np.int32)
-        window_end_times = times[starts + cfg.window - 1].astype("datetime64[ns]")
+        window_end_times = times[starts + window - 1].astype("datetime64[ns]")
         pairs.append(np.stack([np.full_like(starts, aid), starts], axis=1))
         end_times.append(window_end_times)
         start_times.append(times[0])
@@ -429,8 +448,8 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
     meta = {
         "dataset": "physionet_cinc",
         "subset": cfg.subset,
-        "window": int(cfg.window),
-        "horizon": int(cfg.horizon),
+        "window": window,
+        "horizon": horizon,
         "max_window": int(MAX_WINDOW),
         "max_horizon": int(MAX_HORIZON),
         "assets": assets,
@@ -440,7 +459,7 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
         "normalize_per_patient": bool(cfg.normalize_per_patient),
         "clamp_sigma": float(cfg.clamp_sigma),
         "keep_time_meta": keep_time_meta,
-        "freq": cfg.freq,
+        "freq": cfg.freq or DEFAULT_FREQ,
         "start": str(dataset_start) if dataset_start is not None else None,
         "end": str(dataset_end) if dataset_end is not None else None,
     }
@@ -505,10 +524,13 @@ def run_experiment(
 
     paths = CachePaths.from_dir(data_dir)
     meta = _validate_physionet_cache(paths)
-    base_window = int(meta.get("window", K))
-    base_horizon = int(meta.get("horizon", H))
-    max_window = int(meta.get("max_window", base_window))
-    max_horizon = int(meta.get("max_horizon", base_horizon))
+    base_window = min(int(meta.get("window", K)), MAX_WINDOW)
+    base_horizon = min(int(meta.get("horizon", H)), MAX_HORIZON)
+    max_window = min(int(meta.get("max_window", MAX_WINDOW)), MAX_WINDOW)
+    max_horizon = min(int(meta.get("max_horizon", MAX_HORIZON)), MAX_HORIZON)
+
+    # Sanity check: old caches might predate the tighter maxima.
+    base_window, base_horizon = _validate_window_and_horizon(base_window, base_horizon)
 
     if K > max_window or H > max_horizon:
         raise ValueError(
@@ -517,6 +539,7 @@ def run_experiment(
         )
 
     if reindex and (K != base_window or H != base_horizon):
+        _validate_window_and_horizon(K, H)
         _rebuild_window_index_only(
             data_dir,
             window=K,
