@@ -9,9 +9,11 @@ consisting of per-station feature/target matrices and a global window index.
 The target series ``Y`` corresponds to future values of the ambient air
 ``temperature`` (degrees Celsius).  Context features ``X`` include the current
 and historical readings for several meteorological variables such as dew point,
-wind speed and sea level pressure.  All arrays are written in float16 for
-storage efficiency; normalization statistics are computed either globally or
-per station depending on the configuration.
+wind speed and sea level pressure.  Data are sampled hourly by default
+(``1H``), the maximum supported lookback is 336 hours and the maximum horizon is
+168 hours.  All arrays are written in float16 for storage efficiency;
+normalization statistics are computed either globally or per station depending
+on the configuration.
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ else:
 
 TARGET_COLUMN = "temperature"
 DEFAULT_FREQ = "H"  # Hourly sampling interval
-MAX_LOOKBACK = 168
+MAX_LOOKBACK = 336
 MAX_HORIZON = 168
 
 DEFAULT_FEATURE_COLUMNS: Tuple[str, ...] = (
@@ -525,6 +527,17 @@ def _validate_isd_cache(paths: CachePaths) -> Dict[str, object]:
             f"The cache located at '{paths.cache_root}' does not correspond to the NOAA ISD dataset."
         )
 
+    # Clamp the recorded maxima to the supported limits so callers cannot request
+    # windows that exceed the hard-coded capabilities of this dataset module.
+    try:
+        meta["max_window"] = min(int(meta.get("max_window", MAX_LOOKBACK)), MAX_LOOKBACK)
+    except (TypeError, ValueError):
+        meta["max_window"] = MAX_LOOKBACK
+    try:
+        meta["max_horizon"] = min(int(meta.get("max_horizon", MAX_HORIZON)), MAX_HORIZON)
+    except (TypeError, ValueError):
+        meta["max_horizon"] = MAX_HORIZON
+
     return meta
 
 
@@ -555,8 +568,16 @@ def run_experiment(
     meta = _validate_isd_cache(paths)
     max_window = int(meta.get("max_window", MAX_LOOKBACK))
     max_horizon = int(meta.get("max_horizon", MAX_HORIZON))
-    base_window = int(meta.get("window", max_window))
-    base_horizon = int(meta.get("horizon", max_horizon))
+
+    def _coerce_within(value: object, default: int, upper: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return min(parsed, upper)
+
+    base_window = _coerce_within(meta.get("window"), max_window, max_window)
+    base_horizon = _coerce_within(meta.get("horizon"), max_horizon, max_horizon)
 
     if K <= 0:
         raise ValueError("K (window) must be positive")
@@ -569,13 +590,15 @@ def run_experiment(
             f"({max_window}, {max_horizon})."
         )
 
-    if (K, H) != (base_window, base_horizon) and not reindex:
+    needs_reindex = (int(K), int(H)) != (base_window, base_horizon)
+
+    if needs_reindex and not reindex:
         raise ValueError(
             "reindex=False but (K, H) differ from the cached configuration. "
             "Enable reindex to rebuild the window index."
         )
 
-    if reindex and (K, H) != (base_window, base_horizon):
+    if reindex and needs_reindex:
         _rebuild_window_index_only(
             data_dir,
             window=K,
@@ -583,7 +606,6 @@ def run_experiment(
             update_meta=True,
             backup_old=False,
         )
-        base_window, base_horizon = K, H
 
     train_dl, val_dl, test_dl, lengths = load_isd_dataloaders_with_ratio_split(
         data_dir=data_dir,
