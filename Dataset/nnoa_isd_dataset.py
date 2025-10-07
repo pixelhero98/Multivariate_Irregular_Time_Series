@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, Union
 
@@ -45,6 +45,10 @@ else:
 
 
 TARGET_COLUMN = "temperature"
+DEFAULT_FREQ = "H"  # Hourly sampling interval
+MAX_LOOKBACK = 168
+MAX_HORIZON = 168
+
 DEFAULT_FEATURE_COLUMNS: Tuple[str, ...] = (
     "temperature",
     "dew_point",
@@ -58,9 +62,9 @@ DEFAULT_FEATURE_COLUMNS: Tuple[str, ...] = (
 class ISDCacheConfig:
     """Configuration used when preparing the compact ISD cache."""
 
-    window: int
-    horizon: int
-    years: Sequence[int]
+    window: int = MAX_LOOKBACK
+    horizon: int = MAX_HORIZON
+    years: Sequence[int] = field(default_factory=list)
     data_dir: PathLike = "./nnoa_isd_cache"
     raw_data_dir: Optional[PathLike] = "./nnoa_isd_raw"
     country: Optional[str] = "UK"
@@ -69,7 +73,7 @@ class ISDCacheConfig:
     normalize_per_station: bool = True
     clamp_sigma: float = 5.0
     keep_time_meta: str = "end"  # "full" | "end" | "none"
-    freq: str = "H"
+    freq: str = DEFAULT_FREQ
     min_coverage: float = 0.85
     max_stations: Optional[int] = None
     overwrite: bool = False
@@ -358,6 +362,14 @@ def prepare_isd_cache(cfg: ISDCacheConfig) -> Mapping[str, List[str]]:
         raise ValueError("window must be positive")
     if cfg.horizon < 0:
         raise ValueError("horizon must be non-negative")
+    if cfg.window > MAX_LOOKBACK:
+        raise ValueError(
+            f"window ({cfg.window}) exceeds supported maximum ({MAX_LOOKBACK})."
+        )
+    if cfg.horizon > MAX_HORIZON:
+        raise ValueError(
+            f"horizon ({cfg.horizon}) exceeds supported maximum ({MAX_HORIZON})."
+        )
     if not cfg.years:
         raise ValueError("At least one year must be specified in cfg.years")
 
@@ -468,6 +480,8 @@ def prepare_isd_cache(cfg: ISDCacheConfig) -> Mapping[str, List[str]]:
         "target_col": target_col,
         "window": int(cfg.window),
         "horizon": int(cfg.horizon),
+        "max_window": MAX_LOOKBACK,
+        "max_horizon": MAX_HORIZON,
         "keep_time_meta": keep_time_meta,
         "normalize_per_ticker": cfg.normalize_per_station,
         "clamp_sigma": cfg.clamp_sigma,
@@ -539,22 +553,37 @@ def run_experiment(
 
     paths = CachePaths.from_dir(data_dir)
     meta = _validate_isd_cache(paths)
-    base_window = int(meta.get("window", K))
-    base_horizon = int(meta.get("horizon", H))
-    if K > base_window or H > base_horizon:
+    max_window = int(meta.get("max_window", MAX_LOOKBACK))
+    max_horizon = int(meta.get("max_horizon", MAX_HORIZON))
+    base_window = int(meta.get("window", max_window))
+    base_horizon = int(meta.get("horizon", max_horizon))
+
+    if K <= 0:
+        raise ValueError("K (window) must be positive")
+    if H < 0:
+        raise ValueError("H (horizon) must be non-negative")
+
+    if K > max_window or H > max_horizon:
         raise ValueError(
-            "Requested (window, horizon) exceed the cached configuration. "
-            "Re-run prepare_isd_cache with larger values first."
+            f"Requested (window={K}, horizon={H}) exceed the supported maximums "
+            f"({max_window}, {max_horizon})."
         )
 
-    if reindex:
+    if (K, H) != (base_window, base_horizon) and not reindex:
+        raise ValueError(
+            "reindex=False but (K, H) differ from the cached configuration. "
+            "Enable reindex to rebuild the window index."
+        )
+
+    if reindex and (K, H) != (base_window, base_horizon):
         _rebuild_window_index_only(
             data_dir,
             window=K,
             horizon=H,
-            update_meta=False,
+            update_meta=True,
             backup_old=False,
         )
+        base_window, base_horizon = K, H
 
     train_dl, val_dl, test_dl, lengths = load_isd_dataloaders_with_ratio_split(
         data_dir=data_dir,
