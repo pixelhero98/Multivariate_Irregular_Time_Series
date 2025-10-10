@@ -19,24 +19,18 @@ import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, Union
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 
+from ._types import PathLike
 from .fin_dataset import (
     CachePaths,
     load_dataloaders_with_ratio_split as _load_fin_ratio_split,
     rebuild_window_index_only as _rebuild_window_index_only,
 )
-
-if TYPE_CHECKING:
-    from os import PathLike as _PathLike
-
-    PathLike = Union[str, _PathLike[str]]
-else:
-    PathLike = Union[str, os.PathLike]
 
 
 # ---------------------------------------------------------------------------
