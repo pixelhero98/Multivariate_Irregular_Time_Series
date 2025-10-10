@@ -1,6 +1,9 @@
-Traceback (most recent call last):
-  File "/home/pyh/Documents/school/projects/yzn_ts/train_val_pipeline.py", line 10, in <module>
-    from Dataset.fin_dataset import run_experiment
-  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/fin_dataset.py", line 30, in <module>
-    PathLike = Union[str, os.PathLike[str]]
-TypeError: 'ABCMeta' object is not subscriptable
+from Dataset.bms_air_dataset import BMSCacheConfig, prepare_bms_air_cache
+
+cfg = BMSCacheConfig(
+    data_dir="./bms_air_cache",          # where the cache should live
+    raw_data_dir="./bms_air_quality_data",
+    window=336,                          # must cover the max K you’ll train with
+    horizon=168,                         # must cover the max H you’ll train with
+)
+prepare_bms_air_cache(cfg)
