@@ -20,19 +20,14 @@ import os
 from dataclasses import dataclass, field
 from math import ceil as _ceil
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING, Union
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler as _Sampler
 
-if TYPE_CHECKING:
-    from os import PathLike as _PathLike
-
-    PathLike = Union[str, _PathLike[str]]
-else:
-    PathLike = Union[str, os.PathLike]
+from ._types import PathLike
 
 # --------------------- Public configs (kept compatible) ---------------------
 

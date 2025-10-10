@@ -22,7 +22,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING, Union
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -32,18 +32,13 @@ try:  # Optional dependency used for downloading raw ISD measurements
 except Exception:  # pragma: no cover - handled gracefully at runtime
     isd = None
 
+from ._normalization import NormalizationStatsAccumulator
+from ._types import PathLike
 from .fin_dataset import (
     CachePaths,
     load_dataloaders_with_ratio_split as _load_fin_ratio_split,
     rebuild_window_index_only as _rebuild_window_index_only,
 )
-
-if TYPE_CHECKING:
-    from os import PathLike as _PathLike
-
-    PathLike = Union[str, _PathLike[str]]
-else:
-    PathLike = Union[str, os.PathLike]
 
 
 TARGET_COLUMN = "temperature"
@@ -267,94 +262,6 @@ def _build_station_panels(
     return panels
 
 
-class _NormStatsAccumulator:
-    """Accumulate normalization statistics for per-station or global modes."""
-
-    def __init__(self, num_assets: int, feature_dim: int, per_asset: bool) -> None:
-        self.per_asset = per_asset
-        self.num_assets = int(num_assets)
-        self.feature_dim = int(feature_dim)
-
-        if per_asset:
-            self.mean_x: List[Optional[np.ndarray]] = [None] * self.num_assets
-            self.std_x: List[Optional[np.ndarray]] = [None] * self.num_assets
-            self.mean_y: List[Optional[float]] = [None] * self.num_assets
-            self.std_y: List[Optional[float]] = [None] * self.num_assets
-        else:
-            self.count = 0
-            self.sum_x = np.zeros(self.feature_dim, dtype=np.float64)
-            self.sumsq_x = np.zeros(self.feature_dim, dtype=np.float64)
-            self.total_y = 0.0
-            self.total_y_sq = 0.0
-            self.total_y_count = 0
-
-    def update(self, aid: int, features: np.ndarray, targets: np.ndarray) -> None:
-        if self.per_asset:
-            f64 = features.astype(np.float64, copy=False)
-            t64 = targets.astype(np.float64, copy=False)
-            mx = f64.mean(axis=0)
-            sx = f64.std(axis=0)
-            sx = np.where(sx == 0.0, 1.0, sx)
-            my = float(t64.mean()) if t64.size else 0.0
-            sy = float(t64.std()) if t64.size else 1.0
-            sy = 1.0 if sy == 0.0 else sy
-            self.mean_x[aid] = mx.reshape(1, 1, -1).astype(np.float32)
-            self.std_x[aid] = sx.reshape(1, 1, -1).astype(np.float32)
-            self.mean_y[aid] = my
-            self.std_y[aid] = sy
-        else:
-            f64 = features.astype(np.float64, copy=False)
-            t64 = targets.astype(np.float64, copy=False)
-            self.count += f64.shape[0]
-            self.sum_x += f64.sum(axis=0)
-            self.sumsq_x += np.square(f64).sum(axis=0)
-            self.total_y += float(t64.sum())
-            self.total_y_sq += float(np.square(t64).sum())
-            self.total_y_count += t64.shape[0]
-
-    def finalize(self, assets: Iterable[str]) -> Dict[str, object]:
-        assets_list = list(assets)
-        if self.per_asset:
-            if not all(
-                m is not None and s is not None and my is not None and sy is not None
-                for m, s, my, sy in zip(self.mean_x, self.std_x, self.mean_y, self.std_y)
-            ):
-                raise RuntimeError("Normalization statistics missing for some assets.")
-            return {
-                "per_ticker": True,
-                "assets": assets_list,
-                "mean_x": [mx.tolist() for mx in self.mean_x],
-                "std_x": [sx.tolist() for sx in self.std_x],
-                "mean_y": [float(my) for my in self.mean_y],
-                "std_y": [float(sy) for sy in self.std_y],
-            }
-
-        if self.count == 0:
-            raise RuntimeError("Unable to compute normalization statistics (no samples).")
-
-        mean_x = (self.sum_x / self.count).astype(np.float32)
-        var_x = (self.sumsq_x / self.count) - np.square(mean_x.astype(np.float64))
-        var_x = np.maximum(var_x, 1e-12)
-        std_x = np.sqrt(var_x).astype(np.float32)
-        std_x[std_x == 0.0] = 1.0
-
-        if self.total_y_count > 0:
-            mean_y = float(self.total_y / self.total_y_count)
-            var_y = max((self.total_y_sq / self.total_y_count) - (mean_y ** 2), 1e-12)
-            std_y = float(np.sqrt(var_y))
-            std_y = 1.0 if std_y == 0.0 else std_y
-        else:
-            mean_y = 0.0
-            std_y = 1.0
-
-        return {
-            "per_ticker": False,
-            "assets": assets_list,
-            "mean_x": mean_x.reshape(1, 1, -1).tolist(),
-            "std_x": std_x.reshape(1, 1, -1).tolist(),
-            "mean_y": mean_y,
-            "std_y": std_y,
-        }
 
 
 def prepare_isd_cache(cfg: ISDCacheConfig) -> Mapping[str, List[str]]:
@@ -425,7 +332,7 @@ def prepare_isd_cache(cfg: ISDCacheConfig) -> Mapping[str, List[str]]:
     stop_times: List[np.datetime64] = []
 
     feature_dim = len(feature_cols)
-    norm_acc = _NormStatsAccumulator(
+    norm_acc = NormalizationStatsAccumulator(
         num_assets=len(assets),
         feature_dim=feature_dim,
         per_asset=cfg.normalize_per_station,
