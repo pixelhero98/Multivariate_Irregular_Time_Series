@@ -240,7 +240,7 @@ def clean_uci_air_quality(
     if missing:
         raise ValueError(f"Missing expected columns in UCI Air Quality data: {missing}")
 
-    numeric = frame[feature_cols].apply(pd.to_numeric, errors="coerce")
+    numeric = frame[list(feature_cols)].apply(pd.to_numeric, errors="coerce")
 
     if freq:
         numeric = numeric.resample(freq).mean()
