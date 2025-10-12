@@ -27,7 +27,8 @@ import numpy as np
 import pandas as pd
 
 try:  # Optional dependency used for downloading raw ISD measurements
-    import isd  # type: ignore
+    from pyisd import IsdLite
+    isd = IsdLite(verbose=1)  # type: ignore
 except Exception:  # pragma: no cover - handled gracefully at runtime
     isd = None
 
