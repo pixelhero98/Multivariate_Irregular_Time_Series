@@ -23,9 +23,9 @@ The above exception was the direct cause of the following exception:
 Traceback (most recent call last):
   File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/download.py", line 9, in <module>
     prepare_uci_air_cache(cfg)
-  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/uci_air_quality_dataset.py", line 277, in prepare_uci_air_cache
+  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/uci_air_quality_dataset.py", line 286, in prepare_uci_air_cache
     clean_df = clean_uci_air_quality(
-  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/uci_air_quality_dataset.py", line 234, in clean_uci_air_quality
+  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/uci_air_quality_dataset.py", line 243, in clean_uci_air_quality
     numeric = frame[feature_cols].apply(pd.to_numeric, errors="coerce")
   File "/home/pyh/Documents/school/projects/yzn_ts/venv/lib/python3.8/site-packages/pandas/core/frame.py", line 3807, in __getitem__
     indexer = self.columns.get_loc(key)
