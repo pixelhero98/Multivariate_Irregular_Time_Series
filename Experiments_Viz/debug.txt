@@ -1,3 +1,9 @@
-pip uninstall -y isd
-pip install isd-fetch
-
+/home/pyh/Documents/school/projects/yzn_ts/venv/bin/python /home/pyh/Documents/school/projects/yzn_ts/Dataset/download.py 
+Traceback (most recent call last):
+  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/download.py", line 14, in <module>
+    prepare_isd_cache(cfg)
+  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/nnoa_isd_dataset.py", line 292, in prepare_isd_cache
+    station_inventory = list_isd_stations(
+  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/nnoa_isd_dataset.py", line 112, in list_isd_stations
+    inv = isd.get_stations()  # type: ignore[call-arg]
+AttributeError: 'IsdLite' object has no attribute 'get_stations'
