@@ -9,7 +9,6 @@ cfg = UCIAirCacheConfig(
 prepare_uci_air_cache(cfg)
 
 
-/home/pyh/Documents/school/projects/yzn_ts/venv/bin/python /home/pyh/Documents/school/projects/yzn_ts/Dataset/download.py 
 Traceback (most recent call last):
   File "/home/pyh/Documents/school/projects/yzn_ts/venv/lib/python3.8/site-packages/pandas/core/indexes/base.py", line 3802, in get_loc
     return self._engine.get_loc(casted_key)
@@ -24,14 +23,12 @@ The above exception was the direct cause of the following exception:
 Traceback (most recent call last):
   File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/download.py", line 9, in <module>
     prepare_uci_air_cache(cfg)
-  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/uci_air_quality_dataset.py", line 269, in prepare_uci_air_cache
+  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/uci_air_quality_dataset.py", line 277, in prepare_uci_air_cache
     clean_df = clean_uci_air_quality(
-  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/uci_air_quality_dataset.py", line 226, in clean_uci_air_quality
+  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/uci_air_quality_dataset.py", line 234, in clean_uci_air_quality
     numeric = frame[feature_cols].apply(pd.to_numeric, errors="coerce")
   File "/home/pyh/Documents/school/projects/yzn_ts/venv/lib/python3.8/site-packages/pandas/core/frame.py", line 3807, in __getitem__
     indexer = self.columns.get_loc(key)
   File "/home/pyh/Documents/school/projects/yzn_ts/venv/lib/python3.8/site-packages/pandas/core/indexes/base.py", line 3804, in get_loc
     raise KeyError(key) from err
 KeyError: ('NO2(GT)', 'CO(GT)', 'PT08.S1(CO)', 'NMHC(GT)', 'C6H6(GT)', 'PT08.S2(NMHC)', 'NOx(GT)', 'PT08.S3(NOx)', 'PT08.S4(NO2)', 'PT08.S5(O3)', 'T', 'RH', 'AH')
-
-Process finished with exit code 1
