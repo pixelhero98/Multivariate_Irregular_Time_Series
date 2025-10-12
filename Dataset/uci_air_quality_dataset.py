@@ -116,6 +116,15 @@ def _find_existing_member(root: Path, filenames: Sequence[str]) -> Optional[Path
     return None
 
 
+def _normalize_column_name(name: object) -> str:
+    """Return a canonical representation for raw Air Quality headers."""
+
+    text = str(name).replace("\xa0", " ").replace("\u200b", "")
+    if text.startswith("\ufeff"):
+        text = text.lstrip("\ufeff")
+    return text.strip()
+
+
 def download_uci_air_quality_dataset(
     dest_path: PathLike = "./uci_air_quality_raw",
     url: str = DATA_URL,
@@ -193,7 +202,7 @@ def load_raw_uci_air_quality(data_path: PathLike) -> pd.DataFrame:
     # normalize the headers here before selecting the feature columns.  This
     # mirrors the behaviour of other public loaders and prevents confusing
     # ``KeyError`` exceptions when ``clean_uci_air_quality`` runs.
-    df.columns = [str(c).strip() for c in df.columns]
+    df.columns = [_normalize_column_name(c) for c in df.columns]
     return df
 
 
