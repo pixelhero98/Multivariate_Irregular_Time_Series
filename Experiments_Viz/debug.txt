@@ -1,34 +1,8 @@
-from Dataset.uci_air_quality_dataset import UCIAirCacheConfig, prepare_uci_air_cache
 
-cfg = UCIAirCacheConfig(
-    data_dir="/home/pyh/Documents/school/projects/yzn_ts/ldt/LLapDiT_Data/uci_air_quality_data/uci_air_cache",          # where the cache should live
-    raw_data_dir="/home/pyh/Documents/school/projects/yzn_ts/ldt/LLapDiT_Data/uci_air_quality_data",
-    window=336,                          # must cover the max K you’ll train with
-    horizon=168,                         # must cover the max H you’ll train with
-)
-prepare_uci_air_cache(cfg)
-
-
-Traceback (most recent call last):
-  File "/home/pyh/Documents/school/projects/yzn_ts/venv/lib/python3.8/site-packages/pandas/core/indexes/base.py", line 3802, in get_loc
-    return self._engine.get_loc(casted_key)
-  File "pandas/_libs/index.pyx", line 138, in pandas._libs.index.IndexEngine.get_loc
-  File "pandas/_libs/index.pyx", line 165, in pandas._libs.index.IndexEngine.get_loc
-  File "pandas/_libs/hashtable_class_helper.pxi", line 5745, in pandas._libs.hashtable.PyObjectHashTable.get_item
-  File "pandas/_libs/hashtable_class_helper.pxi", line 5753, in pandas._libs.hashtable.PyObjectHashTable.get_item
-KeyError: ('NO2(GT)', 'CO(GT)', 'PT08.S1(CO)', 'NMHC(GT)', 'C6H6(GT)', 'PT08.S2(NMHC)', 'NOx(GT)', 'PT08.S3(NOx)', 'PT08.S4(NO2)', 'PT08.S5(O3)', 'T', 'RH', 'AH')
-
-The above exception was the direct cause of the following exception:
-
+/home/pyh/Documents/school/projects/yzn_ts/venv/bin/python /home/pyh/Documents/school/projects/yzn_ts/Dataset/download.py 
 Traceback (most recent call last):
   File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/download.py", line 9, in <module>
     prepare_uci_air_cache(cfg)
-  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/uci_air_quality_dataset.py", line 286, in prepare_uci_air_cache
-    clean_df = clean_uci_air_quality(
-  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/uci_air_quality_dataset.py", line 243, in clean_uci_air_quality
-    numeric = frame[feature_cols].apply(pd.to_numeric, errors="coerce")
-  File "/home/pyh/Documents/school/projects/yzn_ts/venv/lib/python3.8/site-packages/pandas/core/frame.py", line 3807, in __getitem__
-    indexer = self.columns.get_loc(key)
-  File "/home/pyh/Documents/school/projects/yzn_ts/venv/lib/python3.8/site-packages/pandas/core/indexes/base.py", line 3804, in get_loc
-    raise KeyError(key) from err
-KeyError: ('NO2(GT)', 'CO(GT)', 'PT08.S1(CO)', 'NMHC(GT)', 'C6H6(GT)', 'PT08.S2(NMHC)', 'NOx(GT)', 'PT08.S3(NOx)', 'PT08.S4(NO2)', 'PT08.S5(O3)', 'T', 'RH', 'AH')
+  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/uci_air_quality_dataset.py", line 307, in prepare_uci_air_cache
+    raise ValueError("Insufficient history for the requested window/horizon configuration.")
+ValueError: Insufficient history for the requested window/horizon configuration.
