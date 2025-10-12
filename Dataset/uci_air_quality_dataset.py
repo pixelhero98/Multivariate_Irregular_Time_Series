@@ -186,6 +186,14 @@ def load_raw_uci_air_quality(data_path: PathLike) -> pd.DataFrame:
     drop_cols = [c for c in df.columns if str(c).startswith("Unnamed")]
     if drop_cols:
         df = df.drop(columns=drop_cols)
+
+    # Some distributions of the UCI Air Quality CSV/XLSX files include trailing
+    # whitespace in the column names (for example ``"NO2(GT) "``).  Downstream
+    # processing expects the canonical feature names without any padding, so we
+    # normalize the headers here before selecting the feature columns.  This
+    # mirrors the behaviour of other public loaders and prevents confusing
+    # ``KeyError`` exceptions when ``clean_uci_air_quality`` runs.
+    df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
