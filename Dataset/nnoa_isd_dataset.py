@@ -82,6 +82,130 @@ def _require_isd() -> None:
         )
 
 
+def _get_station_inventory() -> pd.DataFrame:
+    """Return the raw station inventory from the installed :mod:`isd` package.
+
+    The upstream package occasionally changes its public API.  Historical
+    versions exposed a ``get_stations`` helper, while newer releases provide a
+    ``stations`` function.  We attempt a number of known entry points and
+    normalise the returned object to a :class:`pandas.DataFrame`.
+    """
+
+    _require_isd()
+
+    candidates = (
+        "get_stations",
+        "stations",
+        "station_inventory",
+    )
+    last_error: Optional[Exception] = None
+    for name in candidates:
+        attr = getattr(isd, name, None)
+        if attr is None:
+            continue
+
+        try:
+            result = attr() if callable(attr) else attr
+        except Exception as exc:  # pragma: no cover - defensive
+            last_error = exc
+            continue
+
+        if isinstance(result, pd.DataFrame):
+            return result
+
+        # Some variants return iterables / mappings instead of a DataFrame.
+        try:
+            frame = pd.DataFrame(result)
+        except Exception as exc:  # pragma: no cover - defensive
+            last_error = exc
+            continue
+
+        if not frame.empty:
+            return frame
+
+    tried = ", ".join(candidates)
+    if last_error is not None:
+        raise AttributeError(
+            f"Unable to locate a usable station inventory in the installed 'isd' package. "
+            f"Tried attributes: {tried}. Last error: {last_error}"
+        )
+    raise AttributeError(
+        "The installed 'isd' package does not expose a recognised station inventory accessor. "
+        f"Tried attributes: {tried}."
+    )
+
+
+def _get_station_year_data(station_id: str, year: int) -> Tuple[pd.DataFrame, Optional[Mapping[str, object]]]:
+    """Retrieve data for a single station/year combination from :mod:`isd`.
+
+    Similar to :func:`_get_station_inventory`, this helper tolerates API
+    differences between releases by attempting several call conventions.
+    """
+
+    _require_isd()
+
+    candidates = (
+        "get_data",
+        "data",
+        "get_station_data",
+    )
+    call_variants = (
+        ((station_id, year), {}),
+        ((), {"station": station_id, "year": year}),
+        ((), {"station_id": station_id, "year": year}),
+    )
+
+    last_error: Optional[Exception] = None
+    for name in candidates:
+        func = getattr(isd, name, None)
+        if func is None or not callable(func):
+            continue
+
+        for args, kwargs in call_variants:
+            try:
+                result = func(*args, **kwargs)
+            except TypeError:
+                # Try the next calling convention.
+                continue
+            except Exception as exc:  # pragma: no cover - defensive
+                last_error = exc
+                continue
+
+            metadata: Optional[Mapping[str, object]] = None
+            if isinstance(result, tuple):
+                if not result:
+                    continue
+                data_frame = result[0]
+                if len(result) > 1:
+                    meta_candidate = result[1]
+                    if isinstance(meta_candidate, Mapping):
+                        metadata = meta_candidate
+            else:
+                data_frame = result
+
+            if isinstance(data_frame, pd.DataFrame):
+                return data_frame, metadata
+
+            try:
+                frame = pd.DataFrame(data_frame)
+            except Exception as exc:  # pragma: no cover - defensive
+                last_error = exc
+                continue
+
+            return frame, metadata
+
+    tried = ", ".join(candidates)
+    if last_error is not None:
+        raise AttributeError(
+            f"Unable to retrieve ISD measurements via the installed 'isd' package. "
+            f"Tried callables: {tried}. Last error: {last_error}"
+        )
+    raise AttributeError(
+        "The installed 'isd' package does not expose a recognised data retrieval function. "
+        f"Tried callables: {tried}."
+    )
+
+
 def list_isd_stations(
     *,
     country: Optional[str] = None,
@@ -106,9 +230,7 @@ def list_isd_stations(
         experiments.
     """
 
-    _require_isd()
-
-    inv = isd.get_stations()  # type: ignore[call-arg]
+    inv = _get_station_inventory()
     inv = inv.copy()
     inv.columns = [str(c).lower() for c in inv.columns]
 
@@ -153,9 +275,7 @@ def _load_or_download_station_year(
         if parquet_path.exists():
             return pd.read_parquet(parquet_path)
 
-    _require_isd()
-
-    df_year, _meta = isd.get_data(station_id, year)  # type: ignore[call-arg]
+    df_year, _meta = _get_station_year_data(station_id, year)
     if not isinstance(df_year, pd.DataFrame) or df_year.empty:
         return pd.DataFrame()
 
