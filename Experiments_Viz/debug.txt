@@ -1,8 +1,11 @@
+cfg = ISDCacheConfig(
+    years=[2021, 2022],          # required
+    country="UK",                # default is "UK"
+    max_stations=5,              # keep it small to start
+    raw_data_dir="./nnoa_isd_raw",   # optional: caches raw Parquet per station-year
+    data_dir="./nnoa_isd_cache",     # where the compact cache is written
+    min_coverage=0.80,               # relax if stations get filtered out
+    overwrite=False
+)
 
-/home/pyh/Documents/school/projects/yzn_ts/venv/bin/python /home/pyh/Documents/school/projects/yzn_ts/Dataset/download.py 
-Traceback (most recent call last):
-  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/download.py", line 9, in <module>
-    prepare_uci_air_cache(cfg)
-  File "/home/pyh/Documents/school/projects/yzn_ts/Dataset/uci_air_quality_dataset.py", line 307, in prepare_uci_air_cache
-    raise ValueError("Insufficient history for the requested window/horizon configuration.")
-ValueError: Insufficient history for the requested window/horizon configuration.
+result = prepare_isd_cache(cfg)
