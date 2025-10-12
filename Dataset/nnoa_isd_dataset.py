@@ -18,6 +18,7 @@ on the configuration.
 
 from __future__ import annotations
 
+import importlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,11 +27,57 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-try:  # Optional dependency used for downloading raw ISD measurements
-    from pyisd import IsdLite
-    isd = IsdLite(verbose=1)  # type: ignore
-except Exception:  # pragma: no cover - handled gracefully at runtime
-    isd = None
+
+def _initialise_isd_backend() -> Tuple[Optional[object], Optional[str]]:
+    """Attempt to import an ISD client from supported third-party libraries."""
+
+    candidates: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+        ("isd_fetch", ("ISDFetch", "ISDClient", "Client", "client", "fetch")),
+        ("isd_fetch.client", ("ISDFetch", "ISDClient", "Client")),
+        ("pyisd", ("IsdLite", "ISDLite")),
+    )
+
+    for module_name, attr_names in candidates:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:  # pragma: no cover - optional dependency
+            continue
+
+        if not attr_names:
+            return module, module_name
+
+        for attr_name in attr_names:
+            attr = getattr(module, attr_name, None)
+            if attr is None:
+                continue
+
+            # Some libraries expose a factory/class that needs instantiating,
+            # others expose a ready-to-use module-like object.
+            if callable(attr):
+                try:
+                    instance = attr()  # type: ignore[misc]
+                except TypeError:
+                    try:
+                        instance = attr(verbose=1)  # type: ignore[misc]
+                    except TypeError:
+                        # Treat as module-level namespace when we cannot
+                        # determine the appropriate constructor signature.
+                        return module, module_name
+                    except Exception:  # pragma: no cover - best effort import
+                        continue
+                except Exception:  # pragma: no cover - best effort import
+                    continue
+                else:
+                    return instance, module_name
+
+            return attr, module_name
+
+        return module, module_name
+
+    return None, None
+
+
+isd, _isd_backend_name = _initialise_isd_backend()
 
 from ._normalization import NormalizationStatsAccumulator
 from ._types import PathLike
@@ -79,12 +126,13 @@ class ISDCacheConfig:
 def _require_isd() -> None:
     if isd is None:
         raise ImportError(
-            "The 'isd' package is required to download NOAA ISD data. Install via 'pip install isd'."
+            "An ISD client library is required to download NOAA ISD data. "
+            "Install via 'pip install isd-fetch'."
         )
 
 
 def _get_station_inventory() -> pd.DataFrame:
-    """Return the raw station inventory from the installed :mod:`isd` package.
+    """Return the raw station inventory from the installed ISD client library.
 
     The upstream package occasionally changes its public API.  Historical
     versions exposed a ``get_stations`` helper, while newer releases provide a
@@ -98,10 +146,19 @@ def _get_station_inventory() -> pd.DataFrame:
         "get_stations",
         "stations",
         "station_inventory",
+        "list_stations",
+        "inventory",
+        "inventory.get_stations",
+        "inventory.stations",
+        "fetch_stations",
     )
     last_error: Optional[Exception] = None
     for name in candidates:
-        attr = getattr(isd, name, None)
+        attr: Optional[object] = isd
+        for part in name.split("."):
+            if attr is None:
+                break
+            attr = getattr(attr, part, None)
         if attr is None:
             continue
 
@@ -127,17 +184,17 @@ def _get_station_inventory() -> pd.DataFrame:
     tried = ", ".join(candidates)
     if last_error is not None:
         raise AttributeError(
-            f"Unable to locate a usable station inventory in the installed 'isd' package. "
+            f"Unable to locate a usable station inventory in the installed ISD client. "
             f"Tried attributes: {tried}. Last error: {last_error}"
         )
     raise AttributeError(
-        "The installed 'isd' package does not expose a recognised station inventory accessor. "
+        "The installed ISD client does not expose a recognised station inventory accessor. "
         f"Tried attributes: {tried}."
     )
 
 
 def _get_station_year_data(station_id: str, year: int) -> Tuple[pd.DataFrame, Optional[Mapping[str, object]]]:
-    """Retrieve data for a single station/year combination from :mod:`isd`.
+    """Retrieve data for a single station/year combination from the ISD client.
 
     Similar to :func:`_get_station_inventory`, this helper tolerates API
     differences between releases by attempting several call conventions.
@@ -149,16 +206,29 @@ def _get_station_year_data(station_id: str, year: int) -> Tuple[pd.DataFrame, Op
         "get_data",
         "data",
         "get_station_data",
+        "fetch",
+        "fetch_data",
+        "station_data",
+        "download",
+        "inventory.fetch",
     )
+    usaf = station_id[:6]
+    wban = station_id[6:]
     call_variants = (
         ((station_id, year), {}),
         ((), {"station": station_id, "year": year}),
         ((), {"station_id": station_id, "year": year}),
+        ((), {"usaf": usaf, "wban": wban, "year": year}),
+        ((), {"usaf_wban": station_id, "year": year}),
     )
 
     last_error: Optional[Exception] = None
     for name in candidates:
-        func = getattr(isd, name, None)
+        func: Optional[object] = isd
+        for part in name.split("."):
+            if func is None:
+                break
+            func = getattr(func, part, None)
         if func is None or not callable(func):
             continue
 
@@ -198,11 +268,11 @@ def _get_station_year_data(station_id: str, year: int) -> Tuple[pd.DataFrame, Op
     tried = ", ".join(candidates)
     if last_error is not None:
         raise AttributeError(
-            f"Unable to retrieve ISD measurements via the installed 'isd' package. "
+            f"Unable to retrieve ISD measurements via the installed ISD client. "
             f"Tried callables: {tried}. Last error: {last_error}"
         )
     raise AttributeError(
-        "The installed 'isd' package does not expose a recognised data retrieval function. "
+        "The installed ISD client does not expose a recognised data retrieval function. "
         f"Tried callables: {tried}."
     )
 
