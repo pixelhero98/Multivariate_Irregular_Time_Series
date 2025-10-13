@@ -45,7 +45,7 @@ from .fin_dataset import (
 DATA_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/00360/AirQualityUCI.zip"
 ARCHIVE_CSV_NAME = "AirQualityUCI.csv"
 TARGET_COLUMN = "NO2(GT)"
-DEFAULT_FREQ = "1H"
+DEFAULT_FREQ = "1h"
 MAX_LOOKBACK = 336
 MAX_HORIZON = 168
 DEFAULT_FEATURE_COLUMNS: Tuple[str, ...] = (
@@ -123,6 +123,44 @@ def _normalize_column_name(name: object) -> str:
     if text.startswith("\ufeff"):
         text = text.lstrip("\ufeff")
     return text.strip()
+
+
+def _parse_air_quality_timestamp(date: pd.Series, time: pd.Series) -> pd.Series:
+    """Parse the raw ``Date``/``Time`` columns into timestamps.
+
+    The UCI Air Quality files primarily represent timestamps using the
+    ``"%d/%m/%Y %H.%M.%S"`` pattern, but some community re-publications swap the
+    dot separators for colons.  ``pandas.to_datetime`` raises a warning when the
+    format has to be inferred for every element, so we first try the canonical
+    dotted format, then the colon-separated variant, and finally fall back to
+    ``dateutil`` for any remaining edge-cases.  This preserves backwards
+    compatibility while avoiding the noisy warnings observed in the field.
+    """
+
+    date_str = date.astype(str).str.strip()
+    time_str = time.astype(str).str.strip()
+    combined = date_str.str.cat(time_str, sep=" ")
+
+    timestamp = pd.to_datetime(combined, format="%d/%m/%Y %H.%M.%S", errors="coerce")
+
+    missing_mask = timestamp.isna()
+    if missing_mask.any():
+        alt = pd.to_datetime(
+            combined[missing_mask],
+            format="%d/%m/%Y %H:%M:%S",
+            errors="coerce",
+        )
+        timestamp.loc[missing_mask] = alt
+
+    missing_mask = timestamp.isna()
+    if missing_mask.any():
+        timestamp.loc[missing_mask] = pd.to_datetime(
+            combined[missing_mask],
+            dayfirst=True,
+            errors="coerce",
+        )
+
+    return timestamp
 
 
 def download_uci_air_quality_dataset(
@@ -224,11 +262,7 @@ def clean_uci_air_quality(
         raise ValueError("Raw UCI Air Quality dataframe must contain 'Date' and 'Time' columns.")
 
     frame = df.copy()
-    timestamp = pd.to_datetime(
-        frame["Date"].astype(str).str.strip() + " " + frame["Time"].astype(str).str.strip(),
-        dayfirst=True,
-        errors="coerce",
-    )
+    timestamp = _parse_air_quality_timestamp(frame["Date"], frame["Time"])
     frame["datetime"] = timestamp
     frame = frame.dropna(subset=["datetime"])
 
@@ -244,7 +278,8 @@ def clean_uci_air_quality(
     numeric = frame[cols].apply(pd.to_numeric, errors="coerce")
 
     if freq:
-        numeric = numeric.resample(freq).mean()
+        resample_freq = freq.lower() if isinstance(freq, str) else freq
+        numeric = numeric.resample(resample_freq).mean()
 
     numeric = numeric.interpolate(method="time", limit_direction="both")
     numeric = numeric.ffill().bfill()
