@@ -89,7 +89,7 @@ from .fin_dataset import (
 
 
 TARGET_COLUMN = "temperature"
-DEFAULT_FREQ = "H"  # Hourly sampling interval
+DEFAULT_FREQ = "h"  # Hourly sampling interval
 MAX_LOOKBACK = 336
 MAX_HORIZON = 168
 
@@ -151,6 +151,8 @@ def _get_station_inventory() -> pd.DataFrame:
         "inventory.get_stations",
         "inventory.stations",
         "fetch_stations",
+        "raw_metadata",
+        "inventory.raw_metadata",
     )
     last_error: Optional[Exception] = None
     for name in candidates:
@@ -201,6 +203,40 @@ def _get_station_year_data(station_id: str, year: int) -> Tuple[pd.DataFrame, Op
     """
 
     _require_isd()
+
+    if _isd_backend_name == "pyisd":
+        from pyisd import IsdLite
+        usaf, wban = station_id[:6], station_id[6:]     # '03772099999' -> '037720','99999'
+        sid = f"{usaf}-{wban}"                          # pyisd expects 'USAF-WBAN'
+
+        isdl = IsdLite(verbose=0)
+        data = isdl.get_data(
+            start=f"{year}-01-01",
+            end=f"{year}-12-31",
+            station_id=sid,
+            organize_by="location",
+        )
+        if not data:
+            return pd.DataFrame(), None
+
+        # There should be exactly one entry keyed by the station id.
+        df = next(iter(data.values())).reset_index()
+
+        # Standardize time + feature names for downstream steps
+        if "date" in df.columns:
+            df = df.rename(columns={"date": "datetime"})
+        if "index" in df.columns:
+            df = df.rename(columns={"index": "datetime"})
+        df = df.rename(columns={
+            "temp": "temperature",
+            "dewtemp": "dew_point",
+            "pressure": "sea_level_pressure",
+            "windspeed": "wind_speed",
+            "precipitation-1h": "precipitation",
+            "precipitation_1h": "precipitation",   # some versions use underscore
+        })
+        df["station"] = station_id                   # required later by _clean_raw_isd_frame
+        return df, {"backend": "pyisd"}
 
     candidates = (
         "get_data",
@@ -304,6 +340,8 @@ def list_isd_stations(
     inv = _get_station_inventory()
     inv = inv.copy()
     inv.columns = [str(c).lower() for c in inv.columns]
+    if "ctry" in inv.columns and "country" not in inv.columns:
+        inv = inv.rename(columns={"ctry": "country"})
 
     if "usaf" not in inv.columns or "wban" not in inv.columns:
         raise RuntimeError("Unexpected ISD inventory format; expected 'usaf' and 'wban' columns.")
