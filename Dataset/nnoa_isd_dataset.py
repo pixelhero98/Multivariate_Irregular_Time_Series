@@ -444,9 +444,32 @@ def _clean_raw_isd_frame(df: pd.DataFrame) -> pd.DataFrame:
     cleaned = cleaned.dropna(subset=["datetime"])
 
     if "station" not in cleaned.columns:
-        raise ValueError("Raw ISD dataframe must contain a 'station' column.")
+        if "station_id" in cleaned.columns:
+            station_values = cleaned.pop("station_id")
+            valid_mask = station_values.notna()
+            cleaned = cleaned.loc[valid_mask].copy()
+            station_values = station_values.loc[valid_mask]
+        elif {"usaf", "wban"}.issubset(cleaned.columns):
+            usaf_values = cleaned.pop("usaf")
+            wban_values = cleaned.pop("wban")
+            valid_mask = usaf_values.notna() & wban_values.notna()
+            cleaned = cleaned.loc[valid_mask].copy()
+            station_values = (
+                usaf_values.loc[valid_mask].astype(str).str.zfill(6)
+                + wban_values.loc[valid_mask].astype(str).str.zfill(5)
+            )
+        else:
+            raise ValueError(
+                "Raw ISD dataframe must contain a 'station' column or enough metadata to construct one."
+            )
+        cleaned["station"] = station_values
 
-    cleaned["station"] = cleaned["station"].astype(str)
+    station_values = cleaned["station"]
+    if station_values.isna().any():
+        cleaned = cleaned.loc[station_values.notna()].copy()
+        station_values = cleaned["station"]
+
+    cleaned["station"] = station_values.astype(str)
     cleaned = cleaned.sort_values(["station", "datetime"]).reset_index(drop=True)
 
     return cleaned
