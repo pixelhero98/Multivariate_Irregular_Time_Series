@@ -580,9 +580,9 @@ def prepare_isd_cache(cfg: ISDCacheConfig) -> Mapping[str, List[str]]:
     asset_to_id = {asset: idx for idx, asset in enumerate(assets)}
 
     feature_cols = list(feature_columns)
+    target_col = TARGET_COLUMN
     if target_col in feature_cols:
         feature_cols = [target_col] + [c for c in feature_cols if c != target_col]
-    target_col = TARGET_COLUMN
 
     data_dir = Path(cfg.data_dir).expanduser().resolve()
     paths = CachePaths.from_dir(data_dir)
