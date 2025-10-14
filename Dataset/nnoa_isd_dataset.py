@@ -349,19 +349,32 @@ def list_isd_stations(
     inv["station_id"] = inv["usaf"].astype(str).str.zfill(6) + inv["wban"].astype(str).str.zfill(5)
 
     if country is not None and "country" in inv.columns:
-        inv = inv[inv["country"].str.upper() == country.upper()]
+        country_mask = inv["country"].str.upper() == country.upper()
+        country_mask = country_mask.fillna(False)
+        inv = inv.loc[country_mask]
 
     if stations is not None:
-        wanted = set(str(s) for s in stations)
-        inv = inv[inv["station_id"].isin(wanted)]
+        wanted = {str(s) for s in stations}
+        station_mask = inv["station_id"].isin(wanted)
+        inv = inv.loc[station_mask]
 
     if start_year is not None or end_year is not None:
         begin = pd.to_datetime(inv.get("begin")) if "begin" in inv.columns else None
         end = pd.to_datetime(inv.get("end")) if "end" in inv.columns else None
         if begin is not None:
-            inv = inv[begin.dt.year <= (start_year or begin.dt.year.min())]
+            begin_year = begin.dt.year
+            valid_begin = begin_year.dropna()
+            if not valid_begin.empty:
+                cutoff = start_year if start_year is not None else int(valid_begin.min())
+                begin_mask = begin_year <= cutoff
+                inv = inv.loc[begin_mask.fillna(False)]
         if end is not None:
-            inv = inv[end.dt.year >= (end_year or end.dt.year.max())]
+            end_years = end.dt.year
+            valid_end = end_years.dropna()
+            if not valid_end.empty:
+                cutoff = end_year if end_year is not None else int(valid_end.max())
+                end_mask = end_years >= cutoff
+                inv = inv.loc[end_mask.fillna(False)]
 
     inv = inv.sort_values("station_id")
 
@@ -567,6 +580,8 @@ def prepare_isd_cache(cfg: ISDCacheConfig) -> Mapping[str, List[str]]:
     asset_to_id = {asset: idx for idx, asset in enumerate(assets)}
 
     feature_cols = list(feature_columns)
+    if target_col in feature_cols:
+        feature_cols = [target_col] + [c for c in feature_cols if c != target_col]
     target_col = TARGET_COLUMN
 
     data_dir = Path(cfg.data_dir).expanduser().resolve()
