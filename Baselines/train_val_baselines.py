@@ -1,4 +1,6 @@
+import sys
 import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F_nn
@@ -6,7 +8,7 @@ from torch.cuda.amp import GradScaler, autocast
 
 import crypto_config
 from Dataset.fin_dataset import run_experiment
-from Baselines.dlinear import DLinear
+from Baselines.DLinear import DLinear
 
 def device_of():
     if torch.cuda.is_available():

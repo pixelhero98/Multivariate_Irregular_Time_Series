@@ -1,10 +1,10 @@
 # ============================ Data & Preprocessing ============================
-DATA_DIR = "/home/pyh/Documents/school/projects/yzn_ts/ldt/LLapDiT_Data/CRYPTO_130_data"
+DATA_DIR = "ldt/LLapDiT_Data/Crypto_100/crypto_data"
 MKT = DATA_DIR[60:-5]
 SEED = 42
 # --- Data Parameters ---
 PRED = 20            # Target sequence length to predict (H)
-WINDOW = 200           # Conditional input sequence length (K)
+WINDOW = 50           # Conditional input sequence length (K)
 COVERAGE = 0.8
 date_batching=True
 
