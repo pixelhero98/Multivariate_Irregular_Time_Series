@@ -14,9 +14,10 @@ import crypto_config
 from Dataset.fin_dataset import run_experiment
 from Baselines_bhb.DLinear import DLinear
 from Baselines_bhb.FEDformer import FEDformer
+from Baselines_bhb.NHiTS import NHiTS
 
 
-MODEL_REGISTRY = {"dlinear": DLinear, "fedformer": FEDformer}
+MODEL_REGISTRY = {"dlinear": DLinear, "fedformer": FEDformer, "nhits": NHiTS}
 
 
 def device_of():
@@ -31,7 +32,7 @@ def device_of():
 device = device_of()
 
 
-MODEL_NAME_OVERRIDE = 'fedformer'
+MODEL_NAME_OVERRIDE = 'nhits'
 model_name = (MODEL_NAME_OVERRIDE or getattr(crypto_config, "BASELINE_MODEL", "dlinear")).lower()
 if model_name not in MODEL_REGISTRY:
     raise SystemExit(f"Unknown baseline '{model_name}'. Available: {sorted(MODEL_REGISTRY)}")
@@ -109,6 +110,21 @@ elif model_name == "fedformer":
     epochs = getattr(crypto_config, "FEDFORMER_EPOCHS", 50)
     patience = getattr(crypto_config, "FEDFORMER_EARLY_STOP", 15)
     ckpt_subdir = "fedformer"
+elif model_name == "nhits":
+    model = MODEL_REGISTRY[model_name](
+        seq_len=K,
+        pred_len=H,
+        n_stacks=getattr(crypto_config, "NHITS_STACKS", 2),
+        n_blocks=getattr(crypto_config, "NHITS_BLOCKS", 3),
+        n_layers=getattr(crypto_config, "NHITS_LAYERS", 2),
+        hidden_size=getattr(crypto_config, "NHITS_HIDDEN", 128),
+        pooling_kernel_sizes=getattr(crypto_config, "NHITS_POOLINGS", (8, 4, 1)),
+    ).to(device)
+    lr = getattr(crypto_config, "NHITS_LR", 5e-4)
+    weight_decay = getattr(crypto_config, "NHITS_WD", 1e-4)
+    epochs = getattr(crypto_config, "NHITS_EPOCHS", 60)
+    patience = getattr(crypto_config, "NHITS_EARLY_STOP", 20)
+    ckpt_subdir = "nhits"
 else:  # pragma: no cover - safety net
     raise SystemExit(f"Unsupported model '{model_name}'")
 

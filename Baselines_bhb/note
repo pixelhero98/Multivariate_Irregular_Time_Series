@@ -1,0 +1,2 @@
+For running on mps, some code change: 1. FEDformer: _compl_mul1d_real
+2. (In def forward) Replaced the N-HiTS block’s adaptive average pooling with area-mode interpolation to preserve averaging downsampling without triggering MPS divisibility errors and documented the rationale in-line.
