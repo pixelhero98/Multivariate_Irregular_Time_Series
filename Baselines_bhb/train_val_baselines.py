@@ -15,9 +15,10 @@ from Dataset.fin_dataset import run_experiment
 from Baselines_bhb.DLinear import DLinear
 from Baselines_bhb.FEDformer import FEDformer
 from Baselines_bhb.NHiTS import NHiTS
+from Baselines_bhb.PatchTST import PatchTST
 
 
-MODEL_REGISTRY = {"dlinear": DLinear, "fedformer": FEDformer, "nhits": NHiTS}
+MODEL_REGISTRY = {"dlinear": DLinear, "fedformer": FEDformer, "nhits": NHiTS, "patchtst": PatchTST}
 
 
 def device_of():
@@ -32,7 +33,7 @@ def device_of():
 device = device_of()
 
 
-MODEL_NAME_OVERRIDE = 'nhits'
+MODEL_NAME_OVERRIDE = 'patchtst'
 model_name = (MODEL_NAME_OVERRIDE or getattr(crypto_config, "BASELINE_MODEL", "dlinear")).lower()
 if model_name not in MODEL_REGISTRY:
     raise SystemExit(f"Unknown baseline '{model_name}'. Available: {sorted(MODEL_REGISTRY)}")
@@ -125,6 +126,24 @@ elif model_name == "nhits":
     epochs = getattr(crypto_config, "NHITS_EPOCHS", 60)
     patience = getattr(crypto_config, "NHITS_EARLY_STOP", 20)
     ckpt_subdir = "nhits"
+elif model_name == "patchtst":
+    model = MODEL_REGISTRY[model_name](
+        seq_len=K,
+        pred_len=H,
+        patch_len=getattr(crypto_config, "PATCHTST_PATCH_LEN", 16),
+        stride=getattr(crypto_config, "PATCHTST_STRIDE", 8),
+        d_model=getattr(crypto_config, "PATCHTST_D_MODEL", 64),
+        n_heads=getattr(crypto_config, "PATCHTST_N_HEADS", 4),
+        n_layers=getattr(crypto_config, "PATCHTST_ENCODER_LAYERS", 2),
+        d_ff=getattr(crypto_config, "PATCHTST_FF", 128),
+        dropout=getattr(crypto_config, "PATCHTST_DROPOUT", 0.1),
+        head_hidden=getattr(crypto_config, "PATCHTST_HEAD_HIDDEN", 128),
+    ).to(device)
+    lr = getattr(crypto_config, "PATCHTST_LR", 3e-4)
+    weight_decay = getattr(crypto_config, "PATCHTST_WD", 1e-4)
+    epochs = getattr(crypto_config, "PATCHTST_EPOCHS", 80)
+    patience = getattr(crypto_config, "PATCHTST_EARLY_STOP", 20)
+    ckpt_subdir = "patchtst"
 else:  # pragma: no cover - safety net
     raise SystemExit(f"Unsupported model '{model_name}'")
 
