@@ -17,9 +17,15 @@ from Baselines_bhb.FEDformer import FEDformer
 from Baselines_bhb.NHiTS import NHiTS
 from Baselines_bhb.PatchTST import PatchTST
 from Baselines_bhb.iTransformer import ITransformer
+from Baselines_bhb.TimeGrad import TimeGradLight
 
 
-MODEL_REGISTRY = {"dlinear": DLinear, "fedformer": FEDformer, "nhits": NHiTS, "patchtst": PatchTST,  "itransformer": ITransformer,}
+MODEL_REGISTRY = {"dlinear": DLinear,
+                  "fedformer": FEDformer,
+                  "nhits": NHiTS,
+                  "patchtst": PatchTST,
+                  "itransformer": ITransformer,
+                  "timegrad": TimeGradLight,}
 
 
 def device_of():
@@ -34,7 +40,7 @@ def device_of():
 device = device_of()
 
 
-MODEL_NAME_OVERRIDE = 'itransformer'
+MODEL_NAME_OVERRIDE = 'timegrad'
 model_name = (MODEL_NAME_OVERRIDE or getattr(crypto_config, "BASELINE_MODEL", "dlinear")).lower()
 if model_name not in MODEL_REGISTRY:
     raise SystemExit(f"Unknown baseline '{model_name}'. Available: {sorted(MODEL_REGISTRY)}")
@@ -161,6 +167,26 @@ elif model_name == "itransformer":
     epochs = getattr(crypto_config, "ITRANSFORMER_EPOCHS", 80)
     patience = getattr(crypto_config, "ITRANSFORMER_EARLY_STOP", 20)
     ckpt_subdir = "itransformer"
+elif model_name == "timegrad":
+    model = MODEL_REGISTRY[model_name](
+        seq_len=K,
+        pred_len=H,
+        hidden_size=getattr(crypto_config, "TIMEGRAD_HIDDEN", 64),
+        encoder_layers=getattr(crypto_config, "TIMEGRAD_ENCODER_LAYERS", 1),
+        diffusion_steps=getattr(crypto_config, "TIMEGRAD_DIFFUSION_STEPS", 16),
+        cond_hidden=getattr(crypto_config, "TIMEGRAD_COND_HIDDEN", 128),
+        noise_hidden=getattr(crypto_config, "TIMEGRAD_NOISE_HIDDEN", 128),
+        noise_layers=getattr(crypto_config, "TIMEGRAD_NOISE_LAYERS", 2),
+        dropout=getattr(crypto_config, "TIMEGRAD_DROPOUT", 0.1),
+        beta_start=getattr(crypto_config, "TIMEGRAD_BETA_START", 1e-4),
+        beta_end=getattr(crypto_config, "TIMEGRAD_BETA_END", 2e-2),
+        deterministic_eval=getattr(crypto_config, "TIMEGRAD_DETERMINISTIC_EVAL", True),
+    ).to(device)
+    lr = getattr(crypto_config, "TIMEGRAD_LR", 2e-4)
+    weight_decay = getattr(crypto_config, "TIMEGRAD_WD", 1e-4)
+    epochs = getattr(crypto_config, "TIMEGRAD_EPOCHS", 80)
+    patience = getattr(crypto_config, "TIMEGRAD_EARLY_STOP", 20)
+    ckpt_subdir = "timegrad"
 else:  # pragma: no cover - safety net
     raise SystemExit(f"Unsupported model '{model_name}'")
 
