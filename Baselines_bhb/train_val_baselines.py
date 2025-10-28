@@ -18,6 +18,7 @@ from Baselines_bhb.NHiTS import NHiTS
 from Baselines_bhb.PatchTST import PatchTST
 from Baselines_bhb.iTransformer import ITransformer
 from Baselines_bhb.TimeGrad import TimeGradLight
+from Baselines_bhb.ScoreGrad import ScoreGradLight
 
 
 MODEL_REGISTRY = {"dlinear": DLinear,
@@ -25,7 +26,9 @@ MODEL_REGISTRY = {"dlinear": DLinear,
                   "nhits": NHiTS,
                   "patchtst": PatchTST,
                   "itransformer": ITransformer,
-                  "timegrad": TimeGradLight,}
+                  "timegrad": TimeGradLight,
+                  "scoregrad": ScoreGradLight,
+                  }
 
 
 def device_of():
@@ -187,6 +190,27 @@ elif model_name == "timegrad":
     epochs = getattr(crypto_config, "TIMEGRAD_EPOCHS", 80)
     patience = getattr(crypto_config, "TIMEGRAD_EARLY_STOP", 20)
     ckpt_subdir = "timegrad"
+elif model_name == "scoregrad":
+    model = MODEL_REGISTRY[model_name](
+        seq_len=K,
+        pred_len=H,
+        hidden_size=getattr(crypto_config, "SCOREGRAD_HIDDEN", 64),
+        encoder_layers=getattr(crypto_config, "SCOREGRAD_ENCODER_LAYERS", 1),
+        dropout=getattr(crypto_config, "SCOREGRAD_DROPOUT", 0.1),
+        cond_hidden=getattr(crypto_config, "SCOREGRAD_COND_HIDDEN", 128),
+        score_hidden=getattr(crypto_config, "SCOREGRAD_SCORE_HIDDEN", 128),
+        score_layers=getattr(crypto_config, "SCOREGRAD_SCORE_LAYERS", 2),
+        time_embed_dim=getattr(crypto_config, "SCOREGRAD_TIME_EMBED", 64),
+        sde_steps=getattr(crypto_config, "SCOREGRAD_SDE_STEPS", 20),
+        beta_min=getattr(crypto_config, "SCOREGRAD_BETA_MIN", 0.1),
+        beta_max=getattr(crypto_config, "SCOREGRAD_BETA_MAX", 20.0),
+        deterministic_eval=getattr(crypto_config, "SCOREGRAD_DETERMINISTIC_EVAL", True),
+    ).to(device)
+    lr = getattr(crypto_config, "SCOREGRAD_LR", 2e-4)
+    weight_decay = getattr(crypto_config, "SCOREGRAD_WD", 1e-4)
+    epochs = getattr(crypto_config, "SCOREGRAD_EPOCHS", 80)
+    patience = getattr(crypto_config, "SCOREGRAD_EARLY_STOP", 20)
+    ckpt_subdir = "scoregrad"
 else:  # pragma: no cover - safety net
     raise SystemExit(f"Unsupported model '{model_name}'")
 
