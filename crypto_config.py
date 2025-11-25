@@ -55,7 +55,7 @@ CKPT_DIR = "./ldt/checkpoints/" + MKT
 TIMESTEPS     = 1000
 # Recommended to try "cosine", as it pairs well with v-prediction.
 SCHEDULE      = "cosine"     # ["cosine", "linear"]
-PREDICT_TYPE  = "v"          # ["v", "eps"]
+PREDICT_TYPE  = "x0"          # ["x0", "v", "eps"]
 
 # --- Loss Function ---
 # 'weighted_min_snr' is highly recommended. Set to 'none' to disable.
