@@ -487,7 +487,7 @@ def diffusion_loss(
     t: torch.Tensor,
     *,
     cond_summary: Optional[torch.Tensor],
-    predict_type: str = "v",                 # "v" or "eps"
+    predict_type: str = "x0",                # "x0", "v" or "eps"
     weight_scheme: str = "none",             # "none" or "weighted_min_snr"
     minsnr_gamma: float = 5.0,
     sc_feat: Optional[torch.Tensor] = None,
@@ -527,8 +527,10 @@ def diffusion_loss(
         target = eps_true
     elif predict_type == "v":
         target = scheduler.v_from_eps(x_t, t, eps_true)
+    elif predict_type == "x0":
+        target = x0_lat_norm
     else:
-        raise ValueError(f"Unknown predict_type '{predict_type}'. Use 'v' or 'eps'.")
+        raise ValueError(f"Unknown predict_type '{predict_type}'. Use 'x0', 'v', or 'eps'.")
 
     # --- Per-sample MSE with full-mean reduction (resolution-invariant) ---
     err = (pred - target).pow(2)                        # [B, ...]
@@ -620,3 +622,70 @@ def calculate_v_variance(scheduler, dataloader, vae, device, latent_stats):
     v_variance = all_v_targets_cat.var(correction=0).item()
 
     return v_variance
+
+
+@torch.no_grad()
+def calculate_x0_variance(dataloader, device, *, latent_encoder=None):
+    """
+    Calculates the variance of the ``x0`` targets over a given dataloader.
+
+    Args:
+        dataloader: Iterable providing ``(xb, yb, meta)`` batches.
+        device: Torch device to place tensors on for computation.
+        latent_encoder: Optional callable to map the flattened targets to the
+            model's ``x0`` space (e.g. encoding through a VAE). When ``None``,
+            the flattened targets are used directly.
+
+    Returns:
+        Scalar variance of the ``x0`` targets or ``nan`` if no valid batches
+        were found.
+    """
+
+    sum1 = 0.0
+    sum2 = 0.0
+    count = 0
+
+    for _, yb, meta in dataloader:
+        y_in, _ = flatten_targets(yb, meta["entity_mask"], device)
+        if y_in is None:
+            continue
+
+        x0 = latent_encoder(y_in) if latent_encoder is not None else y_in
+        sum1 += x0.sum().item()
+        sum2 += (x0 * x0).sum().item()
+        count += x0.numel()
+
+    if count == 0:
+        print("Warning: No valid data found to calculate x0 variance.")
+        return float("nan")
+
+    mean = sum1 / count
+    variance = max(sum2 / count - mean * mean, 0.0)
+    return variance
+
+
+@torch.no_grad()
+def calculate_target_variance(
+    *,
+    predict_type: str,
+    dataloader,
+    device,
+    scheduler=None,
+    latent_encoder=None,
+    vae=None,
+    latent_stats=None,
+):
+    """Dispatch variance calculation based on prediction parameterisation."""
+
+    if predict_type == "v":
+        if scheduler is None or dataloader is None or vae is None or latent_stats is None:
+            raise ValueError("scheduler, dataloader, vae, and latent_stats are required for v variance.")
+        return calculate_v_variance(scheduler, dataloader, vae, device, latent_stats)
+    if predict_type == "eps":
+        return 1.0  # standard normal noise
+    if predict_type == "x0":
+        if dataloader is None:
+            raise ValueError("dataloader is required for x0 variance calculation.")
+        return calculate_x0_variance(dataloader, device, latent_encoder=latent_encoder)
+
+    raise ValueError("predict_type must be one of 'x0', 'v', or 'eps'.")
