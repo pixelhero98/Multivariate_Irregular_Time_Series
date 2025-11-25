@@ -11,12 +11,20 @@ from Dataset.data_gen import run_experiment
 from Latent_Space.latent_vae import LatentVAE
 from Model.summarizer import LaplaceAE
 from Model.llapdit import LLapDiT
-from Model.llapdit_utils import (EMA, set_torch, encode_mu_norm, _flatten_for_mask,
-                                 make_warmup_cosine, calculate_v_variance,
-                                 compute_latent_stats, diffusion_loss,
-                                 build_context, flatten_targets,
-                                 sample_t_uniform, decode_latents_with_vae
-                                 )
+from Model.llapdit_utils import (
+    EMA,
+    set_torch,
+    encode_mu_norm,
+    _flatten_for_mask,
+    make_warmup_cosine,
+    calculate_target_variance,
+    compute_latent_stats,
+    diffusion_loss,
+    build_context,
+    flatten_targets,
+    sample_t_uniform,
+    decode_latents_with_vae,
+)
 
 LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
 
@@ -151,17 +159,23 @@ def run(
         lap_mode_main=config.LAP_MODE
     ).to(device)
 
-    # ---- Calculate the variance of the v-prediction target ----
-    v_variance = calculate_v_variance(
+    # ---- Calculate the variance of the chosen prediction target ----
+    baseline_target_variance = calculate_target_variance(
+        predict_type=config.PREDICT_TYPE,
         scheduler=diff_model.scheduler,
         dataloader=val_dl,
         vae=vae,
         device=device,
-        latent_stats=(mu_mean, mu_std)
+        latent_stats=(mu_mean, mu_std),
+        latent_encoder=lambda y_in: encode_mu_norm(
+            vae,
+            y_in,
+            mu_mean=mu_mean,
+            mu_std=mu_std,
+        ),
     )
-    print(f"calculated V-Prediction Target Variance: {v_variance:.4f}")
+    print(f"Calculated target variance ({config.PREDICT_TYPE}-prediction): {baseline_target_variance:.4f}")
     print("=========================================================")
-    baseline_v_variance = float(v_variance)
 
     ema = EMA(diff_model, decay=config.EMA_DECAY) if config.USE_EMA_EVAL else None
 
@@ -353,13 +367,13 @@ def run(
             val_loss, cond_gap = validate()
             Z = config.VAE_LATENT_CHANNELS
             val_vs_baseline = (
-                val_loss / baseline_v_variance
-                if baseline_v_variance and baseline_v_variance > 0
+                val_loss / baseline_target_variance
+                if baseline_target_variance and baseline_target_variance > 0
                 else float('inf')
             )
             improvement = (
-                baseline_v_variance - val_loss
-                if baseline_v_variance is not None
+                baseline_target_variance - val_loss
+                if baseline_target_variance is not None
                 else float('nan')
             )
             cond_gap_scaled = cond_gap * Z if math.isfinite(cond_gap) else float('nan')
@@ -462,7 +476,7 @@ def run(
         'val_loader': val_dl,
         'test_loader': test_dl,
         'sizes': sizes,
-        'baseline_v_variance': baseline_v_variance,
+        'baseline_target_variance': baseline_target_variance,
         'best_val': best_val if math.isfinite(best_val) else None,
         'best_checkpoint': best_checkpoint,
         'loaded_checkpoint': loaded_checkpoint,
