@@ -87,11 +87,15 @@ class LLapDiT(nn.Module):
         series_dt: Optional[torch.Tensor] = None,
         series_diff: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Predict ``eps`` or ``v`` for a batch of noisy inputs ``x_t``.
+        """Predict diffusion outputs for a batch of noisy inputs ``x_t``.
 
-        The method delegates temporal reasoning to :class:`LapFormer`.  Only the
-        externally supplied ``cond_summary`` is consumed for conditioning; the
-        legacy in-module summarisation hooks now raise informative errors.
+        The prediction parameterisation is controlled by ``self.predict_type``
+        which defaults to ``"x0"`` for direct clean-signal regression (preferred
+        for training). Alternative parameterisations (``"eps"`` or ``"v"``) are
+        also supported. The method delegates temporal reasoning to
+        :class:`LapFormer`. Only the externally supplied ``cond_summary`` is
+        consumed for conditioning; the legacy in-module summarisation hooks now
+        raise informative errors.
         """
 
         if cond_summary is None:

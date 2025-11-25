@@ -494,7 +494,7 @@ def diffusion_loss(
     reuse_xt_eps: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """
-    MSE on v/eps with optional MinSNR weighting.
+    MSE on x0/v/eps with optional MinSNR weighting.
 
     Args:
         model: callable(x_t, t, cond_summary=..., sc_feat=...) -> pred
@@ -505,7 +505,7 @@ def diffusion_loss(
         x0_lat_norm: [B, ...] clean latents (normalized)
         t: [B] timesteps (int or float tensor)
         cond_summary: optional conditioning tensor
-        predict_type: "v" (default) or "eps"
+        predict_type: "x0" (default), "v", or "eps"
         weight_scheme: "none" (default) or "weighted_min_snr"
         minsnr_gamma: gamma for MinSNR
         sc_feat: optional side-channel features
