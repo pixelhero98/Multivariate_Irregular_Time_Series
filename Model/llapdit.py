@@ -15,8 +15,9 @@ class LLapDiT(nn.Module):
     """Latent Laplace-DiT for multivariate time series with global conditioning.
 
     The model consumes noisy inputs together with optional external summaries
-    (e.g. from a frozen encoder) and predicts either the noise ``eps`` or the
-    velocity ``v`` depending on ``predict_type``.
+    (e.g. from a frozen encoder) and predicts the clean ``x0`` target by
+    default. Alternative parameterisations (``eps`` or ``v``) remain supported
+    via ``predict_type``.
     """
 
     def __init__(
@@ -26,7 +27,7 @@ class LLapDiT(nn.Module):
         num_layers: int,
         num_heads: int,
         *,
-        predict_type: str = "v",
+        predict_type: str = "x0",
         laplace_k: Union[int, List[int]] = 32,
         timesteps: int = 1000,
         schedule: str = "cosine",
@@ -36,9 +37,9 @@ class LLapDiT(nn.Module):
         lap_mode_main: str = "effective",
     ) -> None:
         super().__init__()
-        if predict_type not in {"eps", "v"}:
-            raise ValueError("predict_type must be either 'eps' or 'v'")
-
+        if predict_type not in {"eps", "v", "x0"}:
+            raise ValueError("predict_type must be either 'eps', 'v', or 'x0'")
+            
         self.predict_type = predict_type
         self.self_conditioning = bool(self_conditioning)
 
