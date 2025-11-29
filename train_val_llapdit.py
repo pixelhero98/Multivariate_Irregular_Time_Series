@@ -24,6 +24,7 @@ from Model.llapdit_utils import (
     flatten_targets,
     sample_t_uniform,
     decode_latents_with_vae,
+    plot_laplace_poles,
 )
 
 LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
@@ -188,6 +189,30 @@ def run(
                                   base_lr=config.BASE_LR,
                                   min_lr=config.MIN_LR)
     scaler = GradScaler(enabled=(device.type == "cuda"))
+
+    pole_plot_dir = Path(getattr(config, "POLE_PLOT_DIR", Path(config.OUT_DIR) / "pole_plots"))
+    if getattr(config, "SAVE_POLE_PLOTS", True):
+        pole_plot_dir.mkdir(parents=True, exist_ok=True)
+
+    def export_pole_plot(stage: str):
+        if not getattr(config, "SAVE_POLE_PLOTS", True):
+            return None
+        use_ema = ema is not None and getattr(config, "USE_EMA_EVAL", False)
+        if use_ema:
+            ema.store(diff_model)
+            ema.copy_to(diff_model)
+        try:
+            title = f"LLapDiT denoising poles ({stage})"
+            fname = f"llapdit_poles_{stage}.pdf"
+            return plot_laplace_poles(
+                [diff_model.model],
+                pole_plot_dir / fname,
+                title=title,
+                tag_prefix=f"{stage}-",
+            )
+        finally:
+            if use_ema:
+                ema.restore(diff_model)
 
     # ============================ train/val loops ============================
     def train_one_epoch(epoch: int) -> float:
@@ -470,6 +495,10 @@ def run(
         aggregation_method='mean',
         quantiles=(0.1, 0.5, 0.9),
     )
+
+    if getattr(config, "SAVE_POLE_PLOTS", True):
+        export_pole_plot("val")
+        export_pole_plot("test")
 
     return {
         'train_loader': train_dl,

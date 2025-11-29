@@ -1,6 +1,7 @@
 """Utility helpers used by LLapDiT diffusion models."""
 
 import math
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import torch
@@ -308,6 +309,87 @@ def _print_log(metrics: dict, step: int, csv_path: str = None):
             if write_header:
                 w.writerow(head)
             w.writerow(row)
+
+
+@torch.no_grad()
+def collect_laplace_poles(modules: List[nn.Module], tag_prefix: str = "") -> List[dict]:
+    """Return decay/frequency pairs for all Laplace encoders under ``modules``.
+
+    Args:
+        modules: Sequence of modules to search for :class:`LaplaceTransformEncoder`.
+        tag_prefix: Optional prefix applied to every recorded pole set label.
+
+    Returns:
+        List of dictionaries with ``label``, ``alpha`` and ``omega`` tensors on CPU.
+    """
+
+    from Model.laptrans import LaplaceTransformEncoder
+
+    poles = []
+    for mod in modules:
+        for name, lap in mod.named_modules():
+            if isinstance(lap, LaplaceTransformEncoder):
+                tau = torch.nn.functional.softplus(lap._tau) + 1e-3
+                alpha = lap.s_real.clamp_min(lap.alpha_min) * tau
+                omega = lap.s_imag * tau
+                label = f"{tag_prefix}{name or lap.__class__.__name__}"
+                poles.append({
+                    "label": label,
+                    "alpha": alpha.detach().cpu(),
+                    "omega": omega.detach().cpu(),
+                })
+    return poles
+
+
+@torch.no_grad()
+def plot_laplace_poles(
+    modules: List[nn.Module],
+    save_path: Path,
+    *,
+    title: Optional[str] = None,
+    tag_prefix: str = "",
+) -> Optional[Path]:
+    """Save a scatter plot of Laplace pole locations (frequency vs. decay).
+
+    Args:
+        modules: Iterable of modules containing Laplace encoders to visualise.
+        save_path: Destination ``.pdf`` path for the plot.
+        title: Optional plot title.
+        tag_prefix: Prepended to each legend label (useful for stage tags).
+
+    Returns:
+        The ``Path`` to the saved file, or ``None`` when no poles are found.
+    """
+
+    pole_sets = collect_laplace_poles(modules, tag_prefix=tag_prefix)
+    if not pole_sets:
+        print("[poles] no Laplace encoders found; skipping plot")
+        return None
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6.0, 4.0))
+    for entry in pole_sets:
+        alpha = entry["alpha"].flatten().numpy()
+        omega = entry["omega"].flatten().numpy()
+        ax.scatter(omega, alpha, s=18, alpha=0.75, label=entry["label"])
+
+    ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
+    ax.set_xlabel("Frequency ω (radians / step)")
+    ax.set_ylabel("Decay rate α (>= 0)")
+    if title:
+        ax.set_title(title)
+    if len(pole_sets) > 1:
+        ax.legend(loc="best", fontsize="small")
+
+    fig.tight_layout()
+    fig.savefig(save_path, format="pdf")
+    plt.close(fig)
+    print(f"[poles] saved plot to {save_path}")
+    return save_path
 
 
 # ============================ VAE Latent stats helpers ============================
