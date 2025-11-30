@@ -312,12 +312,16 @@ def _print_log(metrics: dict, step: int, csv_path: str = None):
 
 
 @torch.no_grad()
-def collect_laplace_poles(modules: List[nn.Module], tag_prefix: str = "") -> List[dict]:
+def collect_laplace_poles(
+    modules: List[nn.Module], tag_prefix: str = "", prediction_length: Optional[int] = None
+) -> List[dict]:
     """Return decay/frequency pairs for all Laplace encoders under ``modules``.
 
     Args:
         modules: Sequence of modules to search for :class:`LaplaceTransformEncoder`.
         tag_prefix: Optional prefix applied to every recorded pole set label.
+        prediction_length: Optional horizon identifier added to each entry to
+            distinguish plots produced for different prediction lengths.
 
     Returns:
         List of dictionaries with ``label``, ``alpha`` and ``omega`` tensors on CPU.
@@ -337,6 +341,7 @@ def collect_laplace_poles(modules: List[nn.Module], tag_prefix: str = "") -> Lis
                     "label": label,
                     "alpha": alpha.detach().cpu(),
                     "omega": omega.detach().cpu(),
+                    "prediction_length": prediction_length,
                 })
     return poles
 
@@ -348,6 +353,7 @@ def plot_laplace_poles(
     *,
     title: Optional[str] = None,
     tag_prefix: str = "",
+    prediction_length: Optional[int] = None,
 ) -> Optional[Path]:
     """Save a scatter plot of Laplace pole locations (frequency vs. decay).
 
@@ -356,12 +362,16 @@ def plot_laplace_poles(
         save_path: Destination ``.pdf`` path for the plot.
         title: Optional plot title.
         tag_prefix: Prepended to each legend label (useful for stage tags).
+        prediction_length: Optional prediction horizon identifier used to colour
+            and label pole sets.
 
     Returns:
         The ``Path`` to the saved file, or ``None`` when no poles are found.
     """
 
-    pole_sets = collect_laplace_poles(modules, tag_prefix=tag_prefix)
+    pole_sets = collect_laplace_poles(
+        modules, tag_prefix=tag_prefix, prediction_length=prediction_length
+    )
     if not pole_sets:
         print("[poles] no Laplace encoders found; skipping plot")
         return None
@@ -372,10 +382,31 @@ def plot_laplace_poles(
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(6.0, 4.0))
+    color_cycle = plt.rcParams.get("axes.prop_cycle", None)
+    palette = color_cycle.by_key()["color"] if color_cycle is not None else None
+    pred_colors = {}
+
     for entry in pole_sets:
         alpha = entry["alpha"].flatten().numpy()
         omega = entry["omega"].flatten().numpy()
-        ax.scatter(omega, alpha, s=18, alpha=0.75, label=entry["label"])
+        label_bits = []
+        pred_len = entry.get("prediction_length")
+        if pred_len is not None:
+            label_bits.append(f"pred={pred_len}")
+        label_bits.append(entry["label"])
+
+        color = None
+        if pred_len is not None and palette:
+            color = pred_colors.setdefault(pred_len, palette[len(pred_colors) % len(palette)])
+
+        ax.scatter(
+            omega,
+            alpha,
+            s=18,
+            alpha=0.75,
+            label=" | ".join(label_bits),
+            color=color,
+        )
 
     ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
     ax.set_xlabel("Frequency ω (radians / step)")
