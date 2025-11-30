@@ -209,6 +209,7 @@ def run(
                 pole_plot_dir / fname,
                 title=title,
                 tag_prefix=f"{stage}-pred{config.PRED}-",
+                prediction_length=config.PRED,
             )
         finally:
             if use_ema:

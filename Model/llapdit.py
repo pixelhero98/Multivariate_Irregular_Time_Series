@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 from Model.lapformer import LapFormer
 from Model.llapdit_utils import NoiseScheduler
-from Model.pos_time_emb import timestep_embedding
 
 
 class LLapDiT(nn.Module):
@@ -47,6 +46,10 @@ class LLapDiT(nn.Module):
         # Diffusion scheduler utilities (not exercised in forward-only tests).
         self.scheduler = NoiseScheduler(timesteps=timesteps, schedule=schedule)
 
+        # Learned timestep embedding (replaces sinusoidal positional embedding).
+        self.time_embed = nn.Embedding(timesteps, hidden_dim)
+        nn.init.normal_(self.time_embed.weight, std=0.02)
+
         # Main LapFormer backbone (mode tied to external summariser if any).
         self.model = LapFormer(
             input_dim=data_dim,
@@ -66,10 +69,9 @@ class LLapDiT(nn.Module):
     # Embeddings & conditioning
     # -------------------------------
     def _time_embed(self, t: torch.Tensor) -> torch.Tensor:
-        """Return a SiLU-activated sinusoidal embedding for diffusion steps."""
+        """Return a learned embedding for diffusion steps."""
 
-        te = timestep_embedding(t, self.time_dim)  # [B, H]
-        return F.silu(te)
+        return F.silu(self.time_embed(t.long()))
 
     # -------------------------------
     # Forward call
