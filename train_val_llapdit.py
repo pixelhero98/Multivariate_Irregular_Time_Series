@@ -202,13 +202,13 @@ def run(
             ema.store(diff_model)
             ema.copy_to(diff_model)
         try:
-            title = f"LLapDiT denoising poles ({stage})"
-            fname = f"llapdit_poles_{stage}.pdf"
+            title = f"LLapDiT denoising poles ({stage}, pred={config.PRED})"
+            fname = f"llapdit_poles_pred{config.PRED}_{stage}.pdf"
             return plot_laplace_poles(
                 [diff_model.model],
                 pole_plot_dir / fname,
                 title=title,
-                tag_prefix=f"{stage}-",
+                tag_prefix=f"{stage}-pred{config.PRED}-",
             )
         finally:
             if use_ema:
