@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 
 from Model.laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
-from Model.pos_time_emb import get_sinusoidal_pos_emb
 
 
 def _canon_mode(mode: str) -> str:
@@ -291,12 +290,6 @@ class LapFormer(nn.Module):
         if len(ks) != num_layers:
             raise ValueError("laplace_k list must match num_layers")
 
-        self.register_buffer(
-            "pos_cache",
-            get_sinusoidal_pos_emb(L=1024, dim=hidden_dim, device=torch.device("cpu")),
-            persistent=False,
-        )
-
         self.summary2lap = nn.ModuleList([nn.Linear(hidden_dim, 2 * k) for k in ks])
         self.summary2hid = nn.ModuleList([nn.Linear(2 * k, hidden_dim) for k in ks])
 
@@ -325,13 +318,9 @@ class LapFormer(nn.Module):
         nn.init.zeros_(self.head_proj.bias)
 
     def _pos(self, seq_len: int, batch: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Return (and lazily extend) cached sinusoidal positional encodings."""
+        """Return a zero positional embedding to disable sinusoidal encodings."""
 
-        if self.pos_cache.shape[1] < seq_len:
-            self.pos_cache = get_sinusoidal_pos_emb(
-                seq_len, self.hidden_dim, device=self.pos_cache.device
-            ).to(dtype=self.pos_cache.dtype)
-        return self.pos_cache[:, :seq_len, :].to(device=device, dtype=dtype).expand(batch, -1, -1)
+        return torch.zeros(batch, seq_len, self.hidden_dim, device=device, dtype=dtype)
 
     def forward(
         self,
