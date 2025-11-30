@@ -16,8 +16,9 @@ class LLapDiT(nn.Module):
 
     The model consumes noisy inputs together with optional external summaries
     (e.g. from a frozen encoder) and predicts the clean ``x0`` target by
-    default. Alternative parameterisations (``eps`` or ``v``) remain supported
-    via ``predict_type``.
+    default. This makes the module immediately usable for x0-parameterised
+    training runs without any adaptation. Alternative parameterisations
+    (``eps`` or ``v``) remain supported via ``predict_type``.
     """
 
     def __init__(
