@@ -380,13 +380,87 @@ def plot_laplace_poles(
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     import matplotlib.pyplot as plt
+    import numpy as np
 
     fig, ax = plt.subplots(figsize=(6.0, 4.0))
     color_cycle = plt.rcParams.get("axes.prop_cycle", None)
     palette = color_cycle.by_key()["color"] if color_cycle is not None else None
     pred_colors = {}
 
-    for entry in pole_sets:
+    def _convex_hull(points: np.ndarray) -> Optional[np.ndarray]:
+        """Return points on the convex hull (monotonic chain, O(n log n))."""
+
+        if points.shape[0] < 3:
+            return None
+        pts = np.unique(points, axis=0)
+        if pts.shape[0] < 3:
+            return None
+        pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+
+        def cross(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        lower = []
+        for p in pts:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+        upper = []
+        for p in reversed(pts):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+        hull = np.array(lower[:-1] + upper[:-1])
+        return hull if hull.shape[0] >= 3 else None
+
+    alpha_arrays = [entry["alpha"].flatten().numpy() for entry in pole_sets]
+    omega_arrays = [entry["omega"].flatten().numpy() for entry in pole_sets]
+    all_points = None
+    if alpha_arrays and omega_arrays:
+        all_points = np.concatenate(
+            [np.stack([w, a], axis=1) for w, a in zip(omega_arrays, alpha_arrays)], axis=0
+        )
+
+    avg_entry = None
+    if alpha_arrays and omega_arrays:
+        unique_lengths = {arr.shape[0] for arr in alpha_arrays}
+        if len(unique_lengths) == 1:
+            alpha_mean = np.stack(alpha_arrays, axis=0).mean(axis=0)
+            omega_mean = np.stack(omega_arrays, axis=0).mean(axis=0)
+            avg_entry = {
+                "label": f"{tag_prefix}denoising-avg",
+                "alpha": alpha_mean,
+                "omega": omega_mean,
+                "prediction_length": prediction_length,
+            }
+        else:
+            print(
+                "[poles] pole counts differ across layers; skipping averaged overlay"
+            )
+
+    if all_points is not None and all_points.shape[0] >= 3:
+        hull = _convex_hull(all_points)
+        if hull is not None:
+            ax.fill(
+                hull[:, 0],
+                hull[:, 1],
+                color=(palette[0] if palette else "grey"),
+                alpha=0.08,
+                linewidth=0,
+            )
+
+    for omega, alpha in zip(omega_arrays, alpha_arrays):
+        ax.scatter(
+            omega,
+            alpha,
+            s=12,
+            alpha=0.35,
+            color=(palette[1] if palette and len(palette) > 1 else "#6c757d"),
+            label=None,
+        )
+
+    plot_entries = pole_sets if avg_entry is None else [avg_entry]
+    for entry in plot_entries:
         alpha = entry["alpha"].flatten().numpy()
         omega = entry["omega"].flatten().numpy()
         label_bits = []
@@ -413,11 +487,11 @@ def plot_laplace_poles(
     ax.set_ylabel("Decay rate α (>= 0)")
     if title:
         ax.set_title(title)
-    if len(pole_sets) > 1:
-        ax.legend(loc="best", fontsize="small")
+    if plot_entries:
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize="small")
 
     fig.tight_layout()
-    fig.savefig(save_path, format="pdf")
+    fig.savefig(save_path, format="pdf", bbox_inches="tight")
     plt.close(fig)
     print(f"[poles] saved plot to {save_path}")
     return save_path
