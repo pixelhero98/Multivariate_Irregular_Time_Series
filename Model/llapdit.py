@@ -35,13 +35,18 @@ class LLapDiT(nn.Module):
         attn_dropout: float = 0.0,
         self_conditioning: bool = False,
         lap_mode_main: str = "effective",
+        patch_size: int = 1
     ) -> None:
         super().__init__()
         if predict_type not in {"eps", "v", "x0"}:
             raise ValueError("predict_type must be either 'eps', 'v', or 'x0'")
-            
+
+        # Store data_dim and patch_size
         self.predict_type = predict_type
         self.self_conditioning = bool(self_conditioning)
+
+        self.data_dim = int(data_dim)
+        self.patch_size = int(patch_size)
 
         # Diffusion scheduler utilities (not exercised in forward-only tests).
         self.scheduler = NoiseScheduler(timesteps=timesteps, schedule=schedule)
@@ -63,6 +68,14 @@ class LLapDiT(nn.Module):
             self_conditioning=self_conditioning,
         )
 
+        # Patch embedding / unembedding (no-op when patch_size == 1)
+        if self.patch_size > 1:
+            self.patch_embed = nn.Linear(self.data_dim * self.patch_size, self.data_dim)
+            self.patch_unembed = nn.Linear(self.data_dim, self.data_dim * self.patch_size)
+        else:
+            self.patch_embed = None
+            self.patch_unembed = None
+            
         self.time_dim = hidden_dim  # time embedding dimension
 
     # -------------------------------
@@ -72,7 +85,61 @@ class LLapDiT(nn.Module):
         """Return a learned embedding for diffusion steps."""
 
         return F.silu(self.time_embed(t.long()))
+        
+    # -------------------------------
+    # Patchifying helpers
+    # -------------------------------
+    def _patchify(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert [B, L, D] -> [B, L', D] with temporal patches of size P."""
+        if self.patch_size == 1:
+            return x
 
+        B, L, D = x.shape
+        P = self.patch_size
+
+        # Pad in time so that L' = ceil(L / P)
+        Lp = (L + P - 1) // P
+        L_pad = Lp * P
+        if L_pad != L:
+            # pad on the time dimension (dim=1)
+            pad_T = L_pad - L
+            x = F.pad(x, (0, 0, 0, pad_T))  # [B, L_pad, D]
+
+        # Group into patches and linearly project to data_dim
+        x = x.view(B, Lp, P * D)  # [B, L', P*D]
+        if self.patch_embed is not None:
+            x = self.patch_embed(x)  # [B, L', D]
+
+        return x
+
+    def _unpatchify(self, x: torch.Tensor, L_out: int) -> torch.Tensor:
+        """Convert patch tokens [B, L', D] back to [B, L_out, D]."""
+        if self.patch_size == 1:
+            return x
+
+        B, Lp, D = x.shape
+        P = self.patch_size
+
+        # Undo the patch projection and regroup along time.
+        if self.patch_unembed is not None:
+            x = self.patch_unembed(x)  # [B, L', P*D]
+        x = x.view(B, Lp * P, self.data_dim)  # [B, L'*P, D]
+
+        # Trim or pad to requested length
+        if x.size(1) > L_out:
+            x = x[:, :L_out]
+        elif x.size(1) < L_out:
+            pad_T = L_out - x.size(1)
+            x = F.pad(x, (0, 0, 0, pad_T))  # pad on time dimension
+
+        return x
+
+    def _patchify_opt(self, x_opt: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Patchify optional self-conditioning features."""
+        if x_opt is None:
+            return None
+        return self._patchify(x_opt)
+        
     # -------------------------------
     # Forward call
     # -------------------------------
@@ -94,16 +161,27 @@ class LLapDiT(nn.Module):
         :class:`LapFormer`. Conditioning is expected to be provided explicitly
         via ``cond_summary`` from an external summariser.
         """
-
         t_emb = self._time_embed(t).to(x_t.dtype)
+
+        # Original sequence length before patchifying
+        B, L, D = x_t.shape
+
+        # Patchify the noisy inputs and optional self-conditioning features.
+        x_tokens = self._patchify(x_t)          # [B, L', D] if patch_size > 1
+        sc_tokens = self._patchify_opt(sc_feat)
+
         # Pass dt to LapFormer (only used when lap_mode='recurrent')
-        return self.model(
-            x_t,
+        out_tokens = self.model(
+            x_tokens,
             t_emb,
             cond_summary=cond_summary,
-            sc_feat=sc_feat,
+            sc_feat=sc_tokens,
             dt=dt,
         )
+
+        # Restore per-timestep outputs [B, L, D] for the loss/scheduler.
+        return self._unpatchify(out_tokens, L)
+
 
     # -------------------------------
     # Sampling
