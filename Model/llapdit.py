@@ -41,12 +41,16 @@ class LLapDiT(nn.Module):
         if predict_type not in {"eps", "v", "x0"}:
             raise ValueError("predict_type must be either 'eps', 'v', or 'x0'")
 
+        patch_size = int(patch_size)
+        if patch_size < 1:
+            raise ValueError("patch_size must be a positive integer")
+
         # Store data_dim and patch_size
         self.predict_type = predict_type
         self.self_conditioning = bool(self_conditioning)
 
         self.data_dim = int(data_dim)
-        self.patch_size = int(patch_size)
+        self.patch_size = patch_size
 
         # Diffusion scheduler utilities (not exercised in forward-only tests).
         self.scheduler = NoiseScheduler(timesteps=timesteps, schedule=schedule)
@@ -106,7 +110,7 @@ class LLapDiT(nn.Module):
             x = F.pad(x, (0, 0, 0, pad_T))  # [B, L_pad, D]
 
         # Group into patches and linearly project to data_dim
-        x = x.view(B, Lp, P * D)  # [B, L', P*D]
+        x = x.contiguous().view(B, Lp, P * D)  # [B, L', P*D]
         if self.patch_embed is not None:
             x = self.patch_embed(x)  # [B, L', D]
 
@@ -123,7 +127,7 @@ class LLapDiT(nn.Module):
         # Undo the patch projection and regroup along time.
         if self.patch_unembed is not None:
             x = self.patch_unembed(x)  # [B, L', P*D]
-        x = x.view(B, Lp * P, self.data_dim)  # [B, L'*P, D]
+        x = x.contiguous().view(B, Lp * P, self.data_dim)  # [B, L'*P, D]
 
         # Trim or pad to requested length
         if x.size(1) > L_out:
