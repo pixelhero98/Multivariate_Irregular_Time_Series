@@ -1,9 +1,9 @@
 """Lightweight Laplace auto-encoder used to summarise panel time-series data.
-
-The original repository contained a minimally documented implementation.  This
+"""
+The original repository contained a minimally documented implementation. This
 rewrite keeps the public API intact while clarifying tensor shapes, tightening
-validation and explicitly handling padded entities.  The module exposes the
-`LaplaceAE` class which turns raw panel features into a compact context token
+validation and explicitly handling padded entities. The module exposes the
+``LaplaceAE`` class which turns raw panel features into a compact context token
 sequence alongside reconstruction auxiliaries that are consumed during
 training.
 """
