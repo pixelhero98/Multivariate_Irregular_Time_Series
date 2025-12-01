@@ -133,7 +133,7 @@ class LaplaceAE(nn.Module):
                 f"Input window length {K} does not match configured window_size {self.window_size}."
             )
 
-                # ---- Build scalar signals per entity (EFF-style) ----
+        # ---- Build scalar signals per entity (EFF-style) ----
         v_sig = self.v_head(x)          # [B,K,N]
         t_sig = self.t_head(ctx_diff)   # [B,K,N]
 
