@@ -70,6 +70,7 @@ NUM_HEADS     = 4
 LAPLACE_K     = 256
 LAP_MODE     = 'effective'   # 'parallel' or 'recurrent (support irregular sampling interval, with time-varying Lap basis updates)'
 CONTEXT_LEN   = SUM_CONTEXT_LEN
+PATCH_SIZE = 2
 # ============================ Training Hyperparameters ============================
 EPOCHS = 650
 BASE_LR = 6e-4
