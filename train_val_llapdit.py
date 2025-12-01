@@ -150,10 +150,6 @@ def run(
     mu_mean, mu_std = compute_latent_stats(vae, train_dl, device)
 
     # ---- Conditional diffusion model ----
-    patch_size = int(config.PATCH_SIZE)
-    if patch_size < 1:
-        raise ValueError("PATCH_SIZE must be a positive integer")
-
     diff_model = LLapDiT(
         data_dim=config.VAE_LATENT_CHANNELS, hidden_dim=config.MODEL_WIDTH,
         num_layers=config.NUM_LAYERS, num_heads=config.NUM_HEADS,
@@ -162,7 +158,6 @@ def run(
         dropout=config.DROPOUT, attn_dropout=config.ATTN_DROPOUT,
         self_conditioning=config.SELF_COND,
         lap_mode_main=config.LAP_MODE,
-        patch_size=patch_size
     ).to(device)
 
     # ---- Calculate the variance of the chosen prediction target ----
