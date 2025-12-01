@@ -28,20 +28,14 @@ class LLapDiT(nn.Module):
         attn_dropout: float = 0.0,
         self_conditioning: bool = False,
         lap_mode_main: str = "effective",
-        patch_size: int = 1
     ) -> None:
         super().__init__()
         if predict_type not in {"eps", "v", "x0"}:
             raise ValueError("predict_type must be either 'eps', 'v', or 'x0'")
 
-        patch_size = int(patch_size)
-        if patch_size < 1:
-            raise ValueError("patch_size must be a positive integer")
-
         self.predict_type = predict_type
         self.self_conditioning = bool(self_conditioning)
         self.data_dim = int(data_dim)
-        self.patch_size = patch_size
 
         # Diffusion scheduler utilities
         self.scheduler = NoiseScheduler(timesteps=timesteps, schedule=schedule)
@@ -50,30 +44,9 @@ class LLapDiT(nn.Module):
         self.time_embed = nn.Embedding(timesteps, hidden_dim)
         nn.init.normal_(self.time_embed.weight, std=0.02)
 
-        # --- Patching Logic ---
-        # If patching, we project the flattened patch (P*D) to hidden_dim.
-        # If not patching, we use data_dim as is (LapFormer handles projection internally).
-        if self.patch_size > 1:
-            dim_per_patch = self.data_dim * self.patch_size
-            self.patch_embed = nn.Linear(dim_per_patch, hidden_dim)
-            self.patch_unembed = nn.Linear(hidden_dim, dim_per_patch)
-            
-            # Initialization
-            nn.init.xavier_uniform_(self.patch_embed.weight)
-            nn.init.zeros_(self.patch_embed.bias)
-            nn.init.zeros_(self.patch_unembed.weight)
-            nn.init.zeros_(self.patch_unembed.bias)
-            
-            # Backbone Input is now hidden_dim
-            backbone_input_dim = hidden_dim
-        else:
-            self.patch_embed = None
-            self.patch_unembed = None
-            backbone_input_dim = self.data_dim
-
         # Main LapFormer backbone
         self.model = LapFormer(
-            input_dim=backbone_input_dim, # CRITICAL CHANGE: Matches embedding output
+            input_dim=self.data_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             num_heads=num_heads,
@@ -92,59 +65,6 @@ class LLapDiT(nn.Module):
     def _time_embed(self, t: torch.Tensor) -> torch.Tensor:
         return F.silu(self.time_embed(t.long()))
         
-    # -------------------------------
-    # Patchifying helpers
-    # -------------------------------
-    def _patchify(self, x: torch.Tensor) -> torch.Tensor:
-        """Convert [B, L, D] -> [B, L', Hidden] (if P>1) or [B, L, D] (if P=1)."""
-        if self.patch_size == 1:
-            return x
-
-        B, L, D = x.shape
-        P = self.patch_size
-
-        # Pad in time so that L' = ceil(L / P)
-        Lp = (L + P - 1) // P
-        L_pad = Lp * P
-        if L_pad != L:
-            pad_T = L_pad - L
-            x = F.pad(x, (0, 0, 0, pad_T))  # [B, L_pad, D]
-
-        # Group into patches: [B, Lp, P*D]
-        x = x.contiguous().view(B, Lp, P * D) 
-        
-        # Embed to Hidden Dim: [B, Lp, Hidden]
-        x = self.patch_embed(x)
-
-        return x
-
-    def _unpatchify(self, x: torch.Tensor, L_out: int) -> torch.Tensor:
-        """Convert tokens [B, L', Hidden] back to [B, L_out, D]."""
-        if self.patch_size == 1:
-            return x
-
-        # x is [B, Lp, Hidden]
-        B, Lp, _ = x.shape
-        P = self.patch_size
-
-        # Unembed: [B, Lp, P*D]
-        x = self.patch_unembed(x)
-        
-        # Flatten: [B, Lp*P, D]
-        x = x.contiguous().view(B, Lp * P, self.data_dim)
-
-        # Trim padding
-        if x.size(1) > L_out:
-            x = x[:, :L_out]
-        
-        return x
-
-    def _patchify_opt(self, x_opt: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if x_opt is None:
-            return None
-        return self._patchify(x_opt)
-        
-    # -------------------------------
     # Forward call
     # -------------------------------
     def forward(
@@ -156,37 +76,19 @@ class LLapDiT(nn.Module):
         sc_feat: Optional[torch.Tensor] = None,
         dt: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        
+
         t_emb = self._time_embed(t).to(x_t.dtype)
-        B, L, D = x_t.shape
 
-        # 1. Patchify inputs (projects to hidden_dim if P > 1)
-        x_tokens = self._patchify(x_t)
-        sc_tokens = self._patchify_opt(sc_feat)
-
-        # 2. Adjust dt for patching
-        # If patching, 1 step in model = P steps in data. 
-        # We roughly scale dt by patch_size.
-        if dt is not None and self.patch_size > 1:
-            # Assuming dt is [B, L, 1] or [T, 1], we subsample or scale.
-            # Simple scaling is usually sufficient for effective/exact modes here.
-            dt_tokens = dt[:, ::self.patch_size] * self.patch_size if dt.dim() >= 2 else dt * self.patch_size
-            # Note: Rigorous exact mode might require summing dt within patch, 
-            # but striding * P is a standard approximation.
-        else:
-            dt_tokens = dt
-
-        # 3. Backbone
+        # Backbone
         out_tokens = self.model(
-            x_tokens,
+            x_t,
             t_emb,
             cond_summary=cond_summary,
-            sc_feat=sc_tokens,
-            dt=dt_tokens,
+            sc_feat=sc_feat,
+            dt=dt,
         )
 
-        # 4. Unpatchify (projects back to data_dim)
-        return self._unpatchify(out_tokens, L)
+        return out_tokens
 
 
     # -------------------------------
