@@ -61,9 +61,10 @@ class LaplaceAE(nn.Module):
         self.v_head = TVHead(self.D, tv_hidden)
         self.t_head = TVHead(self.D, tv_hidden)
 
-        # 1-layer parallel Laplace encoders for V and T signals
-        self.lap_v = LaplaceTransformEncoder(k=self.K, feat_dim=self.N, mode="effective")
-        self.lap_t = LaplaceTransformEncoder(k=self.K, feat_dim=self.N, mode="effective")
+        # 1-layer Laplace encoders shared across entities (channel-independent).
+        # They operate on scalar signals per entity, so feat_dim = 1.
+        self.lap_v = LaplaceTransformEncoder(k=self.K, feat_dim=1, mode="effective")
+        self.lap_t = LaplaceTransformEncoder(k=self.K, feat_dim=1, mode="effective")
 
         # It learns to reconstruct the signals from the final context summary.
         self.aux_decoder = nn.Sequential(
@@ -132,17 +133,36 @@ class LaplaceAE(nn.Module):
                 f"Input window length {K} does not match configured window_size {self.window_size}."
             )
 
-        # ---- Build scalar signals per entity (EFF-style) ----
-        v_sig = self.v_head(x)  # [B,K,N]
-        t_sig = self.t_head(ctx_diff)  # [B,K,N]
+                # ---- Build scalar signals per entity (EFF-style) ----
+        v_sig = self.v_head(x)          # [B,K,N]
+        t_sig = self.t_head(ctx_diff)   # [B,K,N]
 
-        # ---- 1-layer Laplace encoders (parallel) ----
-        v_lap = self.lap_v(v_sig)  # [B,K,2K]
-        t_lap = self.lap_t(t_sig)  # [B,K,2K]
+        # ---- Per-entity Laplace encoders (shared weights) ----
+        # Flatten entities into the batch: [B,K,N] -> [B*N,K,1]
+        BN = B * N
+        v_flat = v_sig.permute(0, 2, 1).reshape(BN, K, 1)   # [B*N,K,1]
+        t_flat = t_sig.permute(0, 2, 1).reshape(BN, K, 1)   # [B*N,K,1]
 
-        # ---- Reconstructions via single inverses ----
-        v_hat = self.inv_v(v_lap)  # [B,K,N]
-        t_hat = self.inv_t(t_lap)  # [B,K,N]
+        # Encode each entity’s scalar series with the shared Laplace encoder
+        v_lap_flat = self.lap_v(v_flat)  # [B*N,K,2K]
+        t_lap_flat = self.lap_t(t_flat)  # [B*N,K,2K]
+
+        # ---- Reconstructions via single inverses (per entity) ----
+        v_hat_flat = self.inv_v(v_lap_flat)   # [B*N,K,1]
+        t_hat_flat = self.inv_t(t_lap_flat)   # [B*N,K,1]
+
+        # Reshape back to [B,K,N] for losses
+        v_hat = v_hat_flat.view(B, N, K, 1).permute(0, 2, 1, 3).squeeze(-1)  # [B,K,N]
+        t_hat = t_hat_flat.view(B, N, K, 1).permute(0, 2, 1, 3).squeeze(-1)  # [B,K,N]
+
+        # ---- Aggregate Laplace features across entities for context tokens ----
+        # v_lap_flat/t_lap_flat: [B*N,K,2K] -> [B,N,K,2K]
+        v_lap_bn = v_lap_flat.view(B, N, K, 2 * self.K)
+        t_lap_bn = t_lap_flat.view(B, N, K, 2 * self.K)
+
+        # Simple choice: mean over entities so token scale is independent of N
+        v_lap = v_lap_bn.mean(dim=1)  # [B,K,2K]
+        t_lap = t_lap_bn.mean(dim=1)  # [B,K,2K]
 
         # ---- Lightweight context tokens (for downstream conditioning) ----
         fused = torch.cat([v_lap, t_lap], dim=-1)  # [B,K,4K]
