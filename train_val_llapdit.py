@@ -217,92 +217,92 @@ def run(
 
     # ============================ train/val loops ============================
     def train_one_epoch(epoch: int) -> float:
-            diff_model.train()
-            running_loss = 0.0
-            num_samples = 0
-    
-            for xb, yb, meta in train_dl:
-                V, T = xb
-                mask_bn = meta["entity_mask"]
+        diff_model.train()
+        running_loss = 0.0
+        num_samples = 0
 
-                cond_summary = build_context(laplace_summarizer, V, T, mask_bn, device)
-                y_in, batch_ids = flatten_targets(yb, mask_bn, device)
-                if y_in is None:
-                    continue
-    
-                cond_summary_flat = cond_summary[batch_ids]
-                mu_norm = encode_mu_norm(
-                    vae, y_in,
-                    mu_mean=mu_mean, mu_std=mu_std
-                )
-    
-                Beff = mu_norm.size(0)
-                p_drop = float(config.DROP_COND_P)
-                m_cond = (torch.rand(Beff, device=device) >= p_drop)
-                idx_c = m_cond.nonzero(as_tuple=False).squeeze(1)
-                idx_u = (~m_cond).nonzero(as_tuple=False).squeeze(1)
-    
-                t = sample_t_uniform(scheduler, Beff, device)
-                noise = torch.randn_like(mu_norm)
-                x_t, eps_true = scheduler.q_sample(mu_norm, t, noise)
-    
-                sc_feat_c = sc_feat_u = None
-                use_sc = (epoch >= config.SELF_COND_START_EPOCH and torch.rand(()) < config.SELF_COND_P) and config.SELF_COND
-                if use_sc:
-                    with torch.no_grad():
-                        if idx_c.numel() > 0:
-                            pred_ng_c = diff_model(x_t[idx_c], t[idx_c], cond_summary=cond_summary_flat[idx_c], sc_feat=None)
-                            sc_feat_c = scheduler.to_x0(x_t[idx_c], t[idx_c], pred_ng_c, config.PREDICT_TYPE).detach()
-                        if idx_u.numel() > 0:
-                            pred_ng_u = diff_model(x_t[idx_u], t[idx_u], cond_summary=None, sc_feat=None)
-                            sc_feat_u = scheduler.to_x0(x_t[idx_u], t[idx_u], pred_ng_u, config.PREDICT_TYPE).detach()
-    
-                optimizer.zero_grad(set_to_none=True)
-                loss = 0.0
-    
-                with autocast(enabled=(device.type == "cuda")):
+        for xb, yb, meta in train_dl:
+            V, T = xb
+            mask_bn = meta["entity_mask"]
+
+            cond_summary = build_context(laplace_summarizer, V, T, mask_bn, device)
+            y_in, batch_ids = flatten_targets(yb, mask_bn, device)
+            if y_in is None:
+                continue
+
+            cond_summary_flat = cond_summary[batch_ids]
+            mu_norm = encode_mu_norm(
+                vae, y_in,
+                mu_mean=mu_mean, mu_std=mu_std
+            )
+
+            Beff = mu_norm.size(0)
+            p_drop = float(config.DROP_COND_P)
+            m_cond = (torch.rand(Beff, device=device) >= p_drop)
+            idx_c = m_cond.nonzero(as_tuple=False).squeeze(1)
+            idx_u = (~m_cond).nonzero(as_tuple=False).squeeze(1)
+
+            t = sample_t_uniform(scheduler, Beff, device)
+            noise = torch.randn_like(mu_norm)
+            x_t, eps_true = scheduler.q_sample(mu_norm, t, noise)
+
+            sc_feat_c = sc_feat_u = None
+            use_sc = (epoch >= config.SELF_COND_START_EPOCH and torch.rand(()) < config.SELF_COND_P) and config.SELF_COND
+            if use_sc:
+                with torch.no_grad():
                     if idx_c.numel() > 0:
-                        loss_c = diffusion_loss(
-                            diff_model, scheduler, mu_norm[idx_c], t[idx_c],
-                            cond_summary=cond_summary_flat[idx_c], predict_type=config.PREDICT_TYPE,
-                            weight_scheme=config.LOSS_WEIGHT_SCHEME,
-                            minsnr_gamma=config.MINSNR_GAMMA,
-                            sc_feat=sc_feat_c,
-                            reuse_xt_eps=(x_t[idx_c], eps_true[idx_c]),
-                        )
-                        loss = loss + loss_c * (idx_c.numel() / Beff)
-    
+                        pred_ng_c = diff_model(x_t[idx_c], t[idx_c], cond_summary=cond_summary_flat[idx_c], sc_feat=None)
+                        sc_feat_c = scheduler.to_x0(x_t[idx_c], t[idx_c], pred_ng_c, config.PREDICT_TYPE).detach()
                     if idx_u.numel() > 0:
-                        loss_u = diffusion_loss(
-                            diff_model, scheduler, mu_norm[idx_u], t[idx_u],
-                            cond_summary=None, predict_type=config.PREDICT_TYPE,
-                            weight_scheme=config.LOSS_WEIGHT_SCHEME,
-                            minsnr_gamma=config.MINSNR_GAMMA,
-                            sc_feat=sc_feat_u,
-                            reuse_xt_eps=(x_t[idx_u], eps_true[idx_u]),
-                        )
-                        loss = loss + loss_u * (idx_u.numel() / Beff)
-    
-                if not torch.isfinite(loss):
-                    print("[warn] non-finite loss detected; skipping step")
-                    optimizer.zero_grad(set_to_none=True)
-                    continue
-    
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-    
-                if config.GRAD_CLIP and config.GRAD_CLIP > 0:
-                    nn.utils.clip_grad_norm_(diff_model.parameters(), config.GRAD_CLIP)
-                scaler.step(optimizer)
-                scaler.update()
-                if ema is not None:
-                    ema.update(diff_model)
-                lr_sched.step()
-    
-                running_loss += float(loss.item()) * Beff
-                num_samples += Beff
-    
-            return running_loss / max(1, num_samples)
+                        pred_ng_u = diff_model(x_t[idx_u], t[idx_u], cond_summary=None, sc_feat=None)
+                        sc_feat_u = scheduler.to_x0(x_t[idx_u], t[idx_u], pred_ng_u, config.PREDICT_TYPE).detach()
+
+            optimizer.zero_grad(set_to_none=True)
+            loss = 0.0
+
+            with autocast(enabled=(device.type == "cuda")):
+                if idx_c.numel() > 0:
+                    loss_c = diffusion_loss(
+                        diff_model, scheduler, mu_norm[idx_c], t[idx_c],
+                        cond_summary=cond_summary_flat[idx_c], predict_type=config.PREDICT_TYPE,
+                        weight_scheme=config.LOSS_WEIGHT_SCHEME,
+                        minsnr_gamma=config.MINSNR_GAMMA,
+                        sc_feat=sc_feat_c,
+                        reuse_xt_eps=(x_t[idx_c], eps_true[idx_c]),
+                    )
+                    loss = loss + loss_c * (idx_c.numel() / Beff)
+
+                if idx_u.numel() > 0:
+                    loss_u = diffusion_loss(
+                        diff_model, scheduler, mu_norm[idx_u], t[idx_u],
+                        cond_summary=None, predict_type=config.PREDICT_TYPE,
+                        weight_scheme=config.LOSS_WEIGHT_SCHEME,
+                        minsnr_gamma=config.MINSNR_GAMMA,
+                        sc_feat=sc_feat_u,
+                        reuse_xt_eps=(x_t[idx_u], eps_true[idx_u]),
+                    )
+                    loss = loss + loss_u * (idx_u.numel() / Beff)
+
+            if not torch.isfinite(loss):
+                print("[warn] non-finite loss detected; skipping step")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+
+            if config.GRAD_CLIP and config.GRAD_CLIP > 0:
+                nn.utils.clip_grad_norm_(diff_model.parameters(), config.GRAD_CLIP)
+            scaler.step(optimizer)
+            scaler.update()
+            if ema is not None:
+                ema.update(diff_model)
+            lr_sched.step()
+
+            running_loss += float(loss.item()) * Beff
+            num_samples += Beff
+
+        return running_loss / max(1, num_samples)
     
     
     @torch.inference_mode()
@@ -457,7 +457,6 @@ def run(
             mu_std = ckpt['mu_std'].to(device)
             loaded_checkpoint = best_checkpoint
 
-    eval_stats = None
     if config.DECODER_FT_EPOCHS > 0:
         torch.manual_seed(42)
         finetune_vae_decoder(
@@ -671,8 +670,6 @@ def evaluate_regression(
     if use_ema:
         ema.store(diff_model)
         ema.copy_to(diff_model)
-
-    warned_no_gt_scale = False  # one-time notice if config asks for GT-scale
 
     for xb, yb, meta in dataloader:
         V, T = xb

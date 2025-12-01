@@ -150,7 +150,7 @@ def main() -> None:
 
             print(
                 "LLapDiT results:\n"
-                f"  baseline v-var -> {_fmt_optional(llapdit_stats.get('baseline_v_variance'))}\n"
+                f"  baseline v-var -> {_fmt_optional(llapdit_stats.get('baseline_target_variance'))}\n"
                 f"  best val loss -> {_fmt_optional(llapdit_stats.get('best_val'))}\n"
                 f"  checkpoint -> {llapdit_stats.get('best_checkpoint') or llapdit_stats.get('loaded_checkpoint')}\n"
                 f"  eval CRPS -> {_fmt_optional(eval_stats.get('crps'))}\n"
@@ -160,7 +160,7 @@ def main() -> None:
             )
 
             log_file.write(
-                f"  baseline_v_variance={_fmt_optional(llapdit_stats.get('baseline_v_variance'))}\n"
+                f"  baseline_target_variance={_fmt_optional(llapdit_stats.get('baseline_target_variance'))}\n"
             )
             log_file.write(f"  best_val={_fmt_optional(llapdit_stats.get('best_val'))}\n")
             log_file.write(
