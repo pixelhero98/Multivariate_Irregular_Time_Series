@@ -157,7 +157,8 @@ def run(
         timesteps=config.TIMESTEPS, schedule=config.SCHEDULE,
         dropout=config.DROPOUT, attn_dropout=config.ATTN_DROPOUT,
         self_conditioning=config.SELF_COND,
-        lap_mode_main=config.LAP_MODE
+        lap_mode_main=config.LAP_MODE,
+        patch_size=config.PATCH_SIZE
     ).to(device)
 
     # ---- Calculate the variance of the chosen prediction target ----
