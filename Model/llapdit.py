@@ -81,14 +81,9 @@ class LLapDiT(nn.Module):
         x_t: torch.Tensor,
         t: torch.Tensor,
         *,
-        series: Optional[torch.Tensor] = None,
-        series_mask: Optional[torch.Tensor] = None,
         cond_summary: Optional[torch.Tensor] = None,
-        entity_ids: Optional[torch.Tensor] = None,
         sc_feat: Optional[torch.Tensor] = None,
         dt: Optional[torch.Tensor] = None,
-        series_dt: Optional[torch.Tensor] = None,
-        series_diff: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict diffusion outputs for a batch of noisy inputs ``x_t``.
 
@@ -96,20 +91,10 @@ class LLapDiT(nn.Module):
         which defaults to ``"x0"`` for direct clean-signal regression (preferred
         for training). Alternative parameterisations (``"eps"`` or ``"v"``) are
         also supported. The method delegates temporal reasoning to
-        :class:`LapFormer`. Only the externally supplied ``cond_summary`` is
-        consumed for conditioning; the legacy in-module summarisation hooks now
-        raise informative errors.
+        :class:`LapFormer`. Conditioning is expected to be provided explicitly
+        via ``cond_summary`` from an external summariser.
         """
 
-        if cond_summary is None:
-            if any(
-                arg is not None
-                for arg in (series, series_mask, entity_ids, series_dt, series_diff)
-            ):
-                raise ValueError(
-                    "LLapDiT no longer builds conditioning internally. "
-                    "Provide `cond_summary` from a pre-trained summarizer."
-                )
         t_emb = self._time_embed(t).to(x_t.dtype)
         # Pass dt to LapFormer (only used when lap_mode='recurrent')
         return self.model(
@@ -132,15 +117,10 @@ class LLapDiT(nn.Module):
         guidance_power: float = 2.0,
         eta: float = 0.0,
         *,
-        series: Optional[torch.Tensor] = None,
-        series_mask: Optional[torch.Tensor] = None,
         cond_summary: Optional[torch.Tensor] = None,
-        entity_ids: Optional[torch.Tensor] = None,
         y_obs: Optional[torch.Tensor] = None,
         obs_mask: Optional[torch.Tensor] = None,
         dt: Optional[torch.Tensor] = None,
-        series_dt: Optional[torch.Tensor] = None,
-        series_diff: Optional[torch.Tensor] = None,
         cfg_rescale: bool = True,
         self_cond: bool = False,
         rho: float = 7.5,
@@ -155,11 +135,9 @@ class LLapDiT(nn.Module):
             guidance_strength: CFG strength (scalar or ``(min, max)`` schedule).
             guidance_power: Exponent for scheduled CFG strength.
             eta: DDIM stochasticity parameter.
-            series / series_mask / cond_summary / entity_ids: Optional conditioning
-                data. ``cond_summary`` must be provided when any of the others are.
+            cond_summary: Optional context tokens used for the conditional pass.
             y_obs / obs_mask: Optional observations for inpainting.
-            dt / series_dt / series_diff: Optional step-size metadata forwarded to
-                the Laplace backbone.
+            dt: Optional step-size metadata forwarded to the Laplace backbone.
             cfg_rescale: Whether to apply the CFG rescaling heuristic.
             self_cond: Enable self-conditioning during sampling.
             rho: Karras sigma schedule exponent.
@@ -173,15 +151,6 @@ class LLapDiT(nn.Module):
         device = next(self.parameters()).device
         B, L, D = shape
         T = int(self.scheduler.timesteps)
-
-        # ---- build context once (dt/mask/diff aware) ----
-        if cond_summary is None and any(
-            arg is not None for arg in (series, series_mask, series_dt, series_diff, entity_ids)
-        ):
-            raise ValueError(
-                "LLapDiT.generate requires `cond_summary` from the frozen summarizer; "
-                "internal summarizer construction has been removed."
-            )
 
         # ---- vectorized Karras step indices (descending) ----
         ab = self.scheduler.alpha_bars.to(device)
@@ -259,26 +228,16 @@ class LLapDiT(nn.Module):
             pred_u = self.forward(
                 x_t,
                 t_b,
-                series=None,
-                series_mask=None,
                 cond_summary=None,
                 sc_feat=sc_feat_next if self_cond else None,
-                entity_ids=entity_ids,
                 dt=dt,
-                series_dt=series_dt,
-                series_diff=series_diff,
             )
             pred_c = self.forward(
                 x_t,
                 t_b,
-                series=series,
-                series_mask=series_mask,
                 cond_summary=cond_summary,
                 sc_feat=sc_feat_next if self_cond else None,
-                entity_ids=entity_ids,
                 dt=dt,
-                series_dt=series_dt,
-                series_diff=series_diff,
             )
 
             # classifier-free guidance (optionally scheduled)
