@@ -295,22 +295,6 @@ def log_pole_health(modules: List[nn.Module], log_fn, step: int, tag_prefix: str
             f"{tag_prefix}alpha_max": alpha_cat.max().item(),
             f"{tag_prefix}omega_abs_mean": omega_cat.abs().mean().item()}, step=step)
 
-
-def _print_log(metrics: dict, step: int, csv_path: str = None):
-    msg = " | ".join(f"{k}={v:.4g}" for k, v in metrics.items())
-    print(f"[poles] step {step:>7d} | {msg}")
-    if csv_path is not None:
-        import csv, os
-        head = ["step"] + list(metrics.keys())
-        row = [step] + [metrics[k] for k in metrics]
-        write_header = not os.path.exists(csv_path)
-        with open(csv_path, "a", newline="") as f:
-            w = csv.writer(f)
-            if write_header:
-                w.writerow(head)
-            w.writerow(row)
-
-
 @torch.no_grad()
 def collect_laplace_poles(
     modules: List[nn.Module], tag_prefix: str = "", prediction_length: Optional[int] = None
