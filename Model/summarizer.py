@@ -1,5 +1,4 @@
 """Lightweight Laplace auto-encoder used to summarise panel time-series data.
-"""
 The original repository contained a minimally documented implementation. This
 rewrite keeps the public API intact while clarifying tensor shapes, tightening
 validation and explicitly handling padded entities. The module exposes the
