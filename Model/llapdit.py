@@ -11,14 +11,7 @@ from Model.llapdit_utils import NoiseScheduler
 
 
 class LLapDiT(nn.Module):
-    """Latent Laplace-DiT for multivariate time series with global conditioning.
-
-    The model consumes noisy inputs together with optional external summaries
-    (e.g. from a frozen encoder) and predicts the clean ``x0`` target by
-    default. This makes the module immediately usable for x0-parameterised
-    training runs without any adaptation. Alternative parameterisations
-    (``eps`` or ``v``) remain supported via ``predict_type``.
-    """
+    """Latent Laplace-DiT for multivariate time series with global conditioning."""
 
     def __init__(
         self,
@@ -45,23 +38,42 @@ class LLapDiT(nn.Module):
         if patch_size < 1:
             raise ValueError("patch_size must be a positive integer")
 
-        # Store data_dim and patch_size
         self.predict_type = predict_type
         self.self_conditioning = bool(self_conditioning)
-
         self.data_dim = int(data_dim)
         self.patch_size = patch_size
 
-        # Diffusion scheduler utilities (not exercised in forward-only tests).
+        # Diffusion scheduler utilities
         self.scheduler = NoiseScheduler(timesteps=timesteps, schedule=schedule)
 
-        # Learned timestep embedding (replaces sinusoidal positional embedding).
+        # Learned timestep embedding
         self.time_embed = nn.Embedding(timesteps, hidden_dim)
         nn.init.normal_(self.time_embed.weight, std=0.02)
 
-        # Main LapFormer backbone (mode tied to external summariser if any).
+        # --- Patching Logic ---
+        # If patching, we project the flattened patch (P*D) to hidden_dim.
+        # If not patching, we use data_dim as is (LapFormer handles projection internally).
+        if self.patch_size > 1:
+            dim_per_patch = self.data_dim * self.patch_size
+            self.patch_embed = nn.Linear(dim_per_patch, hidden_dim)
+            self.patch_unembed = nn.Linear(hidden_dim, dim_per_patch)
+            
+            # Initialization
+            nn.init.xavier_uniform_(self.patch_embed.weight)
+            nn.init.zeros_(self.patch_embed.bias)
+            nn.init.zeros_(self.patch_unembed.weight)
+            nn.init.zeros_(self.patch_unembed.bias)
+            
+            # Backbone Input is now hidden_dim
+            backbone_input_dim = hidden_dim
+        else:
+            self.patch_embed = None
+            self.patch_unembed = None
+            backbone_input_dim = self.data_dim
+
+        # Main LapFormer backbone
         self.model = LapFormer(
-            input_dim=data_dim,
+            input_dim=backbone_input_dim, # CRITICAL CHANGE: Matches embedding output
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             num_heads=num_heads,
@@ -72,29 +84,19 @@ class LLapDiT(nn.Module):
             self_conditioning=self_conditioning,
         )
 
-        # Patch embedding / unembedding (no-op when patch_size == 1)
-        if self.patch_size > 1:
-            self.patch_embed = nn.Linear(self.data_dim * self.patch_size, self.data_dim)
-            self.patch_unembed = nn.Linear(self.data_dim, self.data_dim * self.patch_size)
-        else:
-            self.patch_embed = None
-            self.patch_unembed = None
-            
-        self.time_dim = hidden_dim  # time embedding dimension
+        self.time_dim = hidden_dim
 
     # -------------------------------
     # Embeddings & conditioning
     # -------------------------------
     def _time_embed(self, t: torch.Tensor) -> torch.Tensor:
-        """Return a learned embedding for diffusion steps."""
-
         return F.silu(self.time_embed(t.long()))
         
     # -------------------------------
     # Patchifying helpers
     # -------------------------------
     def _patchify(self, x: torch.Tensor) -> torch.Tensor:
-        """Convert [B, L, D] -> [B, L', D] with temporal patches of size P."""
+        """Convert [B, L, D] -> [B, L', Hidden] (if P>1) or [B, L, D] (if P=1)."""
         if self.patch_size == 1:
             return x
 
@@ -105,41 +107,39 @@ class LLapDiT(nn.Module):
         Lp = (L + P - 1) // P
         L_pad = Lp * P
         if L_pad != L:
-            # pad on the time dimension (dim=1)
             pad_T = L_pad - L
             x = F.pad(x, (0, 0, 0, pad_T))  # [B, L_pad, D]
 
-        # Group into patches and linearly project to data_dim
-        x = x.contiguous().view(B, Lp, P * D)  # [B, L', P*D]
-        if self.patch_embed is not None:
-            x = self.patch_embed(x)  # [B, L', D]
+        # Group into patches: [B, Lp, P*D]
+        x = x.contiguous().view(B, Lp, P * D) 
+        
+        # Embed to Hidden Dim: [B, Lp, Hidden]
+        x = self.patch_embed(x)
 
         return x
 
     def _unpatchify(self, x: torch.Tensor, L_out: int) -> torch.Tensor:
-        """Convert patch tokens [B, L', D] back to [B, L_out, D]."""
+        """Convert tokens [B, L', Hidden] back to [B, L_out, D]."""
         if self.patch_size == 1:
             return x
 
-        B, Lp, D = x.shape
+        # x is [B, Lp, Hidden]
+        B, Lp, _ = x.shape
         P = self.patch_size
 
-        # Undo the patch projection and regroup along time.
-        if self.patch_unembed is not None:
-            x = self.patch_unembed(x)  # [B, L', P*D]
-        x = x.contiguous().view(B, Lp * P, self.data_dim)  # [B, L'*P, D]
+        # Unembed: [B, Lp, P*D]
+        x = self.patch_unembed(x)
+        
+        # Flatten: [B, Lp*P, D]
+        x = x.contiguous().view(B, Lp * P, self.data_dim)
 
-        # Trim or pad to requested length
+        # Trim padding
         if x.size(1) > L_out:
             x = x[:, :L_out]
-        elif x.size(1) < L_out:
-            pad_T = L_out - x.size(1)
-            x = F.pad(x, (0, 0, 0, pad_T))  # pad on time dimension
-
+        
         return x
 
     def _patchify_opt(self, x_opt: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """Patchify optional self-conditioning features."""
         if x_opt is None:
             return None
         return self._patchify(x_opt)
@@ -156,34 +156,36 @@ class LLapDiT(nn.Module):
         sc_feat: Optional[torch.Tensor] = None,
         dt: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Predict diffusion outputs for a batch of noisy inputs ``x_t``.
-
-        The prediction parameterisation is controlled by ``self.predict_type``
-        which defaults to ``"x0"`` for direct clean-signal regression (preferred
-        for training). Alternative parameterisations (``"eps"`` or ``"v"``) are
-        also supported. The method delegates temporal reasoning to
-        :class:`LapFormer`. Conditioning is expected to be provided explicitly
-        via ``cond_summary`` from an external summariser.
-        """
+        
         t_emb = self._time_embed(t).to(x_t.dtype)
-
-        # Original sequence length before patchifying
         B, L, D = x_t.shape
 
-        # Patchify the noisy inputs and optional self-conditioning features.
-        x_tokens = self._patchify(x_t)          # [B, L', D] if patch_size > 1
+        # 1. Patchify inputs (projects to hidden_dim if P > 1)
+        x_tokens = self._patchify(x_t)
         sc_tokens = self._patchify_opt(sc_feat)
 
-        # Pass dt to LapFormer (only used when lap_mode='recurrent')
+        # 2. Adjust dt for patching
+        # If patching, 1 step in model = P steps in data. 
+        # We roughly scale dt by patch_size.
+        if dt is not None and self.patch_size > 1:
+            # Assuming dt is [B, L, 1] or [T, 1], we subsample or scale.
+            # Simple scaling is usually sufficient for effective/exact modes here.
+            dt_tokens = dt[:, ::self.patch_size] * self.patch_size if dt.dim() >= 2 else dt * self.patch_size
+            # Note: Rigorous exact mode might require summing dt within patch, 
+            # but striding * P is a standard approximation.
+        else:
+            dt_tokens = dt
+
+        # 3. Backbone
         out_tokens = self.model(
             x_tokens,
             t_emb,
             cond_summary=cond_summary,
             sc_feat=sc_tokens,
-            dt=dt,
+            dt=dt_tokens,
         )
 
-        # Restore per-timestep outputs [B, L, D] for the loss/scheduler.
+        # 4. Unpatchify (projects back to data_dim)
         return self._unpatchify(out_tokens, L)
 
 
