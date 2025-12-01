@@ -8,9 +8,9 @@ import torch
 # Positional / timestep embeddings
 # -------------------------------
 
-def get_sinusoidal_pos_emb(L: int, dim: int,
-                           device: Optional[torch.device] = None
-                           ) -> torch.Tensor:
+def get_sinusoidal_pos_emb(
+    L: int, dim: int, device: Optional[torch.device] = None
+) -> torch.Tensor:
     """
     Standard 1D sinusoidal positional embeddings (Transformer style).
 
