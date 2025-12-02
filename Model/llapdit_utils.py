@@ -344,7 +344,8 @@ def plot_laplace_poles(
     Args:
         modules: Iterable of modules containing Laplace encoders to visualise.
         save_path: Destination ``.pdf`` path for the plot.
-        title: Optional plot title.
+        title: Deprecated. Titles are intentionally omitted so captions can be
+            added externally.
         tag_prefix: Prepended to each legend label (useful for stage tags).
         prediction_length: Optional prediction horizon identifier used to colour
             and label pole sets.
@@ -366,7 +367,7 @@ def plot_laplace_poles(
     import matplotlib.pyplot as plt
     import numpy as np
 
-    fig, ax = plt.subplots(figsize=(6.0, 4.0))
+    fig, ax = plt.subplots(figsize=(8.0, 5.5))
     color_cycle = plt.rcParams.get("axes.prop_cycle", None)
     palette = color_cycle.by_key()["color"] if color_cycle is not None else None
     pred_colors = {}
@@ -474,10 +475,14 @@ def plot_laplace_poles(
     ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
     ax.set_xlabel("Frequency ω (radians / step)")
     ax.set_ylabel("Decay rate α (>= 0)")
-    if title:
-        ax.set_title(title)
     if plot_entries:
-        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize="small")
+        ax.legend(
+            loc="upper right",
+            bbox_to_anchor=(0.98, 0.98),
+            fontsize="medium",
+            framealpha=0.95,
+            borderaxespad=0.8,
+        )
 
     fig.tight_layout()
     fig.savefig(save_path, format="pdf", bbox_inches="tight")
