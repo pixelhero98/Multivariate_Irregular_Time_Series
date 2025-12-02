@@ -1,11 +1,14 @@
-cfg = UCIAirCacheConfig(
-    data_dir=data_dir,
-    raw_data_dir=raw_data_dir,
-    window=336,
-    horizon=168,
-    feature_columns=[
-        "CO(GT)","PT08.S1(CO)","C6H6(GT)","PT08.S2(NMHC)","NOx(GT)",
-        "PT08.S3(NOx)","NO2(GT)","PT08.S4(NO2)","PT08.S5(O3)","T","RH","AH"
-    ],
-)
-prepare_uci_air_cache(cfg)
+Traceback (most recent call last):
+  File "/home/pyh/Documents/school/projects/yzn_ts/train_val_pipeline.py", line 186, in <module>
+    main()
+  File "/home/pyh/Documents/school/projects/yzn_ts/train_val_pipeline.py", line 135, in main
+    llapdit_stats = train_val_llapdit.run(
+  File "/home/pyh/Documents/school/projects/yzn_ts/train_val_llapdit.py", line 500, in run
+    export_pole_plot("val")
+  File "/home/pyh/Documents/school/projects/yzn_ts/train_val_llapdit.py", line 207, in export_pole_plot
+    return plot_laplace_poles(
+  File "/home/pyh/anaconda3/envs/python38/lib/python3.8/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/pyh/Documents/school/projects/yzn_ts/Model/llapdit_utils.py", line 448, in plot_laplace_poles
+    alpha = entry["alpha"].flatten().numpy()
+AttributeError: 'numpy.ndarray' object has no attribute 'numpy'
