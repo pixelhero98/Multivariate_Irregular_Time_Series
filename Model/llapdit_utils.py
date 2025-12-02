@@ -371,6 +371,11 @@ def plot_laplace_poles(
     palette = color_cycle.by_key()["color"] if color_cycle is not None else None
     pred_colors = {}
 
+    def _to_numpy(arr):
+        if isinstance(arr, torch.Tensor):
+            return arr.detach().cpu().numpy()
+        return np.asarray(arr)
+
     def _convex_hull(points: np.ndarray) -> Optional[np.ndarray]:
         """Return points on the convex hull (monotonic chain, O(n log n))."""
 
@@ -397,8 +402,8 @@ def plot_laplace_poles(
         hull = np.array(lower[:-1] + upper[:-1])
         return hull if hull.shape[0] >= 3 else None
 
-    alpha_arrays = [entry["alpha"].flatten().numpy() for entry in pole_sets]
-    omega_arrays = [entry["omega"].flatten().numpy() for entry in pole_sets]
+    alpha_arrays = [_to_numpy(entry["alpha"]).flatten() for entry in pole_sets]
+    omega_arrays = [_to_numpy(entry["omega"]).flatten() for entry in pole_sets]
     all_points = None
     if alpha_arrays and omega_arrays:
         all_points = np.concatenate(
@@ -445,8 +450,8 @@ def plot_laplace_poles(
 
     plot_entries = pole_sets if avg_entry is None else [avg_entry]
     for entry in plot_entries:
-        alpha = entry["alpha"].flatten().numpy()
-        omega = entry["omega"].flatten().numpy()
+        alpha = _to_numpy(entry["alpha"]).flatten()
+        omega = _to_numpy(entry["omega"]).flatten()
         label_bits = []
         pred_len = entry.get("prediction_length")
         if pred_len is not None:
