@@ -104,3 +104,4 @@ DECODER_FT_ANCHOR = 0.1 # 0.1
 OUT_DIR = "./ldt/output"
 SAVE_POLE_PLOTS = True
 POLE_PLOT_DIR = OUT_DIR + "/pole_plots"
+POLE_PLOT_ONLY = False  # Set True to load TRAINED_LLapDiT and export pole plots without retraining
