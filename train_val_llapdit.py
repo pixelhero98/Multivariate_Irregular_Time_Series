@@ -85,6 +85,7 @@ def run(
     sizes: Optional[Sequence[int]] = None,
     config=crypto_config,
 ) -> Dict[str, object]:
+    plot_poles_only = bool(getattr(config, "POLE_PLOT_ONLY", False))
     (train_dl, val_dl, test_dl), sizes = _ensure_loaders(train_dl, val_dl, test_dl, sizes, config)
     device = set_torch()
 
@@ -377,8 +378,14 @@ def run(
     best_val = float('inf')
     patience = 0
 
-    if skip_with_trained_model and os.path.exists(skip_with_trained_model) and config.downstream:
-        print(f"Skipping training. Loading model from: {skip_with_trained_model}")
+    skip_available = skip_with_trained_model and os.path.exists(skip_with_trained_model)
+    if plot_poles_only and not skip_available:
+        raise FileNotFoundError(
+            "POLE_PLOT_ONLY is enabled but TRAINED_LLapDiT checkpoint was not found."
+        )
+
+    if skip_available and (config.downstream or plot_poles_only):
+        print(f"Loading pretrained LLapDiT from: {skip_with_trained_model}")
         ckpt = torch.load(skip_with_trained_model, map_location=device)
         diff_model.load_state_dict(ckpt['model_state'])
         if ema is not None and 'ema_state' in ckpt:
@@ -456,6 +463,20 @@ def run(
             mu_mean = ckpt['mu_mean'].to(device)
             mu_std = ckpt['mu_std'].to(device)
             loaded_checkpoint = best_checkpoint
+
+    if plot_poles_only:
+        export_pole_plot("pretrained")
+        return {
+            'train_loader': train_dl,
+            'val_loader': val_dl,
+            'test_loader': test_dl,
+            'sizes': sizes,
+            'baseline_target_variance': baseline_target_variance,
+            'best_val': None,
+            'best_checkpoint': best_checkpoint,
+            'loaded_checkpoint': loaded_checkpoint,
+            'eval_stats': None,
+        }
 
     if config.DECODER_FT_EPOCHS > 0:
         torch.manual_seed(42)
