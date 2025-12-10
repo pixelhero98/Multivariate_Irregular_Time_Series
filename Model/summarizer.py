@@ -22,9 +22,7 @@ class TVHead(nn.Module):
 
 
 class PanelHistoryAE(nn.Module):
-    """
-    Panel Auto-Encoder with 'Soft Patching' and Learnable Additive Position Embeddings.
-    """
+    """Panel auto-encoder with soft patching and additive position embeddings."""
 
     def __init__(
         self,
@@ -260,5 +258,44 @@ class PanelHistoryAE(nn.Module):
         loss_x = self._masked_mse(aux['x_hat'], aux['x'], entity_mask)
         loss_v = self._masked_mse(aux['v_hat'], aux['v_sig'], entity_mask)
         loss_t = self._masked_mse(aux['t_hat'], aux['t_sig'], entity_mask)
-        
+
         return (w_x * loss_x) + (w_v * loss_v) + (w_t * loss_t)
+
+
+class LaplaceAE(PanelHistoryAE):
+    """Compatibility wrapper that exposes the historical summarizer as ``LaplaceAE``.
+
+    Older training and evaluation scripts expect a ``LaplaceAE`` class with a
+    ``lap_k`` constructor argument. The underlying implementation is provided by
+    :class:`PanelHistoryAE`, where ``lap_k`` corresponds to the mixer output
+    dimension (``mix_dim``).
+    """
+
+    def __init__(
+        self,
+        num_entities: int,
+        feat_dim: int,
+        window_size: int,
+        *,
+        lap_k: int = 64,
+        tv_hidden: int = 32,
+        out_len: int = 16,
+        context_dim: int = 256,
+        dropout: float = 0.1,
+        enc_layers: int = 2,
+        n_heads: int = 4,
+        patch_kernel: int = 3,
+    ) -> None:
+        super().__init__(
+            num_entities=num_entities,
+            feat_dim=feat_dim,
+            window_size=window_size,
+            mix_dim=lap_k,
+            tv_hidden=tv_hidden,
+            out_len=out_len,
+            context_dim=context_dim,
+            enc_layers=enc_layers,
+            n_heads=n_heads,
+            dropout=dropout,
+            patch_kernel=patch_kernel,
+        )
