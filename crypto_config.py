@@ -53,9 +53,9 @@ SUM_CKPT = SUM_DIR + f"/{PRED}-{VAE_LATENT_CHANNELS}-summarizer.pt"
 CKPT_DIR = "./ldt/checkpoints/" + MKT
 
 # --- Diffusion Process ---
-TIMESTEPS     = 1000
+TIMESTEPS     = 200 # 100 - 1000
 # Recommended to try "cosine", as it pairs well with v-prediction.
-SCHEDULE      = "cosine"     # ["cosine", "linear"]
+SCHEDULE      = "linear"     # ["cosine", "linear"]
 PREDICT_TYPE  = "x0"          # ["x0", "v", "eps"]
 
 # --- Loss Function ---
