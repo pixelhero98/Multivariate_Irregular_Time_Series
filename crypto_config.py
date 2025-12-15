@@ -62,7 +62,7 @@ PREDICT_TYPE  = "x0"          # ["x0", "v", "eps"]
 # 'weighted_min_snr' is highly recommended. Set to 'none' to disable.
 LOSS_WEIGHT_SCHEME = 'weighted_min_snr'
 # The gamma parameter for min-SNR weighting. A value of 5.0 is a common starting point.
-MINSNR_GAMMA = 4.5
+MINSNR_GAMMA = 5.0
 
 # --- LLapDiT Architecture ---
 MODEL_WIDTH   = SUM_CONTEXT_DIM
