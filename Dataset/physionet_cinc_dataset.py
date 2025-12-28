@@ -25,6 +25,7 @@ import pandas as pd
 import requests
 
 from ._types import PathLike
+from ._normalization import NormalizationStatsAccumulator
 from .fin_dataset import (
     CachePaths,
     load_dataloaders_with_ratio_split as _load_fin_ratio_split,
@@ -212,96 +213,6 @@ def load_physionet_outcomes(path: PathLike) -> pd.DataFrame:
     return df
 
 
-class _NormStatsAccumulator:
-    """Accumulate normalization statistics for PhysioNet panels."""
-
-    def __init__(self, num_assets: int, feature_dim: int, per_asset: bool) -> None:
-        self.per_asset = bool(per_asset)
-        self.num_assets = int(num_assets)
-        self.feature_dim = int(feature_dim)
-
-        if per_asset:
-            self.sum_x = [np.zeros(feature_dim, dtype=np.float64) for _ in range(num_assets)]
-            self.sumsq_x = [np.zeros(feature_dim, dtype=np.float64) for _ in range(num_assets)]
-            self.count_x = [0 for _ in range(num_assets)]
-            self.sum_y = [0.0 for _ in range(num_assets)]
-            self.sumsq_y = [0.0 for _ in range(num_assets)]
-            self.count_y = [0 for _ in range(num_assets)]
-        else:
-            self.sum_x = np.zeros(feature_dim, dtype=np.float64)
-            self.sumsq_x = np.zeros(feature_dim, dtype=np.float64)
-            self.count_x = 0
-            self.sum_y = 0.0
-            self.sumsq_y = 0.0
-            self.count_y = 0
-
-    def update(self, aid: int, features: np.ndarray, targets: np.ndarray) -> None:
-        if self.per_asset:
-            self.sum_x[aid] += features.sum(axis=0, dtype=np.float64)
-            self.sumsq_x[aid] += (features.astype(np.float64) ** 2).sum(axis=0)
-            self.count_x[aid] += features.shape[0]
-            self.sum_y[aid] += float(targets.sum(dtype=np.float64))
-            self.sumsq_y[aid] += float((targets.astype(np.float64) ** 2).sum())
-            self.count_y[aid] += targets.shape[0]
-        else:
-            self.sum_x += features.sum(axis=0, dtype=np.float64)
-            self.sumsq_x += (features.astype(np.float64) ** 2).sum(axis=0)
-            self.count_x += features.shape[0]
-            self.sum_y += float(targets.sum(dtype=np.float64))
-            self.sumsq_y += float((targets.astype(np.float64) ** 2).sum())
-            self.count_y += targets.shape[0]
-
-    def finalize(self, assets: Sequence[str]) -> Dict[str, object]:
-        def _safe_stats(sum_x, sumsq_x, count_x):
-            if count_x <= 0:
-                return np.zeros(self.feature_dim, dtype=np.float32), np.ones(self.feature_dim, dtype=np.float32)
-            mean = (sum_x / count_x).astype(np.float32)
-            var = (sumsq_x / count_x) - (mean.astype(np.float64) ** 2)
-            var = np.maximum(var, 1e-12)
-            std = np.sqrt(var).astype(np.float32)
-            std[std == 0] = 1.0
-            return mean, std
-
-        if self.per_asset:
-            mean_x, std_x, mean_y, std_y = [], [], [], []
-            for aid in range(len(assets)):
-                mx, sx = _safe_stats(self.sum_x[aid], self.sumsq_x[aid], self.count_x[aid])
-                if self.count_y[aid] > 0:
-                    my = float(self.sum_y[aid] / self.count_y[aid])
-                    vy = max(self.sumsq_y[aid] / self.count_y[aid] - my ** 2, 1e-12)
-                    sy = float(np.sqrt(vy))
-                else:
-                    my = 0.0
-                    sy = 1.0
-                mean_x.append(mx.reshape(1, 1, -1).tolist())
-                std_x.append(sx.reshape(1, 1, -1).tolist())
-                mean_y.append(my)
-                std_y.append(sy if sy != 0 else 1.0)
-            return {
-                "per_ticker": True,
-                "mean_x": mean_x,
-                "std_x": std_x,
-                "mean_y": mean_y,
-                "std_y": std_y,
-            }
-
-        mx, sx = _safe_stats(self.sum_x, self.sumsq_x, self.count_x)
-        if self.count_y > 0:
-            my = float(self.sum_y / self.count_y)
-            vy = max(self.sumsq_y / self.count_y - my ** 2, 1e-12)
-            sy = float(np.sqrt(vy))
-        else:
-            my = 0.0
-            sy = 1.0
-        return {
-            "per_ticker": False,
-            "mean_x": mx.reshape(1, 1, -1).tolist(),
-            "std_x": sx.reshape(1, 1, -1).tolist(),
-            "mean_y": my,
-            "std_y": sy if sy != 0 else 1.0,
-        }
-
-
 # ---------------------------------------------------------------------------
 # Cache preparation
 
@@ -379,7 +290,8 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
     if not feature_frames:
         raise RuntimeError("No patient panels remaining after applying target/outcome processing.")
 
-    feature_cols = list(next(iter(feature_frames.values())).columns)
+    common_feature_cols = set.intersection(*(set(df.columns) for df in feature_frames.values()))
+    feature_cols = [TARGET_COLUMN] + sorted(c for c in common_feature_cols if c != TARGET_COLUMN)
     if TARGET_COLUMN not in feature_cols:
         raise ValueError(f"Target column '{TARGET_COLUMN}' missing from feature columns.")
 
@@ -394,7 +306,7 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
     start_times: List[np.datetime64] = []
     stop_times: List[np.datetime64] = []
 
-    norm_acc = _NormStatsAccumulator(
+    norm_acc = NormalizationStatsAccumulator(
         num_assets=len(assets),
         feature_dim=len(feature_cols),
         per_asset=cfg.normalize_per_patient,
@@ -440,16 +352,20 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
 
     meta = {
         "dataset": "physionet_cinc",
+        "format": "indexcache_v1",
         "subset": cfg.subset,
         "window": window,
         "horizon": horizon,
         "max_window": int(MAX_WINDOW),
         "max_horizon": int(MAX_HORIZON),
         "assets": assets,
+        "asset2id": asset_to_id,
         "feature_cols": feature_cols,
+        "target_col": TARGET_COLUMN,
         "target_column": TARGET_COLUMN,
         "target_parameter": cfg.target_parameter,
         "normalize_per_patient": bool(cfg.normalize_per_patient),
+        "normalize_per_ticker": bool(cfg.normalize_per_patient),
         "clamp_sigma": float(cfg.clamp_sigma),
         "keep_time_meta": keep_time_meta,
         "freq": cfg.freq or DEFAULT_FREQ,
