@@ -23,6 +23,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import requests
+import shutil
 
 from ._types import PathLike
 from ._normalization import NormalizationStatsAccumulator
@@ -51,14 +52,14 @@ OUTCOME_FILENAMES = {
     "set-c": "Outcomes-c.txt",
 }
 
-TARGET_COLUMN = "future_vital"
+TARGET_COLUMN = "HR"
 
 # PhysioNet measurements are recorded every hour for the challenge; align to that by default.
-DEFAULT_FREQ = "1H"
+DEFAULT_FREQ = "1h"
 
 # Keep the cache bounded so ``run_experiment`` can rebuild smaller indices cheaply.
-MAX_WINDOW = 48
-MAX_HORIZON = 24
+MAX_WINDOW = 24
+MAX_HORIZON = 12
 
 
 @dataclass
@@ -86,65 +87,81 @@ class PhysioNetCacheConfig:
 # ---------------------------------------------------------------------------
 # Downloading & ingestion utilities
 
-def download_physionet_cinc_dataset(
-    dest_path: PathLike = "./physionet_cinc_raw",
-    subset: str = "set-a",
-) -> Path:
-    """Download and extract a PhysioNet CinC subset if not already available."""
-
+def download_physionet_cinc_dataset(dest_path="./physionet_cinc_raw", subset="set-a") -> Path:
     subset_key = subset.lower()
     if subset_key not in DATA_URLS:
         raise ValueError(f"Unknown subset '{subset}'. Expected one of {sorted(DATA_URLS)}.")
 
     dest = Path(dest_path).expanduser().resolve()
     subset_dir = dest / subset_key
+    subset_dir.mkdir(parents=True, exist_ok=True)
+
     outcomes_file = subset_dir / OUTCOME_FILENAMES[subset_key]
-    if outcomes_file.exists() and any(subset_dir.glob("*.txt")):
+    outcomes_in_root = dest / OUTCOME_FILENAMES[subset_key]
+
+    # --- NEW: support "full project" layout where outcomes sit in dest/ ---
+    if not outcomes_file.exists() and outcomes_in_root.exists():
+        shutil.copy2(outcomes_in_root, outcomes_file)
+
+    has_patient_txt = any(
+        p for p in subset_dir.glob("*.txt")
+        if not p.name.lower().startswith("outcomes")
+    )
+
+    if outcomes_file.exists() and has_patient_txt:
         return subset_dir
 
-    dest.mkdir(parents=True, exist_ok=True)
-
+    # fall back to downloading subset zip
     url = DATA_URLS[subset_key]
     response = requests.get(url, stream=True, timeout=120)
     response.raise_for_status()
-
     with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
         zf.extractall(dest)
 
+    # after extraction, try the same copy again (zip may not include outcomes)
+    if not outcomes_file.exists() and outcomes_in_root.exists():
+        shutil.copy2(outcomes_in_root, outcomes_file)
+
     if not outcomes_file.exists():
         raise FileNotFoundError(
-            f"Outcome file '{OUTCOME_FILENAMES[subset_key]}' not found after extracting '{url}'."
+            f"Outcome file '{OUTCOME_FILENAMES[subset_key]}' not found in '{subset_dir}' or '{dest}'."
         )
 
     return subset_dir
 
 
 def _read_patient_file(path: Path) -> Tuple[str, pd.DataFrame]:
-    """Read a single patient text file into a cleaned time-indexed dataframe."""
-
     df = pd.read_csv(path)
-    expected_cols = {"RecordID", "Time", "Parameter", "Value"}
-    missing = expected_cols - set(df.columns)
-    if missing:
-        raise ValueError(f"File '{path}' is missing required columns: {sorted(missing)}")
 
-    record_id = str(df["RecordID"].iloc[0])
+    # PhysioNet official format: Time,Parameter,Value
+    if set(df.columns) == {"Time", "Parameter", "Value"}:
+        rid_row = df.loc[df["Parameter"] == "RecordID", "Value"]
+        record_id = str(rid_row.iloc[0]) if not rid_row.empty else path.stem
+        df = df[df["Parameter"] != "RecordID"].copy()
 
-    # Convert the ``HH:MM`` strings to elapsed minutes since ICU admission.
+    # Alternate format (some preprocessed dumps): RecordID,Time,Parameter,Value
+    elif {"RecordID", "Time", "Parameter", "Value"}.issubset(df.columns):
+        record_id = str(df["RecordID"].iloc[0])
+
+    else:
+        raise ValueError(f"Unexpected columns in '{path}': {list(df.columns)}")
+
+    # -1 means missing in this dataset → treat as NaN
+    df["Value"] = pd.to_numeric(df["Value"], errors="coerce")
+    df.loc[df["Value"] < 0, "Value"] = np.nan  # important
+
     time_delta = pd.to_timedelta(df["Time"].astype(str) + ":00")
     df["minutes"] = (time_delta / pd.Timedelta(minutes=1)).astype(int)
-    df["Value"] = pd.to_numeric(df["Value"], errors="coerce")
 
     pivot = df.pivot_table(index="minutes", columns="Parameter", values="Value", aggfunc="last")
     pivot = pivot.sort_index()
 
-    # Treat minutes as offsets from a fixed origin to obtain a DatetimeIndex.
     origin = pd.Timestamp("2000-01-01")
     pivot.index = origin + pd.to_timedelta(pivot.index, unit="m")
-    pivot = pivot.ffill()
-    pivot = pivot.dropna(how="all")
+    pivot = pivot.ffill().dropna(how="all")
 
     return record_id, pivot
+
 
 
 def load_physionet_patient_panels(
