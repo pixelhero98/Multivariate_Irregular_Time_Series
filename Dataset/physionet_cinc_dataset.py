@@ -18,12 +18,11 @@ import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
-import shutil
 
 from ._types import PathLike
 from ._normalization import NormalizationStatsAccumulator
@@ -292,6 +291,7 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
     asset_to_id = {asset: idx for idx, asset in enumerate(assets)}
 
     feature_frames: Dict[str, pd.DataFrame] = {}
+    common_feature_cols: Optional[Set[str]] = None
     for asset in assets:
         panel = _ensure_future_vital_target(panels[asset].copy(), cfg.target_parameter)
 
@@ -302,12 +302,22 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
             panel = panel.ffill()  # ensure broadcast columns remain constant
 
         panel = panel.dropna(how="all")
+        panel = panel.ffill().bfill()
+        non_empty_cols = {c for c in panel.columns if not panel[c].isna().all()}
+        if TARGET_COLUMN not in non_empty_cols:
+            raise RuntimeError(f"Patient '{asset}' is missing the target column after cleaning.")
+
         feature_frames[asset] = panel.astype(np.float32)
+        common_feature_cols = (
+            non_empty_cols if common_feature_cols is None else common_feature_cols & non_empty_cols
+        )
 
     if not feature_frames:
         raise RuntimeError("No patient panels remaining after applying target/outcome processing.")
 
-    common_feature_cols = set.intersection(*(set(df.columns) for df in feature_frames.values()))
+    if not common_feature_cols:
+        raise RuntimeError("No common feature columns remain across patient panels.")
+
     feature_cols = [TARGET_COLUMN] + sorted(c for c in common_feature_cols if c != TARGET_COLUMN)
     if TARGET_COLUMN not in feature_cols:
         raise ValueError(f"Target column '{TARGET_COLUMN}' missing from feature columns.")
@@ -333,6 +343,11 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
     for asset in assets:
         aid = asset_to_id[asset]
         panel = feature_frames[asset][feature_cols]
+        if panel.isna().any().any():
+            raise RuntimeError(
+                f"Patient '{asset}' still contains missing values after alignment. "
+                "Adjust the coverage/frequency settings or verify the raw data."
+            )
         if panel.shape[0] < min_required:
             raise ValueError(
                 f"Patient '{asset}' has insufficient length ({panel.shape[0]} rows) "
