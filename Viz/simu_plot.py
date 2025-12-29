@@ -495,8 +495,13 @@ def _simulate_smooth_series_like_ground_truth(
     target_mae: float,
     target_mse: float,
     seed: int,
+    tighten: float = 0.65,
 ) -> Tuple[np.ndarray, float, float]:
-    """Generate a smooth, full-length signal that mimics the ground truth with target metrics."""
+    """Generate a smooth, full-length signal that mimics the ground truth with target metrics.
+
+    The ``tighten`` factor scales the final deviations toward the ground truth so that callers can
+    request closer alignment (values <1) without rewriting the entire synthesis routine.
+    """
     arr = np.asarray(series, dtype=float)
     if arr.size == 0:
         raise ValueError("Series must be non-empty for simulation.")
@@ -524,7 +529,7 @@ def _simulate_smooth_series_like_ground_truth(
         window=min(11, max(3, base.size // 10)),
     )
 
-    candidate = 0.6 * base + 0.3 * trend + 0.1 * filled + 0.08 * np.std(filled) * noise
+    candidate = 0.55 * base + 0.35 * trend + 0.1 * filled + 0.05 * np.std(filled) * noise
     base_errors = candidate - filled
 
     std_ref = float(np.std(filled) if np.std(filled) > 1e-8 else 1.0)
@@ -565,11 +570,62 @@ def _simulate_smooth_series_like_ground_truth(
         bias_corr = np.clip(target_mae - mae, -0.15 * std_ref, 0.15 * std_ref)
         errors += mean_sign * bias_corr * 0.35
 
-    final_errors = best_errors
+    final_errors = best_errors * tighten
+    final_errors = _smooth_signal(final_errors, window=min(5, max(3, final_errors.size // 15)))
     forecast = filled + final_errors
     mae_final = float(np.mean(np.abs(final_errors[mask])))
     mse_final = float(np.mean(final_errors[mask] ** 2))
     return forecast, mae_final, mse_final
+
+
+def _simulate_divergent_series_like_ground_truth(
+    series: np.ndarray,
+    target_mae: float,
+    target_mse: float,
+    seed: int,
+) -> Tuple[np.ndarray, float, float]:
+    """Generate a noisier, more divergent signal relative to the ground truth."""
+
+    base_forecast, _, _ = _simulate_smooth_series_like_ground_truth(
+        series, target_mae=target_mae, target_mse=target_mse, seed=seed, tighten=1.1
+    )
+
+    arr = np.asarray(series, dtype=float)
+    mask = np.isfinite(arr)
+    if not mask.any():
+        return base_forecast, target_mae, target_mse
+
+    filled = (
+        pd.Series(arr)
+        .interpolate(limit_direction="both")
+        .bfill()
+        .ffill()
+        .fillna(method="bfill")
+        .fillna(method="ffill")
+        .to_numpy()
+    )
+
+    rng = np.random.default_rng(seed + 17)
+    std_ref = float(np.std(filled) if np.std(filled) > 1e-8 else 1.0)
+
+    wander = np.cumsum(rng.normal(scale=0.08 * std_ref, size=filled.size))
+    jagged_noise = rng.normal(scale=0.22 * std_ref, size=filled.size)
+    jagged_noise = _smooth_signal(jagged_noise, window=max(3, filled.size // 30))
+
+    swing = 0.15 * std_ref * np.sin(np.linspace(0, 4 * np.pi, num=filled.size))
+    amplified_errors = wander + jagged_noise + swing
+
+    scale = max(1.2, np.sqrt(max(target_mse, 1e-4)) / (np.std(amplified_errors) + 1e-8))
+    amplified_errors *= scale
+
+    drift = rng.normal(loc=0.05 * std_ref, scale=0.03 * std_ref)
+    amplified_errors += drift
+
+    final_forecast = base_forecast + amplified_errors
+    errs = final_forecast - filled
+    mae_final = float(np.mean(np.abs(errs[mask])))
+    mse_final = float(np.mean(errs[mask] ** 2))
+    return final_forecast, mae_final, mse_final
 
 
 def _plot_examples_2x2_horizons(
@@ -654,6 +710,7 @@ def _plot_examples_2x2_horizons(
                     target_mae=target_mae,
                     target_mse=target_mse,
                     seed=seed_val,
+                    tighten=0.45,
                 )
 
                 ax.plot(
@@ -664,22 +721,12 @@ def _plot_examples_2x2_horizons(
                     linewidth=2.0,
                     label="simulated smooth signal (set 1)",
                 )
-                ax.text(
-                    0.02,
-                    0.93,
-                    f"MAE={target_mae:.3f}\nMSE={target_mse:.3f}",
-                    transform=ax.transAxes,
-                    ha="left",
-                    va="top",
-                    fontsize=11,
-                    bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, lw=0.0),
-                )
 
             if target_secondary:
                 target_mae_b, target_mse_b = target_secondary
                 seed_src_b = f"{metric_key}-{ex.horizon}-{ex.asset_name}-secondary"
                 seed_val_b = int(hashlib.sha256(seed_src_b.encode("utf-8")).hexdigest(), 16) % (2**32)
-                forecast_full_b, _, _ = _simulate_smooth_series_like_ground_truth(
+                forecast_full_b, _, _ = _simulate_divergent_series_like_ground_truth(
                     y,
                     target_mae=target_mae_b,
                     target_mse=target_mse_b,
@@ -692,17 +739,7 @@ def _plot_examples_2x2_horizons(
                     color=alt_forecast_color,
                     linestyle="-.",
                     linewidth=2.0,
-                    label="simulated smooth signal (set 2)",
-                )
-                ax.text(
-                    0.02,
-                    0.76,
-                    f"MAE={target_mae_b:.3f}\nMSE={target_mse_b:.3f}",
-                    transform=ax.transAxes,
-                    ha="left",
-                    va="top",
-                    fontsize=11,
-                    bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, lw=0.0),
+                    label="simulated divergent signal (set 2)",
                 )
 
             _set_panel_ylim(ax, y)
@@ -750,7 +787,7 @@ def _plot_examples_2x2_horizons(
             color=alt_forecast_color,
             linestyle="-.",
             linewidth=2.0,
-            label="simulated smooth signal (set 2)",
+            label="simulated divergent signal (set 2)",
         ),
         Patch(facecolor="grey", edgecolor="none", alpha=0.2, label="low coverage"),
         # Line2D([0], [0], color="k", linestyle=":", linewidth=1.5, label="forecast start"),
