@@ -37,7 +37,7 @@ from Dataset.fin_dataset import CachePaths, _normalize_to_day
 
 @dataclass(frozen=True)
 class CoverageSummary:
-    days: int
+    steps: int
     min: float
     mean: float
     median: float
@@ -45,19 +45,26 @@ class CoverageSummary:
 
 
 def _load_meta(paths: CachePaths) -> Dict[str, object]:
-    if not paths.meta.exists():
-        raise FileNotFoundError(
-            f"Cache metadata not found at '{paths.meta}'. Did you prepare the dataset cache?"
-        )
-    with paths.meta.open("r") as f:
+    meta_path = paths.meta
+    if not meta_path.exists():
+        alt = paths.cache_root / "meta.json"
+        if alt.exists():
+            meta_path = alt
+        else:
+            raise FileNotFoundError(
+                f"Cache metadata not found at '{paths.meta}' "
+                f"(also tried '{alt}'). Did you prepare the dataset cache?"
+            )
+    with meta_path.open("r") as f:
         return json.load(f)
+
 
 
 def _summarize_coverage(per_day: np.ndarray) -> CoverageSummary:
     if per_day.size == 0:
-        return CoverageSummary(days=0, min=0.0, mean=0.0, median=0.0, max=0.0)
+        return CoverageSummary(steps=0, min=0.0, mean=0.0, median=0.0, max=0.0)
     return CoverageSummary(
-        days=int(per_day.size),
+        steps=int(per_day.size),
         min=float(per_day.min()),
         mean=float(per_day.mean()),
         median=float(np.median(per_day)),
@@ -65,24 +72,25 @@ def _summarize_coverage(per_day: np.ndarray) -> CoverageSummary:
     )
 
 
-def _compute_day_coverage(
+def _compute_timestamp_coverage(
     pairs: np.ndarray, end_times: np.ndarray, num_assets: int
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return coverage per day along with inverse day indices and unique days."""
+    """Return coverage per timestamp (window end_time) along with inverse indices and unique timestamps."""
     if pairs.size == 0 or end_times.size == 0:
-        return np.array([]), np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+        return np.array([]), np.array([], dtype=np.int64), np.array([], dtype="datetime64[ns]")
 
-    day_keys = _normalize_to_day(end_times)
-    unique_days, inverse = np.unique(day_keys, return_inverse=True)
+    # Use nanosecond integer keys for stable uniqueness + sorting.
+    t_keys = end_times.astype("datetime64[ns]").astype(np.int64)
+    unique_t, inverse = np.unique(t_keys, return_inverse=True)
 
-    day_asset = np.stack(
-        [inverse.astype(np.int64), pairs[:, 0].astype(np.int64)], axis=1
-    )
-    day_asset_unique = np.unique(day_asset, axis=0)
-    counts = np.bincount(day_asset_unique[:, 0], minlength=len(unique_days))
+    # Count unique (timestamp, asset) pairs.
+    t_asset = np.stack([inverse.astype(np.int64), pairs[:, 0].astype(np.int64)], axis=1)
+    t_asset_unique = np.unique(t_asset, axis=0)
+    counts = np.bincount(t_asset_unique[:, 0], minlength=len(unique_t))
+
     coverage = counts / float(max(1, num_assets))
-    return coverage, inverse, unique_days
-
+    unique_t = unique_t.astype("datetime64[ns]")  # convert back for readability if needed
+    return coverage, inverse, unique_t
 
 def _split_counts(n: int, tr: float, vr: float, te: float) -> Tuple[int, int, int]:
     s = float(tr + vr + te)
@@ -159,22 +167,19 @@ def summarize_dataset(
     pairs = np.load(paths.windows / "global_pairs.npy")
     end_times = np.load(paths.windows / "end_times.npy")
 
-    base_cov, inverse_days, unique_days = _compute_day_coverage(
-        pairs, end_times, len(assets)
-    )
+    base_cov, inverse_t, unique_t = _compute_timestamp_coverage(pairs, end_times, len(assets))
+
     base_cov_summary = _summarize_coverage(base_cov)
 
     kept_pairs = pairs
     kept_end_times = end_times
     filtered_cov_summary = base_cov_summary
     if coverage_threshold > 0.0 and base_cov.size > 0:
-        keep_days = base_cov >= coverage_threshold
-        keep_mask = keep_days[inverse_days]
+        keep_t = base_cov >= coverage_threshold
+        keep_mask = keep_t[inverse_t]
         kept_pairs = pairs[keep_mask]
         kept_end_times = end_times[keep_mask]
-        filtered_cov, *_ = _compute_day_coverage(
-            kept_pairs, kept_end_times, len(assets)
-        )
+        filtered_cov, *_ = _compute_timestamp_coverage(kept_pairs, kept_end_times, len(assets))
         filtered_cov_summary = _summarize_coverage(filtered_cov)
 
     tr_steps, va_steps, te_steps = _apply_split(
@@ -192,19 +197,20 @@ def summarize_dataset(
     print(f"Input channels : {len(feature_cols)}")
     print(f"Window/Horizon : {window}/{horizon}")
     print()
-    print("Coverage per day (before filtering):")
+    print("Coverage per timestamp (before filtering):")
     print(
-        f"  days={base_cov_summary.days} "
+        f"  steps={base_cov_summary.steps} "
         f"min={base_cov_summary.min:.3f} "
         f"mean={base_cov_summary.mean:.3f} "
         f"median={base_cov_summary.median:.3f} "
         f"max={base_cov_summary.max:.3f}"
     )
     if coverage_threshold > 0.0:
-        kept_days = filtered_cov_summary.days
+        kept_steps = filtered_cov_summary.steps
         print(
-            f"Applied coverage >= {coverage_threshold:.2f}: kept {kept_days} / {base_cov_summary.days} days"
+            f"Applied coverage >= {coverage_threshold:.2f}: kept {kept_steps} / {base_cov_summary.steps} steps"
         )
+
         print(
             f"  min={filtered_cov_summary.min:.3f} "
             f"mean={filtered_cov_summary.mean:.3f} "
