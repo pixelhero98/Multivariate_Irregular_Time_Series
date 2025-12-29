@@ -17,10 +17,11 @@ Example usage:
 
 from __future__ import annotations
 
-import argparse
+
 import json
 from dataclasses import dataclass
-from pathlib import Path
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import matplotlib.dates as mdates
@@ -393,13 +394,9 @@ def _plot_examples_2x2_horizons(
     physio_long: ExampleSlice,
     output: Path,
 ) -> None:
-    """2x2 figure: rows=datasets, cols=horizons.
-
-    Uses a relative x-axis (time steps 1..K+h) so the top row can omit x labels
-    without mixing absolute timestamps across datasets.
-    """
-    fig, axes = plt.subplots(2, 2, figsize=(14, 6), constrained_layout=True)
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 6.8), constrained_layout=True)
     color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+    series_color = color_cycle[0] if color_cycle else None
 
     grid = [
         [noaa_short, noaa_long],
@@ -420,54 +417,71 @@ def _plot_examples_2x2_horizons(
             ex = grid[r][c]
             ax = axes[r, c]
             fname, y = next(iter(ex.values.items()))
-            color = color_cycle[0] if color_cycle else None
 
-            # relative time axis: 1..(K+h)
-            x = np.arange(1, len(ex.timestamps) + 1)
+            # relative x-axis: 0..(K+h-1)
+            x = np.arange(len(ex.timestamps))
+            K = ex.window
 
             cov = ex.panel_coverage.to_numpy(dtype=float)
             low = np.isfinite(cov) & (cov <= ex.coverage_threshold)
 
             y = np.asarray(y, dtype=float)
             y_gap = y.copy()
-            y_gap[low] = np.nan  # visible gaps in low-coverage periods
+            y_gap[low] = np.nan
 
-            ax.plot(x, y_gap, label=f"{fname}", color=color)
-            ax.scatter(x[~low], y[~low], s=10, alpha=0.7, color=color, edgecolors="none")
+            # Plot series (no legend label here; legend is shared)
+            ax.plot(x, y_gap, color=series_color, linewidth=2.0, label="_nolegend_")
+            ax.scatter(x[~low], y[~low], s=1, alpha=0.75, color=series_color,
+                       edgecolors="none", label="_nolegend_")
 
-            # forecast start boundary at x=K
-            if len(x) >= ex.window:
-                ax.axvline(ex.window, color="k", linestyle=":", alpha=0.6, linewidth=1)
+            # Forecast start boundary
+            # ax.axvline(K, color="k", linestyle=":", alpha=0.7, linewidth=1.5, label="_nolegend_")
 
             _set_panel_ylim(ax, y)
             _shade_low_coverage(ax, x, ex.panel_coverage, ex.coverage_threshold)
 
-            # clean, consistent ticks: {1, K, K+h}
-            ticks = [1, ex.window, ex.window + ex.horizon]
-            ticks = [t for t in ticks if 1 <= t <= x[-1]]
+            # Short title
+            ds = str(ex.dataset).replace("_", "-")
+            ax.set_title(f"{ds} (h={ex.horizon})")
+
+            # Clean ticks: 0, K, K+h
+            ticks = [0, K, K + ex.horizon]
+            ticks = [t for t in ticks if 0 <= t <= x[-1]]
             ax.set_xticks(sorted(set(ticks)))
 
-            ax.grid(True, linestyle="--", alpha=0.3)
-            ax.set_title(f"{ex.dataset} • {fname} (h={ex.horizon})")
-            ax.legend(loc="upper right")
+            ax.grid(True, linestyle="--", alpha=0.25)
+            ax.margins(x=0.01)
 
-            # show x labels only on bottom row
+            # Only left column shows y tick labels
+            if c == 1:
+                ax.tick_params(axis="y", labelleft=False)
+
+            # Only bottom row shows x labels
             if r == 0:
                 ax.tick_params(axis="x", labelbottom=False)
             else:
                 ax.set_xlabel("time step")
-                ax.tick_params(axis="x", labelbottom=True)
 
+        # Put asset id/name on left side of each row
         axes[r, 0].set_ylabel(str(grid[r][0].asset_name))
 
+    # Shared legend (generic entries, readable)
+    legend_handles = [
+        Line2D([0], [0], color=series_color, linewidth=2.0, label="series"),
+        Patch(facecolor="grey", edgecolor="none", alpha=0.2, label="low coverage"),
+        # Line2D([0], [0], color="k", linestyle=":", linewidth=1.5, label="forecast start"),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        ncol=3,
+        frameon=False,
+        bbox_to_anchor=(0.5, 1.02),
+    )
+
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=200)
-    fig.savefig(output.with_suffix(".pdf"))
+    fig.savefig(output, dpi=300, bbox_inches="tight")
     print(f"Saved figure to {output}")
-
-
-
-
 
 def save_qual_2x2_datasets_horizons(
     noaa_dir: Path,
@@ -480,7 +494,7 @@ def save_qual_2x2_datasets_horizons(
     noaa_window: int = 336,
     physio_window: int = 24,
     coverage_quantile: list = [0.0, 0.3],
-    min_block: int = 32,
+    min_block: int = 256,
 ) -> Path:
     noaa_paths = CachePaths.from_dir(noaa_dir)
     physio_paths = CachePaths.from_dir(physionet_dir)
@@ -520,5 +534,3 @@ if __name__ == "__main__":
         noaa_dir=Path("./ldt/noaa_isd_uk_data/noaa_isd_uk"),
         physionet_dir=Path("./ldt/physionet_cinc_data/physionet_cinc_cache"),
     )
-
-
