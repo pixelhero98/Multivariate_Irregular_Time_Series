@@ -19,6 +19,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from numpy.lib.stride_tricks import sliding_window_view
 
 import numpy as np
 import pandas as pd
@@ -87,46 +88,82 @@ class PhysioNetCacheConfig:
 # Downloading & ingestion utilities
 
 def download_physionet_cinc_dataset(dest_path="./physionet_cinc_raw", subset="set-a") -> Path:
+    """Return the local directory containing the requested PhysioNet split.
+
+    This helper is intentionally conservative about network access: if the
+    files already exist locally (either as a standalone split folder or as part
+    of the full project archive), we will reuse them instead of re-downloading.
+    """
+
     subset_key = subset.lower()
     if subset_key not in DATA_URLS:
         raise ValueError(f"Unknown subset '{subset}'. Expected one of {sorted(DATA_URLS)}.")
 
     dest = Path(dest_path).expanduser().resolve()
-    subset_dir = dest / subset_key
-    subset_dir.mkdir(parents=True, exist_ok=True)
 
-    outcomes_file = subset_dir / OUTCOME_FILENAMES[subset_key]
-    outcomes_in_root = dest / OUTCOME_FILENAMES[subset_key]
+    def _has_patient_txt(folder: Path) -> bool:
+        return any(
+            p for p in folder.glob("*.txt")
+            if not p.name.lower().startswith("outcomes")
+        )
 
-    # --- NEW: support "full project" layout where outcomes sit in dest/ ---
-    if not outcomes_file.exists() and outcomes_in_root.exists():
-        shutil.copy2(outcomes_in_root, outcomes_file)
+    # --- Case 1: files are already in dest/<subset>/ ---
+    direct_subset = dest / subset_key
+    if direct_subset.exists() and _has_patient_txt(direct_subset):
+        outcomes = direct_subset / OUTCOME_FILENAMES[subset_key]
+        if not outcomes.exists():
+            for root in (direct_subset.parent, dest):
+                src = root / OUTCOME_FILENAMES[subset_key]
+                if src.exists():
+                    shutil.copy2(src, outcomes)
+                    break
+        return direct_subset
 
-    has_patient_txt = any(
-        p for p in subset_dir.glob("*.txt")
-        if not p.name.lower().startswith("outcomes")
-    )
+    # --- Case 2: user extracted the *full project* archive under dest/ ---
+    # e.g., dest/<project_name>/<subset>/
+    for candidate in sorted(dest.rglob(subset_key)):
+        if not candidate.is_dir():
+            continue
+        if _has_patient_txt(candidate):
+            outcomes = candidate / OUTCOME_FILENAMES[subset_key]
+            if not outcomes.exists():
+                for root in (candidate.parent, dest):
+                    src = root / OUTCOME_FILENAMES[subset_key]
+                    if src.exists():
+                        shutil.copy2(src, outcomes)
+                        break
+            return candidate
 
-    if outcomes_file.exists() and has_patient_txt:
-        return subset_dir
-
-    # fall back to downloading subset zip
+    # --- Fall back: download the split zip and extract into dest/ ---
+    dest.mkdir(parents=True, exist_ok=True)
     url = DATA_URLS[subset_key]
     response = requests.get(url, stream=True, timeout=120)
     response.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
         zf.extractall(dest)
 
-    # after extraction, try the same copy again (zip may not include outcomes)
-    if not outcomes_file.exists() and outcomes_in_root.exists():
-        shutil.copy2(outcomes_in_root, outcomes_file)
+    subset_dir = dest / subset_key
+    outcomes = subset_dir / OUTCOME_FILENAMES[subset_key]
+    if not outcomes.exists():
+        # The split zip may not include the outcomes file; try common roots.
+        for root in (subset_dir.parent, dest):
+            src = root / OUTCOME_FILENAMES[subset_key]
+            if src.exists():
+                shutil.copy2(src, outcomes)
+                break
 
-    if not outcomes_file.exists():
+    if not subset_dir.exists() or not _has_patient_txt(subset_dir):
         raise FileNotFoundError(
-            f"Outcome file '{OUTCOME_FILENAMES[subset_key]}' not found in '{subset_dir}' or '{dest}'."
+            f"Patient time-series files for '{subset_key}' not found after extraction into '{dest}'."
+        )
+
+    if not outcomes.exists():
+        raise FileNotFoundError(
+            f"Outcome file '{OUTCOME_FILENAMES[subset_key]}' not found under '{subset_dir}' (or '{dest}')."
         )
 
     return subset_dir
+
 
 
 def _read_patient_file(path: Path) -> Tuple[str, pd.DataFrame]:
@@ -167,7 +204,7 @@ def load_physionet_patient_panels(
     data_dir: PathLike,
     *,
     parameters: Optional[Sequence[str]] = None,
-    freq: str = "1H",
+    freq: str = DEFAULT_FREQ,
     min_minutes: int = 60,
     min_coverage: float = 0.6,
     max_patients: Optional[int] = None,
@@ -247,25 +284,27 @@ def _validate_window_and_horizon(window: int, horizon: int) -> Tuple[int, int]:
 
 
 def _ensure_future_vital_target(panel: pd.DataFrame, target_parameter: str) -> pd.DataFrame:
-    """Append the continuous target column expected by the downstream pipeline."""
-
     if target_parameter not in panel.columns:
-        raise ValueError(f"Target parameter '{target_parameter}' missing for patient panel.")
+        panel[target_parameter] = np.nan
 
-    target_series = panel[target_parameter].ffill().bfill()
-    if target_series.isna().any():
-        raise ValueError(
-            "Target parameter contains gaps even after forward/backward filling; "
-            "cannot create a continuous future vital series."
-        )
-
-    panel = panel.drop(columns=[target_parameter])
-    panel[TARGET_COLUMN] = target_series.astype(np.float32)
+    target = panel[target_parameter].astype(np.float32)
+    panel = panel.drop(columns=[target_parameter], errors="ignore")
+    panel[TARGET_COLUMN] = target  # keep NaNs for masked training
     return panel
 
 
+
+
 def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, object]:
-    """Prepare the compact cache compatible with the financial pipeline."""
+    """Prepare the compact cache compatible with the financial pipeline.
+
+    Notes
+    -----
+    PhysioNet panels are irregular and may contain missing values even after
+    alignment. Since the downstream pipeline supports masked training, we keep
+    NaNs in both features and targets, and only require that each patient has
+    at least one observed target value.
+    """
 
     window, horizon = _validate_window_and_horizon(cfg.window, cfg.horizon)
 
@@ -273,10 +312,20 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
     if keep_time_meta not in {"full", "end", "none"}:
         raise ValueError("keep_time_meta must be one of {'full', 'end', 'none'}")
 
-    subset_dir = download_physionet_cinc_dataset(cfg.raw_data_dir or "./physionet_cinc_raw", cfg.subset)
+    subset_dir = download_physionet_cinc_dataset(
+        cfg.raw_data_dir or "./physionet_cinc_raw",
+        cfg.subset,
+    )
+
+    # Ensure the target parameter is not accidentally dropped when parameter
+    # filtering is enabled.
+    load_params = None
+    if cfg.parameters is not None:
+        load_params = list(dict.fromkeys([*cfg.parameters, cfg.target_parameter]))
+
     panels = load_physionet_patient_panels(
         subset_dir,
-        parameters=cfg.parameters,
+        parameters=load_params,
         freq=cfg.freq,
         min_minutes=cfg.min_minutes,
         min_coverage=cfg.min_coverage,
@@ -287,33 +336,47 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
     if cfg.include_outcomes:
         outcomes = load_physionet_outcomes(subset_dir / OUTCOME_FILENAMES[cfg.subset.lower()])
 
-    assets = sorted(panels.keys())
-    asset_to_id = {asset: idx for idx, asset in enumerate(assets)}
+    min_required = window + horizon
 
+    # ------------------------------------------------------------------
+    # Build per-patient frames and determine a shared feature set.
+
+    raw_assets = sorted(panels.keys())
     feature_frames: Dict[str, pd.DataFrame] = {}
     common_feature_cols: Optional[Set[str]] = None
-    for asset in assets:
+
+    for asset in raw_assets:
         panel = _ensure_future_vital_target(panels[asset].copy(), cfg.target_parameter)
 
         if outcomes is not None and asset in outcomes.index:
             static_values = outcomes.loc[asset]
             for col, value in static_values.items():
                 panel[f"OUTCOME_{col.upper()}"] = np.float32(value) if pd.notna(value) else np.nan
-            panel = panel.ffill()  # ensure broadcast columns remain constant
+            # Forward-fill only to keep broadcast static covariates constant.
+            panel = panel.ffill()
 
         panel = panel.dropna(how="all")
-        panel = panel.ffill().bfill()
-        non_empty_cols = {c for c in panel.columns if not panel[c].isna().all()}
-        if TARGET_COLUMN not in non_empty_cols:
-            raise RuntimeError(f"Patient '{asset}' is missing the target column after cleaning.")
+        if panel.shape[0] < min_required:
+            continue
 
+        # Skip patients with no observed target value at all.
+        target_vals = panel.get(TARGET_COLUMN)
+        if target_vals is None:
+            continue
+        if not np.isfinite(target_vals.to_numpy(dtype=np.float32, copy=False)).any():
+            continue
+
+        non_empty_cols = {c for c in panel.columns if not panel[c].isna().all()}
         feature_frames[asset] = panel.astype(np.float32)
         common_feature_cols = (
             non_empty_cols if common_feature_cols is None else common_feature_cols & non_empty_cols
         )
 
     if not feature_frames:
-        raise RuntimeError("No patient panels remaining after applying target/outcome processing.")
+        raise RuntimeError(
+            "No patient panels remaining after applying target/outcome processing. "
+            "Try lowering min_coverage or disabling parameter filtering."
+        )
 
     if not common_feature_cols:
         raise RuntimeError("No common feature columns remain across patient panels.")
@@ -321,6 +384,13 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
     feature_cols = [TARGET_COLUMN] + sorted(c for c in common_feature_cols if c != TARGET_COLUMN)
     if TARGET_COLUMN not in feature_cols:
         raise ValueError(f"Target column '{TARGET_COLUMN}' missing from feature columns.")
+
+    # Recompute assets after filtering so ids/files are consistent.
+    assets = sorted(feature_frames.keys())
+    asset_to_id = {asset: idx for idx, asset in enumerate(assets)}
+
+    # ------------------------------------------------------------------
+    # Persist arrays and build the global window index.
 
     data_dir = Path(cfg.data_dir).expanduser().resolve()
     paths = CachePaths.from_dir(data_dir)
@@ -339,20 +409,13 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
         per_asset=cfg.normalize_per_patient,
     )
 
-    min_required = window + horizon
     for asset in assets:
         aid = asset_to_id[asset]
         panel = feature_frames[asset][feature_cols]
-        if panel.isna().any().any():
-            raise RuntimeError(
-                f"Patient '{asset}' still contains missing values after alignment. "
-                "Adjust the coverage/frequency settings or verify the raw data."
-            )
+
         if panel.shape[0] < min_required:
-            raise ValueError(
-                f"Patient '{asset}' has insufficient length ({panel.shape[0]} rows) "
-                f"for window={window} and horizon={horizon}."
-            )
+            # Should not happen due to earlier filtering, but keep robust.
+            continue
 
         features = panel.to_numpy(dtype=np.float32, copy=True)
         targets = panel[TARGET_COLUMN].to_numpy(dtype=np.float32, copy=True)
@@ -362,15 +425,32 @@ def prepare_physionet_cinc_cache(cfg: PhysioNetCacheConfig) -> Mapping[str, obje
         np.save(paths.targets / f"{aid}.npy", targets.astype(np.float16, copy=False))
         np.save(paths.times / f"{aid}.npy", times)
 
+        # Normalization must ignore missing values downstream (masked training).
         norm_acc.update(aid, features, targets)
 
         max_start = panel.shape[0] - min_required + 1
+        if max_start <= 0:
+            continue
         starts = np.arange(0, max_start, dtype=np.int32)
+
+        # Keep only windows with at least one observed target value in the forecast horizon.
+        if horizon > 0:
+            obs = ~np.isnan(targets)
+            future_obs = sliding_window_view(obs, window_shape=horizon)
+            valid = future_obs[window : window + max_start].any(axis=1)
+            starts = starts[valid]
+
+        if starts.size == 0:
+            continue
+
         window_end_times = times[starts + window - 1].astype("datetime64[ns]")
         pairs.append(np.stack([np.full_like(starts, aid), starts], axis=1))
         end_times.append(window_end_times)
         start_times.append(times[0])
         stop_times.append(times[-1])
+
+    if not pairs:
+        raise RuntimeError("No valid context windows available across patients (target too sparse?).")
 
     global_pairs = np.concatenate(pairs, axis=0).astype(np.int32)
     global_end_times = np.concatenate(end_times, axis=0).astype("datetime64[ns]")
