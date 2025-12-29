@@ -508,6 +508,8 @@ def _simulate_smooth_series_like_ground_truth(
     filled = (
         pd.Series(arr)
         .interpolate(limit_direction="both")
+        .bfill()
+        .ffill()
         .fillna(method="bfill")
         .fillna(method="ffill")
         .to_numpy()
@@ -709,6 +711,13 @@ def _plot_examples_2x2_horizons(
         Patch(facecolor="grey", edgecolor="none", alpha=0.2, label="low coverage"),
         # Line2D([0], [0], color="k", linestyle=":", linewidth=1.5, label="forecast start"),
     ]
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        ncol=3,
+        frameon=False,
+        bbox_to_anchor=(0.5, -0.08),
+    )
     fig.legend(
         handles=legend_handles,
         loc="upper center",
