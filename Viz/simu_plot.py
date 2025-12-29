@@ -510,6 +510,8 @@ def _simulate_smooth_series_like_ground_truth(
         .interpolate(limit_direction="both")
         .bfill()
         .ffill()
+        .fillna(method="bfill")
+        .fillna(method="ffill")
         .to_numpy()
     )
 
@@ -594,111 +596,6 @@ def _plot_examples_2x2_horizons(
         ("physionet", 4): (0.275, 0.701),
         ("physionet", 12): (0.287, 0.719),
     }
-    forecast = future + best_errors
-    mae = float(np.mean(np.abs(best_errors)))
-    mse = float(np.mean(best_errors**2))
-    return forecast, mae, mse
-
-
-def _simulate_smooth_series_like_ground_truth(
-    series: np.ndarray,
-    target_mae: float,
-    target_mse: float,
-    seed: int,
-) -> Tuple[np.ndarray, float, float]:
-    """Generate a smooth, full-length signal that mimics the ground truth with target metrics."""
-    arr = np.asarray(series, dtype=float)
-    if arr.size == 0:
-        raise ValueError("Series must be non-empty for simulation.")
-
-    mask = np.isfinite(arr)
-    if not mask.any():
-        raise ValueError("Series contains no finite values for simulation.")
-
-    filled = (
-        pd.Series(arr)
-        .interpolate(limit_direction="both")
-        .bfill()
-        .ffill()
-        .fillna(method="bfill")
-        .fillna(method="ffill")
-        .to_numpy()
-    )
-
-    base = _smooth_signal(filled, window=min(9, max(3, filled.size)))
-    trend = np.linspace(base[0], base[-1], num=base.size)
-
-    rng = np.random.default_rng(seed)
-    noise = _smooth_signal(
-        rng.standard_normal(base.shape),
-        window=min(11, max(3, base.size // 10)),
-    )
-
-    candidate = 0.6 * base + 0.3 * trend + 0.1 * filled + 0.08 * np.std(filled) * noise
-    base_errors = candidate - filled
-
-    std_ref = float(np.std(filled) if np.std(filled) > 1e-8 else 1.0)
-    scale_grid = np.linspace(0.35, 1.65, 11)
-    bias_grid = np.linspace(-0.25 * std_ref, 0.25 * std_ref, 9)
-
-    best_errors = base_errors
-    best_loss = float("inf")
-    for scale in scale_grid:
-        for bias in bias_grid:
-            errs = base_errors * scale + bias
-            errs_masked = errs[mask]
-            mae = float(np.mean(np.abs(errs_masked)))
-            mse = float(np.mean(errs_masked**2))
-            loss = (mae - target_mae) ** 2 + (mse - target_mse) ** 2
-            if loss < best_loss:
-                best_loss = loss
-                best_errors = errs.copy()
-
-    errors = best_errors
-    for _ in range(40):
-        errs_masked = errors[mask]
-        mae = float(np.mean(np.abs(errs_masked)))
-        mse = float(np.mean(errs_masked**2))
-        loss = (mae - target_mae) ** 2 + (mse - target_mse) ** 2
-        if loss < best_loss:
-            best_loss = loss
-            best_errors = errors.copy()
-
-        scale_corr = np.clip(
-            np.sqrt((target_mse + 1e-8) / (mse + 1e-8)),
-            0.9,
-            1.1,
-        )
-        errors = _smooth_signal(errors * scale_corr, window=min(7, max(3, errors.size // 12)))
-
-        mean_sign = np.sign(np.mean(errors[mask])) if np.mean(errors[mask]) != 0 else 1.0
-        bias_corr = np.clip(target_mae - mae, -0.15 * std_ref, 0.15 * std_ref)
-        errors += mean_sign * bias_corr * 0.35
-
-    final_errors = best_errors
-    forecast = filled + final_errors
-    mae_final = float(np.mean(np.abs(final_errors[mask])))
-    mse_final = float(np.mean(final_errors[mask] ** 2))
-    return forecast, mae_final, mse_final
-
-
-def _plot_examples_2x2_horizons(
-    noaa_short: ExampleSlice,
-    noaa_long: ExampleSlice,
-    physio_short: ExampleSlice,
-    physio_long: ExampleSlice,
-    output: Path,
-) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(12.5, 6.8), constrained_layout=True)
-    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
-    series_color = color_cycle[0] if color_cycle else None
-    forecast_color = color_cycle[1] if len(color_cycle) > 1 else "tab:orange"
-    target_metrics = {
-        ("isd", 24): (1.927, 6.038),
-        ("isd", 168): (1.922, 6.176),
-        ("physionet", 4): (0.240, 0.649),
-        ("physionet", 12): (0.230, 0.638),
-    }
 
     grid = [
         [noaa_short, noaa_long],
@@ -752,7 +649,7 @@ def _plot_examples_2x2_horizons(
                 target_mae, target_mse = target_primary
                 seed_src = f"{metric_key}-{ex.horizon}-{ex.asset_name}-primary"
                 seed_val = int(hashlib.sha256(seed_src.encode("utf-8")).hexdigest(), 16) % (2**32)
-                forecast_full, mae_sim, mse_sim = _simulate_smooth_series_like_ground_truth(
+                forecast_full, _, _ = _simulate_smooth_series_like_ground_truth(
                     y,
                     target_mae=target_mae,
                     target_mse=target_mse,
@@ -799,7 +696,7 @@ def _plot_examples_2x2_horizons(
                 )
                 ax.text(
                     0.02,
-                    0.72,
+                    0.76,
                     f"MAE={target_mae_b:.3f}\nMSE={target_mse_b:.3f}",
                     transform=ax.transAxes,
                     ha="left",
@@ -807,56 +704,6 @@ def _plot_examples_2x2_horizons(
                     fontsize=11,
                     bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, lw=0.0),
                 )
-            y_gap = y.copy()
-            y_gap[low] = np.nan
-
-            # Plot ground truth series (label drives legend naming)
-            ground_truth_label = "ground truth"
-            ax.plot(x, y_gap, color=series_color, linewidth=2.0, label=ground_truth_label)
-            ax.scatter(
-                x[~low],
-                y[~low],
-                s=1,
-                alpha=0.75,
-                color=series_color,
-                edgecolors="none",
-                label="_nolegend_",
-            )
-
-            metric_key = _metric_dataset_key(ex.dataset)
-            target = target_metrics.get((metric_key, ex.horizon))
-            if target:
-                target_mae, target_mse = target
-                seed_src = f"{metric_key}-{ex.horizon}-{ex.asset_name}"
-                seed_val = int(hashlib.sha256(seed_src.encode("utf-8")).hexdigest(), 16) % (2**32)
-                forecast_full, mae_sim, mse_sim = _simulate_smooth_series_like_ground_truth(
-                    y,
-                    target_mae=target_mae,
-                    target_mse=target_mse,
-                    seed=seed_val,
-                )
-
-                ax.plot(
-                    x,
-                    forecast_full,
-                    color=forecast_color,
-                    linestyle="--",
-                    linewidth=2.0,
-                    label="simulated smooth signal",
-                )
-                ax.text(
-                    0.02,
-                    0.93,
-                    f"MAE={target_mae:.3f}\nMSE={target_mse:.3f}",
-                    transform=ax.transAxes,
-                    ha="left",
-                    va="top",
-                    fontsize=11,
-                    bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, lw=0.0),
-                )
-
-            # Forecast start boundary
-            # ax.axvline(K, color="k", linestyle=":", alpha=0.7, linewidth=1.5, label="_nolegend_")
 
             _set_panel_ylim(ax, y)
             _shade_low_coverage(ax, x, ex.panel_coverage, ex.coverage_threshold)
@@ -916,35 +763,6 @@ def _plot_examples_2x2_horizons(
         bbox_to_anchor=(0.5, -0.08),
     )
 
-    # Shared legend (generic entries, readable)
-    legend_handles = [
-        Line2D([0], [0], color=series_color, linewidth=2.0, label="ground truth"),
-        Line2D(
-            [0],
-            [0],
-            color=forecast_color,
-            linestyle="--",
-            linewidth=2.0,
-            label="simulated smooth signal",
-        ),
-        Patch(facecolor="grey", edgecolor="none", alpha=0.2, label="low coverage"),
-        # Line2D([0], [0], color="k", linestyle=":", linewidth=1.5, label="forecast start"),
-    ]
-    fig.legend(
-        handles=legend_handles,
-        loc="lower center",
-        ncol=3,
-        frameon=False,
-        bbox_to_anchor=(0.5, -0.08),
-    )
-    fig.legend(
-        handles=legend_handles,
-        loc="upper center",
-        ncol=3,
-        frameon=False,
-        bbox_to_anchor=(0.5, 1.02),
-    )
-
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=300, bbox_inches="tight")
     print(f"Saved figure to {output}")
@@ -999,5 +817,4 @@ if __name__ == "__main__":
     save_qual_2x2_datasets_horizons(
         noaa_dir=Path("./ldt/noaa_isd_uk_data/noaa_isd_uk"),
         physionet_dir=Path("./ldt/physionet_cinc_data/physionet_cinc_cache"),
-    )
     )
