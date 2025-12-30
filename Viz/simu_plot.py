@@ -1,18 +1,20 @@
 """Plot qualitative missingness examples for prepared dataset caches.
 
-This script builds a 2x2 figure illustrating two datasets (NOAA ISD and
-PhysioNet CinC) with consecutive timestamps that exhibit lower per-timestamp
-coverage. Missing regions are shaded to make gaps visually obvious. Each row
-shares a y-axis so the two subplots in the row are directly comparable for the
-same entity/time span. The requested horizon/window are enforced via each
-dataset module's ``run_experiment`` entry point so the plot matches the
-training configuration.
+This module can generate two styles of figures:
+
+* A legacy 2x2 horizon plot (NOAA ISD vs PhysioNet CinC) for quick comparisons
+  of short/long horizons.
+* A 3x2 grid that mirrors the style shown in the reference image: columns for
+  PhysioNet, Crypto, and NOAA ISD UK; the upper row shows "signal 1" with its
+  ground truth trace and a simulated reconstruction, while the lower row shows
+  "signal 2" for the same datasets. Missing regions are shaded to highlight
+  sparse coverage.
 
 Example usage:
-    python Viz/plot_missingness_examples.py \\
+    python Viz/simu_plot.py \\
         --noaa-dir ./nnoa_isd_cache \\
         --physionet-dir ./physionet_cinc_cache \\
-        --output ./missingness_examples.png
+        --crypto-dir ./ldt/LLapDiT_Data/bms_air_quality_data/bms_air_cache
 """
 
 from __future__ import annotations
@@ -628,6 +630,96 @@ def _simulate_divergent_series_like_ground_truth(
     return final_forecast, mae_final, mse_final
 
 
+def _select_asset_slices_for_features(
+    paths: CachePaths,
+    meta: Mapping[str, object],
+    feature_ids: Sequence[int],
+    horizon: int,
+    quantile: float,
+    min_block: int,
+    window: int,
+) -> List[ExampleSlice]:
+    pairs = np.load(paths.windows / "global_pairs.npy")
+    end_times = np.load(paths.windows / "end_times.npy")
+
+    assets = list(meta.get("assets", []))
+    coverage, inverse_t, unique_t = _compute_timestamp_coverage(pairs, end_times, len(assets))
+    if coverage.size == 0:
+        raise RuntimeError("Coverage array is empty; ensure the cache contains windowed data.")
+
+    expected_step = _coerce_freq_to_timedelta(meta.get("freq"))
+    block_indices, threshold = _pick_coverage_block(
+        coverage,
+        unique_t,
+        quantile=quantile,
+        min_block=min_block,
+        expected_step=expected_step,
+    )
+    if block_indices.size == 0:
+        raise RuntimeError("Selected low-coverage block is empty (unexpected).")
+
+    block_times = unique_t[block_indices]
+    coverage_range = (pd.to_datetime(block_times[0]), pd.to_datetime(block_times[-1]))
+
+    window_mask = np.isin(inverse_t, block_indices)
+    block_pairs = pairs[window_mask]
+    if block_pairs.size == 0:
+        raise RuntimeError("Unable to find windows that align with the selected low-coverage block.")
+
+    minlength = max(int(block_pairs[:, 0].max()) + 1, len(assets))
+    counts = np.bincount(block_pairs[:, 0].astype(int), minlength=minlength)
+    asset_id = int(np.argmax(counts))
+    asset_name = assets[asset_id] if asset_id < len(assets) else f"asset-{asset_id}"
+
+    asset_pairs = block_pairs[block_pairs[:, 0] == asset_id]
+    start_indices = asset_pairs[:, 1].astype(int)
+    if start_indices.size == 0:
+        raise RuntimeError("No windows found for selected asset inside low-coverage block.")
+
+    start_idx = int(np.median(start_indices))
+
+    features = np.load(paths.features / f"{asset_id}.npy")
+    times = np.load(paths.times / f"{asset_id}.npy")
+
+    max_end = start_idx + window + horizon
+    if max_end > features.shape[0]:
+        start_idx = max(0, features.shape[0] - (window + horizon))
+        max_end = start_idx + window + horizon
+
+    coverage_series = pd.Series(coverage, index=pd.to_datetime(unique_t)).sort_index()
+
+    feature_cols = list(meta.get("feature_cols", []))
+
+    slices: List[ExampleSlice] = []
+    for feature_id in feature_ids:
+        fname = feature_cols[feature_id] if feature_id < len(feature_cols) else f"feat-{feature_id}"
+        end = start_idx + window + horizon
+        t = pd.DatetimeIndex(pd.to_datetime(times[start_idx:end]))
+        sel = features[start_idx:end, :].astype(np.float32)
+        y = sel[:, feature_id].astype(float)
+
+        if expected_step is not None:
+            cov_slice = coverage_series.reindex(t, method="nearest", tolerance=expected_step / 2)
+        else:
+            cov_slice = coverage_series.reindex(t)
+
+        slices.append(
+            ExampleSlice(
+                dataset=str(meta.get("dataset", "unknown")),
+                asset_name=asset_name,
+                feature_names=[fname],
+                timestamps=t,
+                values={fname: y},
+                panel_coverage=cov_slice,
+                coverage_threshold=float(threshold),
+                coverage_range=coverage_range,
+                window=window,
+                horizon=horizon,
+            )
+        )
+    return slices
+
+
 def _plot_examples_2x2_horizons(
     noaa_short: ExampleSlice,
     noaa_long: ExampleSlice,
@@ -850,8 +942,216 @@ def save_qual_2x2_datasets_horizons(
 
 
 
+
+def _plot_examples_3x2_signals(
+    physio_slices: Sequence[ExampleSlice],
+    crypto_slices: Sequence[ExampleSlice],
+    noaa_slices: Sequence[ExampleSlice],
+    output: Path,
+) -> None:
+    fig, axes = plt.subplots(
+        2,
+        3,
+        figsize=(14.5, 6.2),
+        sharey="row",
+        constrained_layout=True,
+    )
+    target_color = "#1f77b4"
+    recon_color = "#ff7f0e"
+    band_color = "#2ca02c"
+    datasets = [
+        ("PhysioNet", physio_slices),
+        ("Crypto", crypto_slices),
+        ("NOAA ISD UK", noaa_slices),
+    ]
+
+    def _band_for_series(y: np.ndarray, base: np.ndarray, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+        rng = np.random.default_rng(seed)
+        std_ref = np.nanstd(y[np.isfinite(y)]) if np.isfinite(y).any() else 1.0
+        noise = rng.normal(scale=0.08 * std_ref, size=(20, base.size))
+        smooth_win = min(5, max(3, base.size // 20))
+        smoothed_noise = np.array([_smooth_signal(row, window=smooth_win) for row in noise])
+        samples = base + smoothed_noise
+        lower = np.nanpercentile(samples, 15, axis=0)
+        upper = np.nanpercentile(samples, 85, axis=0)
+        return lower, upper
+
+    def _plot_panel(ax, ex: ExampleSlice, title: Optional[str] = None, show_ylabel: bool = False) -> None:
+        fname, y = next(iter(ex.values.items()))
+        x = np.arange(len(ex.timestamps))
+        cov = ex.panel_coverage.to_numpy(dtype=float)
+        low = np.isfinite(cov) & (cov <= ex.coverage_threshold)
+
+        y = np.asarray(y, dtype=float)
+        y_gap = y.copy()
+        y_gap[low] = np.nan
+
+        ax.plot(x, y_gap, color=target_color, linewidth=2.0, label="Target")
+        ax.scatter(
+            x[~low],
+            y[~low],
+            s=6,
+            alpha=0.65,
+            color=target_color,
+            edgecolors="none",
+            label="_nolegend_",
+        )
+
+        std_ref = np.nanstd(y[np.isfinite(y)]) if np.isfinite(y).any() else 1.0
+        target_mae = 0.28 * std_ref + 1e-4
+        target_mse = 0.4 * std_ref**2 + 1e-4
+        seed_src = f"{ex.dataset}-{ex.asset_name}-{fname}-{ex.horizon}"
+        seed_val = int(hashlib.sha256(seed_src.encode("utf-8")).hexdigest(), 16) % (2**32)
+        recon, _, _ = _simulate_smooth_series_like_ground_truth(
+            y,
+            target_mae=target_mae,
+            target_mse=target_mse,
+            seed=seed_val,
+            tighten=0.5,
+        )
+        band_low, band_high = _band_for_series(y, recon, seed_val + 11)
+
+        ax.fill_between(
+            x,
+            band_low,
+            band_high,
+            color=band_color,
+            alpha=0.15,
+            linewidth=0,
+            label="simulated spread",
+        )
+        ax.plot(x, recon, color=recon_color, linewidth=2.0, label="Simulated")
+
+        _shade_low_coverage(ax, x, ex.panel_coverage, ex.coverage_threshold)
+        ticks = [0, ex.window, ex.window + ex.horizon]
+        ticks = [t for t in ticks if 0 <= t <= x[-1]]
+        ax.set_xticks(sorted(set(ticks)))
+        ax.grid(True, linestyle="--", alpha=0.3)
+        ax.margins(x=0.02)
+
+        if title:
+            ax.set_title(title)
+        if show_ylabel:
+            ax.set_ylabel("value")
+        else:
+            ax.tick_params(axis="y", labelleft=False)
+
+    for col, (label, slices) in enumerate(datasets):
+        top = slices[0]
+        bottom = slices[1]
+        _plot_panel(axes[0, col], top, title=label, show_ylabel=(col == 0))
+        _plot_panel(axes[1, col], bottom, show_ylabel=(col == 0))
+        axes[0, col].set_xlabel("")
+        axes[1, col].set_xlabel("time step")
+
+    legend_handles = [
+        Line2D([0], [0], color=target_color, linewidth=2.0, label="Target"),
+        Line2D([0], [0], color=recon_color, linewidth=2.0, label="Simulated"),
+        Patch(facecolor=band_color, edgecolor="none", alpha=0.15, label="simulated spread"),
+        Patch(facecolor="grey", edgecolor="none", alpha=0.2, label="low coverage"),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        ncol=4,
+        frameon=False,
+        bbox_to_anchor=(0.5, -0.04),
+    )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=300, bbox_inches="tight")
+    print(f"Saved figure to {output}")
+
+
+def save_qual_3x2_datasets_signals(
+    physionet_dir: Path,
+    crypto_dir: Path,
+    noaa_dir: Path,
+    out_path: Path = Path("./plot/qual_3x2_signals.png"),
+    physio_features: Optional[Sequence[str]] = None,
+    crypto_features: Optional[Sequence[str]] = None,
+    noaa_features: Optional[Sequence[str]] = None,
+    physio_window: Optional[int] = None,
+    crypto_window: Optional[int] = None,
+    noaa_window: Optional[int] = None,
+    physio_horizon: Optional[int] = None,
+    crypto_horizon: Optional[int] = None,
+    noaa_horizon: Optional[int] = None,
+    coverage_quantile: float = 0.25,
+    min_block: int = 192,
+) -> Path:
+    physio_paths = CachePaths.from_dir(physionet_dir)
+    crypto_paths = CachePaths.from_dir(crypto_dir)
+    noaa_paths = CachePaths.from_dir(noaa_dir)
+
+    physio_meta = _load_meta(physio_paths)
+    crypto_meta = _load_meta(crypto_paths)
+    noaa_meta = _load_meta(noaa_paths)
+
+    physio_meta, physio_window_eff, physio_horizon_eff = _prepare_index_with_run_experiment(
+        physio_paths,
+        physio_meta,
+        window_override=physio_window,
+        horizon_override=physio_horizon,
+    )
+    crypto_meta, crypto_window_eff, crypto_horizon_eff = _prepare_index_with_run_experiment(
+        crypto_paths,
+        crypto_meta,
+        window_override=crypto_window,
+        horizon_override=crypto_horizon,
+    )
+    noaa_meta, noaa_window_eff, noaa_horizon_eff = _prepare_index_with_run_experiment(
+        noaa_paths,
+        noaa_meta,
+        window_override=noaa_window,
+        horizon_override=noaa_horizon,
+    )
+
+    def _ensure_two(feats: Sequence[int]) -> List[int]:
+        if not feats:
+            raise ValueError("No features available for plotting.")
+        if len(feats) == 1:
+            return [feats[0], feats[0]]
+        return list(feats[:2])
+
+    physio_feats = _ensure_two(_feature_indices(list(physio_meta.get("feature_cols", [])), physio_features))
+    crypto_feats = _ensure_two(_feature_indices(list(crypto_meta.get("feature_cols", [])), crypto_features))
+    noaa_feats = _ensure_two(_feature_indices(list(noaa_meta.get("feature_cols", [])), noaa_features))
+
+    physio_slices = _select_asset_slices_for_features(
+        physio_paths,
+        physio_meta,
+        feature_ids=physio_feats,
+        horizon=physio_horizon_eff,
+        quantile=coverage_quantile,
+        min_block=min_block,
+        window=physio_window_eff,
+    )
+    crypto_slices = _select_asset_slices_for_features(
+        crypto_paths,
+        crypto_meta,
+        feature_ids=crypto_feats,
+        horizon=crypto_horizon_eff,
+        quantile=coverage_quantile,
+        min_block=min_block,
+        window=crypto_window_eff,
+    )
+    noaa_slices = _select_asset_slices_for_features(
+        noaa_paths,
+        noaa_meta,
+        feature_ids=noaa_feats,
+        horizon=noaa_horizon_eff,
+        quantile=coverage_quantile,
+        min_block=min_block,
+        window=noaa_window_eff,
+    )
+
+    _plot_examples_3x2_signals(physio_slices, crypto_slices, noaa_slices, out_path)
+    return out_path
+
 if __name__ == "__main__":
-    save_qual_2x2_datasets_horizons(
-        noaa_dir=Path("./ldt/noaa_isd_uk_data/noaa_isd_uk"),
+    save_qual_3x2_datasets_signals(
         physionet_dir=Path("./ldt/physionet_cinc_data/physionet_cinc_cache"),
+        crypto_dir=Path("./ldt/LLapDiT_Data/bms_air_quality_data/bms_air_cache"),
+        noaa_dir=Path("./ldt/noaa_isd_uk_data/noaa_isd_uk"),
     )
