@@ -319,7 +319,8 @@ def collect_laplace_poles(
             if isinstance(lap, LaplaceTransformEncoder):
                 tau = torch.nn.functional.softplus(lap._tau) + 1e-3
                 alpha = lap.s_real.clamp_min(lap.alpha_min) * tau
-                omega = lap.s_imag * tau
+                # FIX: Apply .abs() to fold negative frequencies onto the positive half-plane
+                omega = lap.s_imag.abs() * tau 
                 label = f"{tag_prefix}{name or lap.__class__.__name__}"
                 poles.append({
                     "label": label,
