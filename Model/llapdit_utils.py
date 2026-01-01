@@ -26,9 +26,8 @@ def set_torch() -> torch.device:
 
 
 def sample_t_uniform(scheduler: "NoiseScheduler", n: int, device: torch.device) -> torch.Tensor:
-    """Sample ``n`` discrete timesteps uniformly from ``[0, T)``."""
-
-    return torch.randint(0, scheduler.timesteps, (n,), device=device)
+    """Sample ``n`` discrete timesteps uniformly from ``[1, T)``."""
+    return torch.randint(1, scheduler.timesteps, (n,), device=device)
 
 
 def make_warmup_cosine(
@@ -92,20 +91,20 @@ class NoiseScheduler(nn.Module):
             betas = betas.clamp(min=1e-8, max=0.999)
             betas[0] = 0.0  # ensure ᾱ(0)=1 and no noise at t=0
         else:
-            # cosine ᾱ(t): normalize so ᾱ(0)=1
-            ts = torch.linspace(0.0, 1.0, self.timesteps + 1, dtype=torch.float32)
+            # cosine
+            ts = torch.linspace(0.0, 1.0, self.timesteps, dtype=torch.float32)  # T points, includes 1.0
             abar = _cosine_alpha_bar(ts)
             abar = abar / abar[0].clamp_min(1e-12)
-            # Convert ᾱ to per-step α_t: α_t = ᾱ_t / ᾱ_{t-1}
-            ratios = (abar[1:] / abar[:-1]).clamp(1e-8, 0.999999)
+            
             alphas = torch.ones(self.timesteps, dtype=torch.float32)
             if self.timesteps > 1:
-                alphas[1:] = ratios[: self.timesteps - 1]
+                alphas[1:] = (abar[1:] / abar[:-1]).clamp(1e-8, 0.999999)
+            
             betas = (1.0 - alphas)
             betas[0] = 0.0
             if self.timesteps > 1:
                 betas[1:] = betas[1:].clamp(min=1e-8, max=0.999)
-
+                
         # Register buffers
         self.register_buffer("betas", betas)  # [T]
         alphas = (1.0 - betas).clamp(1e-12, 1.0)  # [T]
