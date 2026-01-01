@@ -529,6 +529,9 @@ def run(
             guidance_power=config.GUIDANCE_POWER,
             lambda_rec_anchor=config.DECODER_FT_ANCHOR,
             self_cond=config.SELF_COND,
+            dynamic_thresh_p=getattr(config, "DYNAMIC_THRESH_P", 0.0),
+            dynamic_thresh_max=getattr(config, "DYNAMIC_THRESH_MAX", 1.0),
+            rho=getattr(config, "KARRAS_RHO", 7.5),
         )
 
     eval_stats = evaluate_regression(
@@ -548,8 +551,9 @@ def run(
         eta=1.0, # FIX: Explicitly request stochastic sampling
         aggregation_method='mean',
         quantiles=(0.1, 0.5, 0.9),
-        dynamic_thresh_p=0.995, 
-        dynamic_thresh_max=1.0
+        dynamic_thresh_p=getattr(config, "DYNAMIC_THRESH_P", 0.995), 
+        dynamic_thresh_max=getattr(config, "DYNAMIC_THRESH_MAX", 1.0),
+        rho=getattr(config, "KARRAS_RHO", 7.5),
     )
 
     if getattr(config, "SAVE_POLE_PLOTS", True):
@@ -589,7 +593,8 @@ def finetune_vae_decoder(
         lambda_rec_anchor: float = 0.25,
         self_cond: bool = False,
         dynamic_thresh_p: float = 0.0,
-        dynamic_thresh_max: float = 1.0
+        dynamic_thresh_max: float = 1.0,
+        rho: float = 7.5,
 ):
     """
     Fine-tune ONLY the VAE decoder to adapt to the diffusion model's generated latent x0_norm.
@@ -640,7 +645,8 @@ def finetune_vae_decoder(
                     cond_summary=cs, self_cond=self_cond, cfg_rescale=True,
                     # FIX: Added parameter names
                     dynamic_thresh_p=dynamic_thresh_p, 
-                    dynamic_thresh_max=dynamic_thresh_max
+                    dynamic_thresh_max=dynamic_thresh_max,
+                    rho=rho,
                 )
 
                 # ---- Forward decoder on generated latents ----
@@ -694,6 +700,7 @@ def evaluate_regression(
         quantiles: tuple = (0.1, 0.5, 0.9),
         dynamic_thresh_p: float = 0.995,
         dynamic_thresh_max: float = 1.0,
+        rho: float = 7.5,
 ):
     """
     Evaluates the model by generating multiple samples and creating a probabilistic forecast.
@@ -761,7 +768,8 @@ def evaluate_regression(
                 cond_summary=cs, self_cond=self_cond, cfg_rescale=True,
                 # FIX: Added parameter names
                 dynamic_thresh_p=dynamic_thresh_p, 
-                dynamic_thresh_max=dynamic_thresh_max
+                dynamic_thresh_max=dynamic_thresh_max,
+                rho=rho,
             )
 
             y_hat_sample = decode_latents_with_vae(
