@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Tuple
 
-import crypto_config
+import config
 from Dataset.fin_dataset import run_experiment
 import train_val_latent
 import train_val_summarizer
@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 
 
 def prepare_dataloaders(
-    config=crypto_config,
+    config=config,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Tuple[int, int, int]]:
     """Build train/val/test loaders using the shared configuration."""
 
@@ -37,14 +37,14 @@ def _fmt_optional(value: object) -> str:
     return str(value)
 
 
-def _summarizer_ckpt_path(config=crypto_config) -> Path:
+def _summarizer_ckpt_path(config=config) -> Path:
     ckpt = config.SUM_CKPT
     if ckpt:
         return Path(ckpt)
     return Path(config.SUM_DIR) / f"{config.PRED}-{config.VAE_LATENT_CHANNELS}-summarizer.pt"
 
 
-def _update_config_for_pred(pred: int, config=crypto_config) -> None:
+def _update_config_for_pred(pred: int, config=config) -> None:
     """Mutate the shared configuration to reflect a new prediction horizon."""
 
     config.PRED = pred
@@ -81,7 +81,7 @@ def main() -> None:
             train_loader, val_loader, test_loader, sizes = prepare_dataloaders()
 
             print("\n=== Training VAE ===")
-            vae_ckpt = Path(crypto_config.VAE_CKPT)
+            vae_ckpt = Path(config.VAE_CKPT)
             if vae_ckpt.exists():
                 print(f"Found existing VAE checkpoint at {vae_ckpt}; skipping training.")
                 vae_stats: Dict[str, object] = {
@@ -95,7 +95,7 @@ def main() -> None:
                     val_dl=val_loader,
                     test_dl=test_loader,
                     sizes=sizes,
-                    config=crypto_config,
+                    config=config,
                 )
             print(
                 "VAE checkpoints:\n"
@@ -105,7 +105,7 @@ def main() -> None:
             )
 
             print("\n=== Training Summarizer ===")
-            summarizer_ckpt = _summarizer_ckpt_path(crypto_config)
+            summarizer_ckpt = _summarizer_ckpt_path(config)
             if summarizer_ckpt.exists():
                 print(
                     f"Found existing summarizer checkpoint at {summarizer_ckpt}; "
@@ -122,7 +122,7 @@ def main() -> None:
                     val_loader=val_loader,
                     test_loader=test_loader,
                     sizes=sizes,
-                    config=crypto_config,
+                    config=config,
                 )
             print(
                 "Summarizer results:\n"
@@ -137,7 +137,7 @@ def main() -> None:
                 val_dl=val_loader,
                 test_dl=test_loader,
                 sizes=sizes,
-                config=crypto_config,
+                config=config,
             )
             eval_stats = llapdit_stats.get("eval_stats") or {}
             pinball_stats = eval_stats.get("pinball") if isinstance(eval_stats, dict) else None
