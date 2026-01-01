@@ -547,6 +547,8 @@ def run(
         guidance_power=config.GUIDANCE_POWER,
         aggregation_method='mean',
         quantiles=(0.1, 0.5, 0.9),
+        dynamic_thresh_p=0.995, 
+        dynamic_thresh_max=1.0
     )
 
     if getattr(config, "SAVE_POLE_PLOTS", True):
