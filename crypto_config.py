@@ -97,6 +97,7 @@ EMA_DECAY    = 0.999
 
 # --- Generation Parameters ---
 GEN_STEPS = 64
+GEN_ETA = 1.0  # DDIM stochasticity (0.0 = deterministic)
 NUM_EVAL_SAMPLES = 20
 GUIDANCE_STRENGTH = (1.0, 2.0)
 GUIDANCE_POWER = 1.0
