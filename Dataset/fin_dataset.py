@@ -255,8 +255,8 @@ def prepare_features_and_index_cache(
     normalize_per_ticker: bool = True,
     clamp_sigma: float = 5.0,
     min_obs_buffer: int = 50,
-    min_train_coverage: float = 0.7,
-    min_row_coverage: Optional[float] = None,
+    min_train_coverage: Optional[float] = None,
+    min_row_coverage: Optional[float] = 0.0,
     liquidity_rank_window: Optional[Tuple[str,str]] = None,
     top_n_by_dollar_vol: Optional[int] = None,
     max_windows_per_ticker: Optional[int] = None,  # applies at *index* build time
@@ -280,6 +280,7 @@ def prepare_features_and_index_cache(
     paths = CachePaths.from_dir(data_dir)
     paths.data_dir.mkdir(parents=True, exist_ok=True)
     paths.ensure()
+    target_col = f"RET_{feature_cfg.target_field.upper()}"
 
     # ---- download / load features per ticker (reuses your feature logic) ----
     need_price_cols = set(feature_cfg.price_fields) | {feature_cfg.target_field}
@@ -385,16 +386,22 @@ def prepare_features_and_index_cache(
         feat_df = build_feature_frame(df_raw)
         if feat_df.shape[0] < min_obs:
             continue
-        # coverage check using first 80% of sample as proxy for train adequacy
-        train_like = feat_df.iloc[: max(1, int(0.8 * len(feat_df)))]
-        row_coverage = 1.0 - train_like.isna().mean(axis=1) if len(train_like) else []
-        coverage = float(np.mean(row_coverage)) if len(row_coverage) else 0.0
-        if coverage < min_train_coverage:
+        if target_col not in feat_df.columns:
             continue
+        obs_mask_full = feat_df.notna()
+        # coverage check using first 80% of sample as proxy for train adequacy
+        if min_train_coverage is not None:
+            train_like = obs_mask_full.iloc[: max(1, int(0.8 * len(feat_df)))]
+            row_coverage = train_like.mean(axis=1).to_numpy(dtype=np.float32) if len(train_like) else []
+            coverage = float(np.mean(row_coverage)) if len(row_coverage) else 0.0
+            if coverage < min_train_coverage:
+                continue
         if min_row_coverage is not None:
             min_non_missing = max(1, int(np.ceil(min_row_coverage * feat_df.shape[1])))
-            feat_df = feat_df.dropna(thresh=min_non_missing)
-        feat_df = feat_df.dropna(how="all")
+        else:
+            min_non_missing = 1
+        keep_rows = obs_mask_full.sum(axis=1) >= min_non_missing
+        feat_df = feat_df.loc[keep_rows]
         if not np.isfinite(feat_df[target_col].to_numpy(dtype=np.float32, copy=False)).any():
             continue
         per_ticker[t] = feat_df
@@ -510,7 +517,7 @@ def prepare_features_and_index_cache(
         'normalize_per_ticker': bool(normalize_per_ticker),
         'clamp_sigma': float(clamp_sigma),
         'min_obs_buffer': int(min_obs_buffer),
-        'min_train_coverage': float(min_train_coverage),
+        'min_train_coverage': (float(min_train_coverage) if min_train_coverage is not None else None),
         'min_row_coverage': (float(min_row_coverage) if min_row_coverage is not None else None),
         'liquidity_rank_window': liquidity_rank_window,
         'top_n_by_dollar_vol': top_n_by_dollar_vol,
@@ -684,6 +691,10 @@ def make_collate_level_and_firstdiff(
         T = _torch.zeros_like(V)
         Y = _torch.zeros((B, N, H), dtype=y_dtype)
         M = _torch.zeros((B, N), dtype=_torch.bool)
+        X_obs = _torch.zeros((B, N, K, F), dtype=_torch.bool)
+        X_fill = _torch.zeros((B, N, K, F), dtype=_torch.bool)
+        Y_obs = _torch.zeros((B, N, H), dtype=_torch.bool)
+        delta_t = _torch.zeros((B, N, K), dtype=_torch.float32)
         ctx_times = [[None] * N for _ in range(B)]  # <— make this BEFORE the fill loop
 
         # ---- fill panels ----
@@ -693,14 +704,33 @@ def make_collate_level_and_firstdiff(
             if 0 <= aid < N:
                 n = aid  # slot index
                 xt = _torch.as_tensor(x, dtype=x_dtype)
+                obs_mask = meta.get("x_obs_mask")
+                obs_mask_t = _torch.as_tensor(obs_mask, dtype=_torch.bool) if obs_mask is not None else _torch.isfinite(xt)
+                fill_mask = meta.get("x_mask")
+                fill_mask_t = _torch.as_tensor(fill_mask, dtype=_torch.bool) if fill_mask is not None else obs_mask_t
                 V[b, n] = xt
                 T[b, n] = _first_diff(xt)
+                X_obs[b, n] = obs_mask_t
+                X_fill[b, n] = fill_mask_t
 
                 yt = _torch.as_tensor(y, dtype=y_dtype)
                 if yt.ndim == 0:
                     Y[b, n, 0] = yt
+                    y_mask_t = _torch.as_tensor(meta.get("y_obs_mask", True), dtype=_torch.bool).reshape(-1)
+                    Y_obs[b, n, 0] = y_mask_t[0] if y_mask_t.numel() else _torch.tensor(True, dtype=_torch.bool)
                 else:
                     Y[b, n, :yt.shape[-1]] = yt
+                    y_mask = meta.get("y_obs_mask")
+                    if y_mask is None:
+                        y_mask_t = _torch.isfinite(yt) if _torch.is_floating_point(yt) else _torch.ones_like(yt, dtype=_torch.bool)
+                    else:
+                        y_mask_t = _torch.as_tensor(y_mask, dtype=_torch.bool)
+                    Y_obs[b, n, :y_mask_t.shape[-1]] = y_mask_t
+
+                dt = meta.get("delta_t")
+                if dt is not None:
+                    dt_t = _torch.as_tensor(dt, dtype=_torch.float32).reshape(-1)
+                    delta_t[b, n, :dt_t.shape[-1]] = dt_t
 
                 M[b, n] = True
                 ctx_times[b][n] = meta.get("ctx_times")  # <— now indices exist
@@ -713,6 +743,10 @@ def make_collate_level_and_firstdiff(
             "entity_mask": M if return_entity_mask else None,
             "dates": [_key_to_pydate(k) for k in dates_order],
             "ctx_times": ctx_times,
+            "x_obs_mask": X_obs,
+            "x_mask": X_fill,
+            "y_obs_mask": Y_obs,
+            "delta_t": delta_t,
         }
         return [V, T], Y, meta_out
 
@@ -784,9 +818,12 @@ class _IndexBackedDataset(Dataset):
         s = int(start); e = s + self.window
         x = Xf[s:e, :].astype(np.float32)  # [K,F]
         obs_slice = Obs[s:e] if Obs is not None else None
-        fill_slice = Fill[s:e] if Fill is not None else None
+        if obs_slice is None:
+            obs_slice = np.isfinite(x)
+        fill_slice = Fill[s:e] if Fill is not None else obs_slice
         
         y_vec = Yf[e:e+self.horizon].astype(np.float32)  # [H]
+        y_obs_mask = np.isfinite(y_vec)
         raw_last_for_label = float(y_vec[-1]) if y_vec.size else 0.0
 
 
@@ -807,6 +844,8 @@ class _IndexBackedDataset(Dataset):
         lo_y, hi_y = my - self.clamp_sigma * sy, my + self.clamp_sigma * sy
         y_vec = np.clip(y_vec, lo_y, hi_y, out=y_vec)
         y_vec = (y_vec - my) / sy
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        y_vec = np.nan_to_num(y_vec, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Torch tensors expected by collate: X->float32, Y->float32 or int
         x_t = torch.tensor(x, dtype=torch.float32)
@@ -829,6 +868,7 @@ class _IndexBackedDataset(Dataset):
             meta['x_obs_mask'] = obs_slice
         if fill_slice is not None:
             meta['x_mask'] = fill_slice
+        meta['y_obs_mask'] = y_obs_mask
         return x_t, y_t, meta
 
 # --------------------- Date grouping helpers for ratio-split ---------------------
@@ -1255,7 +1295,7 @@ def run_experiment(
     - Coverage threshold is applied per day; panel width is auto-detected from the cache.
     """
     if reindex:
-        rebuild_window_index_only(data_dir, window=K, horizon=H, update_meta=False, backup_old=False)
+        rebuild_window_index_only(data_dir, window=K, horizon=H, update_meta=True, backup_old=False)
 
     train_dl, val_dl, test_dl, lengths = load_dataloaders_with_ratio_split(
         data_dir=data_dir,
