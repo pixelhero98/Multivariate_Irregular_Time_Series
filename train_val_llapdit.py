@@ -545,6 +545,7 @@ def run(
         steps=config.GEN_STEPS,
         guidance_strength=config.GUIDANCE_STRENGTH,
         guidance_power=config.GUIDANCE_POWER,
+        eta=1.0, # FIX: Explicitly request stochastic sampling
         aggregation_method='mean',
         quantiles=(0.1, 0.5, 0.9),
         dynamic_thresh_p=0.995, 
@@ -637,7 +638,9 @@ def finetune_vae_decoder(
                     shape=(Beff, Hcur, Z), steps=gen_steps,
                     guidance_strength=guidance_strength, guidance_power=guidance_power,
                     cond_summary=cs, self_cond=self_cond, cfg_rescale=True,
-                    dynamic_thresh_p, dynamic_thresh_max
+                    # FIX: Added parameter names
+                    dynamic_thresh_p=dynamic_thresh_p, 
+                    dynamic_thresh_max=dynamic_thresh_max
                 )
 
                 # ---- Forward decoder on generated latents ----
@@ -686,6 +689,7 @@ def evaluate_regression(
         diff_model, vae, summarizer, dataloader, device, mu_mean, mu_std, config, ema=None,
         self_cond: bool = False,
         steps: int = 36, guidance_strength: float = 2.0, guidance_power: float = 0.3,
+        eta: float = 1.0,  # FIX: Added eta parameter (default 1.0 for stochasticity)
         aggregation_method: str = 'mean',
         quantiles: tuple = (0.1, 0.5, 0.9),
         dynamic_thresh_p: float = 0.995,
@@ -753,8 +757,11 @@ def evaluate_regression(
             x0_norm = diff_model.generate(
                 shape=(Beff, Hcur, Z), steps=steps,
                 guidance_strength=guidance_strength, guidance_power=guidance_power,
+                eta=eta,  # FIX: Pass eta here
                 cond_summary=cs, self_cond=self_cond, cfg_rescale=True,
-                dynamic_thresh_p, dynamic_thresh_max
+                # FIX: Added parameter names
+                dynamic_thresh_p=dynamic_thresh_p, 
+                dynamic_thresh_max=dynamic_thresh_max
             )
 
             y_hat_sample = decode_latents_with_vae(
