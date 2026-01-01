@@ -320,7 +320,7 @@ def collect_laplace_poles(
                 tau = torch.nn.functional.softplus(lap._tau) + 1e-3
                 alpha = lap.s_real.clamp_min(lap.alpha_min) * tau
                 # FIX: Apply .abs() to fold negative frequencies onto the positive half-plane
-                omega = lap.s_imag.abs() * tau 
+                omega = lap.s_imag.abs() * tau
                 label = f"{tag_prefix}{name or lap.__class__.__name__}"
                 poles.append({
                     "label": label,
@@ -495,17 +495,30 @@ def plot_laplace_poles(
 # ============================ VAE Latent stats helpers ============================
 def flatten_targets(yb: torch.Tensor, mask_bn: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     """yb: [B,N,H] -> y_in: [Beff,H,1], batch_ids: [Beff] mapping to B for cond rows"""
-    y = torch.nan_to_num(yb.to(device), nan=0.0, posinf=0.0, neginf=0.0)
-    B, N, Hcur = y.shape
-    y_flat = y.reshape(B * N, Hcur).unsqueeze(-1)  # [B*N, H, 1]
+
+    # 1. Move to device first
+    y = yb.to(device)
+
+    # 2. Check finite status on RAW data
     finite_mask = torch.isfinite(y)
     for _ in range(y.dim() - 2):
         finite_mask = finite_mask.all(dim=-1)
+
+    # 3. Sanitize after check
+    y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+
+    B, N, Hcur = y.shape
+    y_flat = y.reshape(B * N, Hcur).unsqueeze(-1)  # [B*N, H, 1]
+
     mask = mask_bn.to(device).reshape(B * N)
     m_flat = (mask & finite_mask.reshape(B * N))
+
     if not m_flat.any():
         return None, None
+
     y_in = y_flat[m_flat]
+
+    # Create batch_ids on the correct device
     batch_ids = torch.arange(B, device=device).unsqueeze(1).expand(B, N).reshape(B * N)[m_flat]
     return y_in, batch_ids
 
@@ -592,16 +605,29 @@ def compute_latent_stats(vae, dataloader, device):
     all_mu = []
     for (_, y, meta) in dataloader:
         m = meta["entity_mask"].to(device=device, dtype=torch.bool)
-        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
-        B, N, H = y.shape
-        y_flat = y.reshape(B * N, H).unsqueeze(-1)
+
+        # 1. Move y to device to match 'm'
+        y = y.to(device)
+
+        # 2. Calculate finite mask BEFORE sanitization
+        #    (Prevents NaNs from being hidden by nan_to_num)
         finite_mask = torch.isfinite(y)
         for _ in range(y.dim() - 2):
             finite_mask = finite_mask.all(dim=-1)
+
+        # 3. Sanitize
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+
+        B, N, H = y.shape
+        y_flat = y.reshape(B * N, H).unsqueeze(-1)
+
+        # Now both m and finite_mask are on 'device'
         m_flat = (m.reshape(B * N) & finite_mask.reshape(B * N))
+
         if not m_flat.any():
             continue
-        y_in = y_flat[m_flat].to(device)
+
+        y_in = y_flat[m_flat]
         _, mu, _ = vae(y_in)  # [Beff, L, Z]
         all_mu.append(mu.detach().cpu())
 
@@ -610,7 +636,7 @@ def compute_latent_stats(vae, dataloader, device):
 
     mu_cat = torch.cat(all_mu, dim=0)  # [sum(Beff), L, Z]
     mu_mean = mu_cat.mean(dim=(0, 1)).to(device)
-    mu_std  = mu_cat.std(dim=(0, 1), correction=0).clamp_min(1e-6).to(device)
+    mu_std = mu_cat.std(dim=(0, 1), correction=0).clamp_min(1e-6).to(device)
     return mu_mean, mu_std
 
 
