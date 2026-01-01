@@ -39,7 +39,7 @@ class NormalizationStatsAccumulator:
                 _PerAssetState(None, None, None, None) for _ in range(int(num_assets))
             ]
         else:
-            self._count = 0
+            self._count_x = np.zeros(self._feature_dim, dtype=np.int64)
             self._sum_x = np.zeros(self._feature_dim, dtype=np.float64)
             self._sumsq_x = np.zeros(self._feature_dim, dtype=np.float64)
             self._sum_y = 0.0
@@ -72,13 +72,27 @@ class NormalizationStatsAccumulator:
             state = self._state[asset_id]
             f64 = features.astype(np.float64, copy=False)
             t64 = targets.astype(np.float64, copy=False)
+            finite_x = np.isfinite(f64)
+            count_x = finite_x.sum(axis=0, dtype=np.int64)
+            safe_x = np.where(finite_x, f64, 0.0)
+            sum_x = safe_x.sum(axis=0, dtype=np.float64)
+            sumsq_x = np.square(safe_x, dtype=np.float64).sum(axis=0)
+            denom_x = np.maximum(count_x, 1)
+            mean_x = sum_x / denom_x
+            var_x = np.maximum(sumsq_x / denom_x - np.square(mean_x, dtype=np.float64), 1e-12)
+            std_x = np.sqrt(var_x, dtype=np.float64)
+            std_x = np.where((std_x == 0.0) | ~np.isfinite(std_x), 1.0, std_x)
 
-            mean_x = f64.mean(axis=0)
-            std_x = f64.std(axis=0)
-            std_x = np.where(std_x == 0.0, 1.0, std_x)
-            mean_y = float(t64.mean()) if t64.size else 0.0
-            std_y = float(t64.std()) if t64.size else 1.0
-            std_y = 1.0 if std_y == 0.0 else std_y
+            finite_y = np.isfinite(t64)
+            count_y = int(finite_y.sum())
+            safe_y = np.where(finite_y, t64, 0.0)
+            sum_y = float(safe_y.sum())
+            sumsq_y = float(np.square(safe_y, dtype=np.float64).sum())
+            denom_y = max(count_y, 1)
+            mean_y = sum_y / denom_y
+            var_y = max(sumsq_y / denom_y - (mean_y**2), 1e-12)
+            std_y = float(np.sqrt(var_y))
+            std_y = 1.0 if (std_y == 0.0 or not np.isfinite(std_y)) else std_y
 
             state.mean_x = mean_x.reshape(1, 1, -1).astype(np.float32)
             state.std_x = std_x.reshape(1, 1, -1).astype(np.float32)
@@ -89,12 +103,18 @@ class NormalizationStatsAccumulator:
         # Global statistics mode
         f64 = features.astype(np.float64, copy=False)
         t64 = targets.astype(np.float64, copy=False)
-        self._count += f64.shape[0]
-        self._sum_x += f64.sum(axis=0)
-        self._sumsq_x += np.square(f64).sum(axis=0)
-        self._sum_y += float(t64.sum())
-        self._sumsq_y += float(np.square(t64).sum())
-        self._count_y += t64.shape[0]
+        finite_x = np.isfinite(f64)
+        count_x = finite_x.sum(axis=0, dtype=np.int64)
+        safe_x = np.where(finite_x, f64, 0.0)
+        self._count_x += count_x
+        self._sum_x += safe_x.sum(axis=0, dtype=np.float64)
+        self._sumsq_x += np.square(safe_x, dtype=np.float64).sum(axis=0)
+
+        finite_y = np.isfinite(t64)
+        self._count_y += int(finite_y.sum())
+        safe_y = np.where(finite_y, t64, 0.0)
+        self._sum_y += float(safe_y.sum())
+        self._sumsq_y += float(np.square(safe_y, dtype=np.float64).sum())
 
     # ------------------------------------------------------------------
 
@@ -121,20 +141,22 @@ class NormalizationStatsAccumulator:
                 "std_y": [float(s.std_y) if s.std_y is not None else 1.0 for s in self._state],
             }
 
-        if getattr(self, "_count", 0) == 0:
+        if int(self._count_x.sum()) == 0 and self._count_y == 0:
             raise RuntimeError("Unable to compute normalization statistics (no samples).")
 
-        mean_x = (self._sum_x / self._count).astype(np.float32)
-        var_x = (self._sumsq_x / self._count) - np.square(mean_x.astype(np.float64))
+        denom_x = np.maximum(self._count_x.astype(np.float64), 1.0)
+        mean_x = (self._sum_x / denom_x).astype(np.float32)
+        var_x = (self._sumsq_x / denom_x) - np.square(mean_x.astype(np.float64))
         var_x = np.maximum(var_x, 1e-12)
         std_x = np.sqrt(var_x).astype(np.float32)
-        std_x[std_x == 0.0] = 1.0
+        std_x = np.where((std_x == 0.0) | ~np.isfinite(std_x), 1.0, std_x)
 
         if getattr(self, "_count_y", 0) > 0:
-            mean_y = float(self._sum_y / self._count_y)
-            var_y = max((self._sumsq_y / self._count_y) - (mean_y**2), 1e-12)
+            denom_y = max(self._count_y, 1)
+            mean_y = float(self._sum_y / denom_y)
+            var_y = max((self._sumsq_y / denom_y) - (mean_y**2), 1e-12)
             std_y = float(np.sqrt(var_y))
-            std_y = 1.0 if std_y == 0.0 else std_y
+            std_y = 1.0 if (std_y == 0.0 or not np.isfinite(std_y)) else std_y
         else:
             mean_y = 0.0
             std_y = 1.0
@@ -150,4 +172,3 @@ class NormalizationStatsAccumulator:
 
 
 __all__ = ["NormalizationStatsAccumulator"]
-
