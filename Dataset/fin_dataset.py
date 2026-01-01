@@ -326,7 +326,7 @@ def prepare_features_and_index_cache(
         if feature_cfg.if_calendar and feature_cfg.calendar is not None:
             cal = build_calendar_frame(out.index, feature_cfg.calendar)
             out = pd.concat([out, cal], axis=1)
-        out = out.dropna()
+        out = out.dropna(how="all")
         # enforce float32 now, will save to float16 later
         for c in out.columns:
             if out[c].dtype == np.float64:
@@ -347,8 +347,14 @@ def prepare_features_and_index_cache(
             continue
         # coverage check using first 80% of sample as proxy for train adequacy
         train_like = feat_df.iloc[: max(1, int(0.8 * len(feat_df)))]
-        coverage = 1.0 - train_like.isna().any(axis=1).mean() if len(train_like) else 0.0
+        row_coverage = 1.0 - train_like.isna().mean(axis=1) if len(train_like) else []
+        coverage = float(np.mean(row_coverage)) if len(row_coverage) else 0.0
         if coverage < min_train_coverage:
+            continue
+        min_non_missing = max(1, int(np.ceil(min_train_coverage * feat_df.shape[1])))
+        feat_df = feat_df.dropna(thresh=min_non_missing)
+        feat_df = feat_df.dropna(how="all")
+        if not np.isfinite(feat_df[target_col].to_numpy(dtype=np.float32, copy=False)).any():
             continue
         per_ticker[t] = feat_df
 
@@ -391,6 +397,7 @@ def prepare_features_and_index_cache(
     for a in assets:
         aid = asset2id[a]
         times = np.load(paths.times / f"{aid}.npy")
+        Y = np.load(paths.targets / f"{aid}.npy")
         times_arr = times.astype("datetime64[ns]")
         T = times_arr.shape[0]
         min_required = window + horizon
