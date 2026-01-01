@@ -587,6 +587,8 @@ def finetune_vae_decoder(
         guidance_power: float = 0.3,
         lambda_rec_anchor: float = 0.25,
         self_cond: bool = False,
+        dynamic_thresh_p: float = 0.0,
+        dynamic_thresh_max: float = 1.0
 ):
     """
     Fine-tune ONLY the VAE decoder to adapt to the diffusion model's generated latent x0_norm.
@@ -635,6 +637,7 @@ def finetune_vae_decoder(
                     shape=(Beff, Hcur, Z), steps=gen_steps,
                     guidance_strength=guidance_strength, guidance_power=guidance_power,
                     cond_summary=cs, self_cond=self_cond, cfg_rescale=True,
+                    dynamic_thresh_p, dynamic_thresh_max
                 )
 
                 # ---- Forward decoder on generated latents ----
@@ -685,6 +688,8 @@ def evaluate_regression(
         steps: int = 36, guidance_strength: float = 2.0, guidance_power: float = 0.3,
         aggregation_method: str = 'mean',
         quantiles: tuple = (0.1, 0.5, 0.9),
+        dynamic_thresh_p: float = 0.995,
+        dynamic_thresh_max: float = 1.0,
 ):
     """
     Evaluates the model by generating multiple samples and creating a probabilistic forecast.
@@ -749,6 +754,7 @@ def evaluate_regression(
                 shape=(Beff, Hcur, Z), steps=steps,
                 guidance_strength=guidance_strength, guidance_power=guidance_power,
                 cond_summary=cs, self_cond=self_cond, cfg_rescale=True,
+                dynamic_thresh_p, dynamic_thresh_max
             )
 
             y_hat_sample = decode_latents_with_vae(
