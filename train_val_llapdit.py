@@ -30,6 +30,34 @@ from Model.llapdit_utils import (
 LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
 
 
+def _nan_to_num(x: torch.Tensor) -> torch.Tensor:
+    if torch.isfinite(x).all():
+        return x
+    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _entity_finite_mask(x: torch.Tensor) -> torch.Tensor:
+    finite = torch.isfinite(x)
+    for _ in range(x.dim() - 2):
+        finite = finite.all(dim=-1)
+    return finite
+
+
+def _sanitize_batch(
+    xb: Tuple[torch.Tensor, torch.Tensor],
+    yb: torch.Tensor,
+    mask_bn: torch.Tensor,
+    device: torch.device,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+    V, T = xb
+    V = _nan_to_num(V).to(device)
+    T = _nan_to_num(T).to(device)
+    yb = _nan_to_num(yb).to(device)
+    mask = mask_bn.to(device=device, dtype=torch.bool)
+    mask = mask & _entity_finite_mask(V) & _entity_finite_mask(T) & _entity_finite_mask(yb)
+    return (V, T), yb, mask
+
+
 def _ensure_loaders(
     train_dl: Optional[DataLoader],
     val_dl: Optional[DataLoader],
@@ -223,8 +251,10 @@ def run(
         num_samples = 0
 
         for xb, yb, meta in train_dl:
-            V, T = xb
-            mask_bn = meta["entity_mask"]
+            (V, T), yb, mask_bn = _sanitize_batch(xb, yb, meta["entity_mask"], device)
+
+            if not mask_bn.any():
+                continue
 
             cond_summary = build_context(laplace_summarizer, V, T, mask_bn, device)
             y_in, batch_ids = flatten_targets(yb, mask_bn, device)
@@ -317,8 +347,10 @@ def run(
             ema.copy_to(diff_model)
     
         for xb, yb, meta in val_dl:
-            V, T = xb
-            mask_bn = meta["entity_mask"]
+            (V, T), yb, mask_bn = _sanitize_batch(xb, yb, meta["entity_mask"], device)
+    
+            if not mask_bn.any():
+                continue
     
             cond_summary = build_context(laplace_summarizer, V, T, mask_bn, device)
             y_in, batch_ids = flatten_targets(yb, mask_bn, device)
@@ -583,8 +615,10 @@ def finetune_vae_decoder(
         total_gen, total_anchor, total_all, count = 0.0, 0.0, 0.0, 0
 
         for xb, yb, meta in loader:
-            V, T = xb
-            mask_bn = meta["entity_mask"]
+            (V, T), yb, mask_bn = _sanitize_batch(xb, yb, meta["entity_mask"], device)
+            if not mask_bn.any():
+                continue
+
             cs_full = build_context(summarizer, V, T, mask_bn, device)
             y_true, batch_ids = _flatten_for_mask(yb, mask_bn, device)
             if y_true is None:
@@ -693,8 +727,9 @@ def evaluate_regression(
         ema.copy_to(diff_model)
 
     for xb, yb, meta in dataloader:
-        V, T = xb
-        mask_bn = meta["entity_mask"]
+        (V, T), yb, mask_bn = _sanitize_batch(xb, yb, meta["entity_mask"], device)
+        if not mask_bn.any():
+            continue
 
         cond_summary = build_context(summarizer, V, T, mask_bn, device)
         y_in, batch_ids = _flatten_for_mask(yb, mask_bn, device)

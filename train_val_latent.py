@@ -20,6 +20,14 @@ from Latent_Space.latent_vae_utils import normalize_and_check
 LoaderTuple = Tuple[DataLoader, DataLoader, DataLoader]
 
 
+def _nan_to_num(tensor: torch.Tensor, value: float = 0.0) -> torch.Tensor:
+    """Replace NaN/Inf values to keep losses finite."""
+
+    if torch.isfinite(tensor).all():
+        return tensor
+    return torch.nan_to_num(tensor, nan=value, posinf=value, neginf=value)
+
+
 def _ensure_loaders(
     train_dl: Optional[DataLoader],
     val_dl: Optional[DataLoader],
@@ -77,11 +85,13 @@ def _prepare_latent_batch(y: torch.Tensor, mask: torch.Tensor) -> Optional[torch
     if mask.dtype != torch.bool:
         mask = mask.to(dtype=torch.bool)
     mask = mask.to(device=y.device)
-    y = y.to(device=mask.device)
+    y = _nan_to_num(y.to(device=mask.device))
 
     batch_size, num_entities, horizon = y.shape
     y_flat = y.reshape(batch_size * num_entities, horizon)
     mask_flat = mask.reshape(batch_size * num_entities)
+    valid_entities = torch.isfinite(y_flat).all(dim=1)
+    mask_flat = mask_flat & valid_entities
     if not torch.any(mask_flat):
         return None
     return y_flat[mask_flat].unsqueeze(-1)
@@ -128,6 +138,12 @@ def _epoch_pass(
                 kl_per_sample = kl_elem.sum(dim=-1)
                 kl_loss = kl_per_sample.mean()
                 loss = recon_loss + beta * kl_loss
+
+        if not torch.isfinite(loss):
+            print("[warn] non-finite loss detected; skipping step")
+            if is_train:
+                optimizer.zero_grad(set_to_none=True)
+            continue
 
         if is_train:
             if scaler is None:

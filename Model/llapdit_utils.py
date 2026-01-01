@@ -495,10 +495,14 @@ def plot_laplace_poles(
 # ============================ VAE Latent stats helpers ============================
 def flatten_targets(yb: torch.Tensor, mask_bn: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     """yb: [B,N,H] -> y_in: [Beff,H,1], batch_ids: [Beff] mapping to B for cond rows"""
-    y = yb.to(device)
+    y = torch.nan_to_num(yb.to(device), nan=0.0, posinf=0.0, neginf=0.0)
     B, N, Hcur = y.shape
     y_flat = y.reshape(B * N, Hcur).unsqueeze(-1)  # [B*N, H, 1]
-    m_flat = mask_bn.to(device).reshape(B * N)
+    finite_mask = torch.isfinite(y)
+    for _ in range(y.dim() - 2):
+        finite_mask = finite_mask.all(dim=-1)
+    mask = mask_bn.to(device).reshape(B * N)
+    m_flat = (mask & finite_mask.reshape(B * N))
     if not m_flat.any():
         return None, None
     y_in = y_flat[m_flat]
@@ -587,15 +591,22 @@ def compute_latent_stats(vae, dataloader, device):
     """
     all_mu = []
     for (_, y, meta) in dataloader:
-        m = meta["entity_mask"]
+        m = meta["entity_mask"].to(device=device, dtype=torch.bool)
+        y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
         B, N, H = y.shape
         y_flat = y.reshape(B * N, H).unsqueeze(-1)
-        m_flat = m.reshape(B * N)
+        finite_mask = torch.isfinite(y)
+        for _ in range(y.dim() - 2):
+            finite_mask = finite_mask.all(dim=-1)
+        m_flat = (m.reshape(B * N) & finite_mask.reshape(B * N))
         if not m_flat.any():
             continue
         y_in = y_flat[m_flat].to(device)
         _, mu, _ = vae(y_in)  # [Beff, L, Z]
         all_mu.append(mu.detach().cpu())
+
+    if not all_mu:
+        raise RuntimeError("No valid latent samples found after filtering non-finite values.")
 
     mu_cat = torch.cat(all_mu, dim=0)  # [sum(Beff), L, Z]
     mu_mean = mu_cat.mean(dim=(0, 1)).to(device)

@@ -92,6 +92,21 @@ def _permute_to_seq_first(x: torch.Tensor) -> torch.Tensor:
     return x.permute(0, 2, 1, 3).contiguous()
 
 
+def _nan_to_num(x: torch.Tensor) -> torch.Tensor:
+    if torch.isfinite(x).all():
+        return x
+    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _entity_finite_mask(x: torch.Tensor) -> torch.Tensor:
+    """Return per-entity mask marking sequences with all finite values."""
+
+    finite = torch.isfinite(x)
+    for _ in range(x.dim() - 2):
+        finite = finite.all(dim=-1)
+    return finite
+
+
 def _apply_entity_mask(series: torch.Tensor, mask_bn: torch.Tensor) -> torch.Tensor:
     if mask_bn.dtype != torch.bool:
         mask_bn = mask_bn.to(dtype=torch.bool)
@@ -112,9 +127,10 @@ def _prepare_batch(
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
     (V, T), _, meta = batch
-    V = _permute_to_seq_first(V).to(device)
-    T = _permute_to_seq_first(T).to(device)
+    V = _nan_to_num(_permute_to_seq_first(V)).to(device)
+    T = _nan_to_num(_permute_to_seq_first(T)).to(device)
     mask = meta["entity_mask"].to(device=device, dtype=torch.bool)
+    mask = mask & _entity_finite_mask(V) & _entity_finite_mask(T)
     V = _apply_entity_mask(V, mask)
     T = _apply_entity_mask(T, mask)
     elems = _batch_elements(mask, V.size(1))
