@@ -232,7 +232,7 @@ class LLapDiT(nn.Module):
                 ab_b = _alpha_bar_batched(t_b)  # [B,1,1]
                 g_min_t = torch.as_tensor(g_min, device=device, dtype=ab_b.dtype)
                 g_max_t = torch.as_tensor(g_max, device=device, dtype=ab_b.dtype)
-                g_scalar = g_min_t + (g_max_t - g_min_t) * (1.0 - ab_b) ** guidance_power
+                g_scalar = g_min_t + (g_max_t - g_min_t) * (ab_b ** guidance_power)
             else:
                 g_scalar = (
                     torch.as_tensor(float(guidance_strength), device=device)
