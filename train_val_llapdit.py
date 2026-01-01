@@ -15,7 +15,6 @@ from Model.llapdit_utils import (
     EMA,
     set_torch,
     encode_mu_norm,
-    _flatten_for_mask,
     make_warmup_cosine,
     calculate_target_variance,
     compute_latent_stats,
@@ -632,7 +631,7 @@ def finetune_vae_decoder(
                 continue
 
             cs_full = build_context(summarizer, V, T, mask_bn, device)
-            y_true, batch_ids = _flatten_for_mask(yb, mask_bn, device)
+            y_true, batch_ids = flatten_targets(yb, mask_bn, device)
             if y_true is None:
                 continue
             cs = cs_full[batch_ids]
@@ -753,7 +752,7 @@ def evaluate_regression(
             continue
 
         cond_summary = build_context(summarizer, V, T, mask_bn, device)
-        y_in, batch_ids = _flatten_for_mask(yb, mask_bn, device)
+        y_in, batch_ids = flatten_targets(yb, mask_bn, device)
         if y_in is None:
             continue
         cs = cond_summary[batch_ids]

@@ -36,7 +36,7 @@ def normalize_and_check(all_mu: torch.Tensor, plot: bool = False):
     per_dim_std  = all_mu_norm.std(dim=(0, 1))
     D = all_mu_norm.size(-1)
     print("\nPer-dim stats (first 10 dims or D if smaller):")
-    for i in range(min(1000, D)):
+    for i in range(min(10, D)):
         print(f"  dim {i:2d}: mean={per_dim_mean[i]:7.4f}, std={per_dim_std[i]:7.4f}")
 
     if plot:
