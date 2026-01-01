@@ -2,7 +2,7 @@ import os, torch, math
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
-import crypto_config
+import config
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -63,7 +63,7 @@ def _ensure_loaders(
     val_dl: Optional[DataLoader],
     test_dl: Optional[DataLoader],
     sizes: Optional[Sequence[int]],
-    config=crypto_config,
+    config=config,
 ) -> Tuple[LoaderTuple, Optional[Tuple[int, int, int]]]:
     if any(loader is None for loader in (train_dl, val_dl, test_dl)):
         train_dl, val_dl, test_dl, sizes = run_experiment(
@@ -111,7 +111,7 @@ def run(
     val_dl: Optional[DataLoader] = None,
     test_dl: Optional[DataLoader] = None,
     sizes: Optional[Sequence[int]] = None,
-    config=crypto_config,
+    config=config,
 ) -> Dict[str, object]:
     plot_poles_only = bool(getattr(config, "POLE_PLOT_ONLY", False))
     (train_dl, val_dl, test_dl), sizes = _ensure_loaders(train_dl, val_dl, test_dl, sizes, config)
