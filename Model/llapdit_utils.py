@@ -808,14 +808,17 @@ def diffusion_loss(
             raise AttributeError("Scheduler must provide alpha_bar_at(t) or alpha_bars.")
 
         # --- SNR and MinSNR weight ---
-        abar = abar.clamp(1e-6, 1.0 - 1e-6)            # numerical stability
-        snr = abar / (1.0 - abar)                       # [B]
+        abar = abar.clamp(1e-6, 1.0 - 1e-6)
+        snr = abar / (1.0 - abar)
         gamma = torch.as_tensor(minsnr_gamma, device=snr.device, dtype=snr.dtype)
 
-        w = torch.minimum(snr, gamma) / (snr + 1.0)     # [B]
-        w = w.detach()                                   # do not backprop through weights
+        # FIX: Standard Min-SNR for x0 prediction is just min(SNR, gamma).
+        # The previous version / (snr + 1.0) was incorrect.
+        w = torch.minimum(snr, gamma) 
+        
+        w = w.detach()
 
-        # --- Weight-normalized loss to keep scale stable across gamma choices ---
+        # Weight-normalized loss
         w_mean = w.mean().clamp_min(1e-8)
         return (w * per_sample).mean() / w_mean
 
