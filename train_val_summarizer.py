@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
-import crypto_config
+import config
 import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
@@ -48,7 +48,7 @@ def _ensure_loaders(
     val_loader: Optional[DataLoader],
     test_loader: Optional[DataLoader],
     sizes: Optional[Sequence[int]],
-    config=crypto_config,
+    config=config,
 ) -> Tuple[LoaderTuple, Optional[Tuple[int, int, int]]]:
     if any(loader is None for loader in (train_loader, val_loader, test_loader)):
         train_loader, val_loader, test_loader, sizes = run_experiment(
@@ -197,7 +197,7 @@ def run(
     val_loader: Optional[DataLoader] = None,
     test_loader: Optional[DataLoader] = None,
     sizes: Optional[Sequence[int]] = None,
-    config=crypto_config,
+    config=config,
 ) -> Dict[str, object]:
     (train_loader, val_loader, test_loader), sizes = _ensure_loaders(
         train_loader, val_loader, test_loader, sizes, config
