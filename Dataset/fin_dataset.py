@@ -28,6 +28,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, Sampler as _Sampler
 
 from ._types import PathLike
+from ._normalization import NormalizationStatsAccumulator
 
 # --------------------- Public configs (kept compatible) ---------------------
 
@@ -102,6 +103,14 @@ class CachePaths:
         return self.cache_root / "windows"
 
     @property
+    def obs_masks(self) -> Path:
+        return self.cache_root / "obs_masks_bool"
+
+    @property
+    def fill_masks(self) -> Path:
+        return self.cache_root / "fill_masks_bool"
+
+    @property
     def meta(self) -> Path:
         return self.cache_root / "meta.json"
 
@@ -116,6 +125,8 @@ class CachePaths:
         self.targets.mkdir(parents=True, exist_ok=True)
         self.times.mkdir(parents=True, exist_ok=True)
         self.windows.mkdir(parents=True, exist_ok=True)
+        self.obs_masks.mkdir(parents=True, exist_ok=True)
+        self.fill_masks.mkdir(parents=True, exist_ok=True)
             
 # --------------------- Lightweight stores ---------------------
 
@@ -178,6 +189,34 @@ def _cyclical_from_int(values: np.ndarray, period: int):
     return np.sin(ang).astype(np.float32), np.cos(ang).astype(np.float32)
 
 
+def _finite_mean_std(
+    arr: np.ndarray, axis=None, keepdims: bool = True, eps: float = 1e-12
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute finite-only mean/std with stability safeguards."""
+    arr = np.asarray(arr, dtype=np.float32)
+    finite = np.isfinite(arr)
+    count = finite.sum(axis=axis, keepdims=keepdims)
+    safe = np.where(finite, arr, 0.0)
+
+    denom = np.maximum(count, 1)
+    mean = safe.sum(axis=axis, dtype=np.float64, keepdims=keepdims) / denom
+    sq_sum = np.square(safe, dtype=np.float64).sum(axis=axis, keepdims=keepdims)
+    var = sq_sum / denom - np.square(mean, dtype=np.float64)
+    var = np.maximum(var, eps)
+    std = np.sqrt(var, dtype=np.float64)
+    std = np.where((std == 0.0) | ~np.isfinite(std), 1.0, std)
+    return mean.astype(np.float32), std.astype(np.float32), count.astype(np.int64)
+
+
+def _compute_time_deltas(times: np.ndarray) -> np.ndarray:
+    """Return first differences between consecutive timestamps in seconds."""
+    if times.size == 0:
+        return np.array([], dtype=np.float32)
+    deltas = np.diff(times.astype("datetime64[s]").astype(np.int64)).astype(np.float32)
+    deltas = np.concatenate([np.zeros((1,), dtype=np.float32), deltas])
+    return deltas
+
+
 def build_calendar_frame(idx: pd.DatetimeIndex, cfg: CalendarConfig) -> pd.DataFrame:
     import pandas as pd
     cols = {}
@@ -216,7 +255,8 @@ def prepare_features_and_index_cache(
     normalize_per_ticker: bool = True,
     clamp_sigma: float = 5.0,
     min_obs_buffer: int = 50,
-    min_train_coverage: float = 0.9,
+    min_train_coverage: float = 0.7,
+    min_row_coverage: Optional[float] = None,
     liquidity_rank_window: Optional[Tuple[str,str]] = None,
     top_n_by_dollar_vol: Optional[int] = None,
     max_windows_per_ticker: Optional[int] = None,  # applies at *index* build time
@@ -351,8 +391,9 @@ def prepare_features_and_index_cache(
         coverage = float(np.mean(row_coverage)) if len(row_coverage) else 0.0
         if coverage < min_train_coverage:
             continue
-        min_non_missing = max(1, int(np.ceil(min_train_coverage * feat_df.shape[1])))
-        feat_df = feat_df.dropna(thresh=min_non_missing)
+        if min_row_coverage is not None:
+            min_non_missing = max(1, int(np.ceil(min_row_coverage * feat_df.shape[1])))
+            feat_df = feat_df.dropna(thresh=min_non_missing)
         feat_df = feat_df.dropna(how="all")
         if not np.isfinite(feat_df[target_col].to_numpy(dtype=np.float32, copy=False)).any():
             continue
@@ -380,15 +421,28 @@ def prepare_features_and_index_cache(
 
     # ---- Save compact arrays ----
     # Per-ticker matrices: X[t] shape [T,F] float16, Y[t] shape [T] float16, times[t] datetime64
+    norm_acc = NormalizationStatsAccumulator(
+        num_assets=len(assets),
+        feature_dim=len(feature_cols),
+        per_asset=normalize_per_ticker,
+    )
     for a in assets:
         df = per_ticker[a]
-        X = df[feature_cols].to_numpy(dtype=np.float32, copy=False)
+        feature_view = df[feature_cols]
+        X = feature_view.to_numpy(dtype=np.float32, copy=False)
         Y = df[target_col].to_numpy(dtype=np.float32, copy=False)
         times = df.index.to_numpy()
+        obs_mask = feature_view.notna().to_numpy(dtype=bool, copy=False)
+        fill_mask = obs_mask  # no in-place filling performed here
         # Write as float16 (2× smaller) – okay post-normalization/standardization
-        np.save(paths.features / f"{asset2id[a]}.npy", X.astype(np.float16))
-        np.save(paths.targets / f"{asset2id[a]}.npy", Y.astype(np.float16))
-        np.save(paths.times / f"{asset2id[a]}.npy", times.astype("datetime64[ns]"))
+        aid = asset2id[a]
+        np.save(paths.features / f"{aid}.npy", X.astype(np.float16))
+        np.save(paths.targets / f"{aid}.npy", Y.astype(np.float16))
+        np.save(paths.times / f"{aid}.npy", times.astype("datetime64[ns]"))
+        np.save(paths.obs_masks / f"{aid}.npy", obs_mask)
+        np.save(paths.fill_masks / f"{aid}.npy", fill_mask)
+
+        norm_acc.update(aid, X, Y)
 
     # ---- Precompute a *global* window index (small) ----
     # This is optional but speeds up loader start; also lets us cap max_windows_per_ticker deterministically
@@ -428,39 +482,7 @@ def prepare_features_and_index_cache(
     np.save(paths.windows / "end_times.npy", end_times)
 
     # ---- Norm stats (per-ticker, scalar Y) ----
-    norm_stats = {
-        'per_ticker': normalize_per_ticker,
-        'assets': assets,
-        'mean_x': [], 'std_x': [],   # list per asset -> [1,1,F] if per_ticker else [1,1,F]
-        'mean_y': [], 'std_y': [],
-    }
-    if normalize_per_ticker:
-        for a in assets:
-            aid = asset2id[a]
-            Xf = np.load(paths.features / f"{aid}.npy", mmap_mode="r")
-            Yf = np.load(paths.targets / f"{aid}.npy", mmap_mode="r")
-            mx = Xf.astype(np.float32).mean(axis=0, keepdims=True)[None, ...]   # [1,1,F]
-            sx = Xf.astype(np.float32).std(axis=0, keepdims=True)[None, ...]
-            sx[sx == 0] = 1.0
-            my = float(Yf.astype(np.float32).mean())
-            sy = float(Yf.astype(np.float32).std()); sy = (1.0 if sy == 0 else sy)
-            norm_stats['mean_x'].append(mx.tolist()); norm_stats['std_x'].append(sx.tolist())
-            norm_stats['mean_y'].append(my);          norm_stats['std_y'].append(sy)
-    else:
-        # global stats shared by all assets
-        Xs, Ys = [], []
-        for a in assets:
-            aid = asset2id[a]
-            Xs.append(np.load(paths.features / f"{aid}.npy", mmap_mode="r").astype(np.float32))
-            Ys.append(np.load(paths.targets / f"{aid}.npy", mmap_mode="r").astype(np.float32))
-        Xcat = np.concatenate(Xs, axis=0)
-        Ycat = np.concatenate(Ys, axis=0)
-        mx = Xcat.mean(axis=0, keepdims=True)[None, ...]
-        sx = Xcat.std(axis=0, keepdims=True)[None, ...]; sx[sx == 0] = 1.0
-        my = float(Ycat.mean()); sy = float(Ycat.std()); sy = (1.0 if sy == 0 else sy)
-        norm_stats['mean_x'] = mx.tolist(); norm_stats['std_x'] = sx.tolist()
-        norm_stats['mean_y'] = my;           norm_stats['std_y'] = sy
-        del Xcat, Ycat
+    norm_stats = norm_acc.finalize(assets)
     with paths.norm_stats.open("w") as f:
         json.dump(norm_stats, f)
 
@@ -488,6 +510,8 @@ def prepare_features_and_index_cache(
         'normalize_per_ticker': bool(normalize_per_ticker),
         'clamp_sigma': float(clamp_sigma),
         'min_obs_buffer': int(min_obs_buffer),
+        'min_train_coverage': float(min_train_coverage),
+        'min_row_coverage': (float(min_row_coverage) if min_row_coverage is not None else None),
         'liquidity_rank_window': liquidity_rank_window,
         'top_n_by_dollar_vol': top_n_by_dollar_vol,
         'max_windows_per_ticker': max_windows_per_ticker,
@@ -725,6 +749,8 @@ class _IndexBackedDataset(Dataset):
         self._X: Dict[int, np.ndarray] = {}
         self._Y: Dict[int, np.ndarray] = {}
         self._T: Dict[int, np.ndarray] = {}
+        self._OBS: Dict[int, Optional[np.ndarray]] = {}
+        self._FILL: Dict[int, Optional[np.ndarray]] = {}
 
         self.per_ticker = bool(norm_stats.get('per_ticker', True))
         self.mean_x = norm_stats['mean_x']
@@ -740,13 +766,25 @@ class _IndexBackedDataset(Dataset):
             self._X[aid] = np.load(self.paths.features / f"{aid}.npy", mmap_mode="r")
             self._Y[aid] = np.load(self.paths.targets / f"{aid}.npy", mmap_mode="r")
             self._T[aid] = np.load(self.paths.times / f"{aid}.npy", mmap_mode="r")
-        return self._X[aid], self._Y[aid], self._T[aid]
+            obs_path = self.paths.obs_masks / f"{aid}.npy"
+            fill_path = self.paths.fill_masks / f"{aid}.npy"
+            self._OBS[aid] = np.load(obs_path, mmap_mode="r") if obs_path.exists() else None
+            self._FILL[aid] = np.load(fill_path, mmap_mode="r") if fill_path.exists() else None
+        return (
+            self._X[aid],
+            self._Y[aid],
+            self._T[aid],
+            self._OBS.get(aid),
+            self._FILL.get(aid),
+        )
 
     def __getitem__(self, i: int):
         aid, start = self.pairs[i]
-        Xf, Yf, Tf = self._get_arrays(int(aid))
+        Xf, Yf, Tf, Obs, Fill = self._get_arrays(int(aid))
         s = int(start); e = s + self.window
         x = Xf[s:e, :].astype(np.float32)  # [K,F]
+        obs_slice = Obs[s:e] if Obs is not None else None
+        fill_slice = Fill[s:e] if Fill is not None else None
         
         y_vec = Yf[e:e+self.horizon].astype(np.float32)  # [H]
         raw_last_for_label = float(y_vec[-1]) if y_vec.size else 0.0
@@ -782,9 +820,15 @@ class _IndexBackedDataset(Dataset):
             if self.keep_time_meta == 'full':
                 meta['ctx_times'] = Tf[s:e]
                 meta['y_times'] = Tf[e:e+self.horizon]
+                meta['delta_t'] = _compute_time_deltas(Tf[s:e])
             else:
                 meta['ctx_times'] = Tf[e-1]
                 meta['y_times']  = Tf[e+self.horizon-1]
+                meta['delta_t'] = _compute_time_deltas(Tf[s:e])
+        if obs_slice is not None:
+            meta['x_obs_mask'] = obs_slice
+        if fill_slice is not None:
+            meta['x_mask'] = fill_slice
         return x_t, y_t, meta
 
 # --------------------- Date grouping helpers for ratio-split ---------------------
@@ -876,22 +920,35 @@ def _compute_train_only_norm_stats(
                 Xp = Xf[:upto_x, :]
                 Yp = Yf[:upto_y]
 
-                mx = Xp.mean(axis=0, keepdims=True)[None, ...]
-                vx = Xp.var(axis=0, keepdims=True, ddof=0)[None, ...]
-                sx = _np.sqrt(_np.maximum(vx, 1e-12)); sx[sx == 0] = 1.0
-                my = float(Yp.mean()) if Yp.size else 0.0
-                sy = float(Yp.std()) if Yp.size else 1.0
-                sy = (1.0 if sy == 0 else sy)
+                mx, sx, count_x = _finite_mean_std(Xp, axis=0, keepdims=True)
+                my_arr, sy_arr, count_y_arr = _finite_mean_std(Yp, axis=0, keepdims=False)
+                if int(count_x.max()) == 0:
+                    mx = _np.zeros((1, 1, feature_dim), dtype=_np.float32)
+                    sx = _np.ones((1, 1, feature_dim), dtype=_np.float32)
+                else:
+                    mx = mx[None, ...]
+                    sx = sx[None, ...]
+                if int(count_y_arr) == 0:
+                    my = 0.0
+                    sy = 1.0
+                else:
+                    my = float(my_arr)
+                    sy = float(sy_arr)
 
                 mean_x.append(mx.tolist()); std_x.append(sx.tolist())
                 mean_y.append(my);         std_y.append(sy)
 
-                g_count += Xp.shape[0]
-                g_sum   += Xp.sum(axis=0, dtype=_np.float64)
-                g_sumsq += (Xp.astype(_np.float64) ** 2).sum(axis=0)
-                g_y_count += Yp.shape[0]
-                g_y_sum   += float(Yp.sum())
-                g_y_sumsq += float((Yp.astype(_np.float64) ** 2).sum())
+                finite_x = _np.isfinite(Xp)
+                g_count += finite_x.sum(axis=0, dtype=_np.int64)
+                safe_x = _np.where(finite_x, Xp, 0.0)
+                g_sum   += safe_x.sum(axis=0, dtype=_np.float64)
+                g_sumsq += (safe_x.astype(_np.float64) ** 2).sum(axis=0)
+
+                finite_y = _np.isfinite(Yp)
+                g_y_count += int(finite_y.sum())
+                safe_y = _np.where(finite_y, Yp, 0.0)
+                g_y_sum   += float(safe_y.sum())
+                g_y_sumsq += float((safe_y.astype(_np.float64) ** 2).sum())
             else:
                 mean_x.append(None); std_x.append(None)
                 mean_y.append(None); std_y.append(None)
@@ -941,12 +998,16 @@ def _compute_train_only_norm_stats(
         upto_y = min(upto_y, Yf.shape[0])
         Xp = Xf[:upto_x, :]
         Yp = Yf[:upto_y]
-        g_count += Xp.shape[0]
-        g_sum   += Xp.sum(axis=0, dtype=_np.float64)
-        g_sumsq += (Xp.astype(_np.float64) ** 2).sum(axis=0)
-        g_y_count += Yp.shape[0]
-        g_y_sum   += float(Yp.sum())
-        g_y_sumsq += float((Yp.astype(_np.float64) ** 2).sum())
+        finite_x = _np.isfinite(Xp)
+        g_count += finite_x.sum(axis=0, dtype=_np.int64)
+        safe_x = _np.where(finite_x, Xp, 0.0)
+        g_sum   += safe_x.sum(axis=0, dtype=_np.float64)
+        g_sumsq += (safe_x.astype(_np.float64) ** 2).sum(axis=0)
+        finite_y = _np.isfinite(Yp)
+        g_y_count += int(finite_y.sum())
+        safe_y = _np.where(finite_y, Yp, 0.0)
+        g_y_sum   += float(safe_y.sum())
+        g_y_sumsq += float((safe_y.astype(_np.float64) ** 2).sum())
 
     if g_count == 0:
         return None
@@ -1182,7 +1243,7 @@ def run_experiment(
     ratios=(0.7, 0.1, 0.2),
     per_asset=True,
     date_batching=True,
-    coverage=0.85,
+    coverage=0.0,
     dates_per_batch=30,
     batch_size=64,
     norm="train_only",    # default is "train_only" in the patched loader; set "cache" if you want fixed μ/σ

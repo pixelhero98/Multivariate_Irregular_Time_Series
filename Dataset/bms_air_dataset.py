@@ -67,6 +67,9 @@ class BMSCacheConfig:
     freq: str = DEFAULT_SAMPLE_FREQ
     stations: Optional[Sequence[str]] = None
     overwrite: bool = False
+    raw_ffill: bool = False
+    raw_ffill_limit: Optional[int] = None
+    panel_ffill_limit: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +122,26 @@ def _encode_wind_direction(series: pd.Series) -> pd.Series:
     return codes.astype(np.float32)
 
 
-def clean_bms_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Perform light cleaning and station-wise forward-filling of the dataset."""
+def clean_bms_data(
+    df: pd.DataFrame,
+    *,
+    ffill_raw: bool = False,
+    ffill_limit: Optional[int] = None,
+) -> pd.DataFrame:
+    """Perform light cleaning of the dataset.
+
+    Parameters
+    ----------
+    df:
+        Raw dataframe concatenated across stations.
+    ffill_raw:
+        Whether to forward-fill missing values within each station prior to
+        constructing hourly panels. Defaults to ``False`` to preserve the
+        irregular observation pattern.
+    ffill_limit:
+        Optional cap on how many consecutive rows a value can be carried
+        forward when ``ffill_raw`` is enabled.
+    """
 
     df = df.copy()
     # Build a timestamp using the provided components.
@@ -153,8 +174,11 @@ def clean_bms_data(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.sort_values(["station", "datetime"])  # ensure chronological order
 
-    fill_cols = [c for c in df.columns if c not in {"station", "datetime"}]
-    df[fill_cols] = df.groupby("station", sort=False)[fill_cols].ffill()
+    if ffill_raw:
+        fill_cols = [c for c in df.columns if c not in {"station", "datetime"}]
+        df[fill_cols] = df.groupby("station", sort=False)[fill_cols].ffill(
+            limit=ffill_limit
+        )
 
     return df
 
@@ -165,8 +189,14 @@ def _build_station_frames(
     stations: Optional[Sequence[str]] = None,
     *,
     min_coverage: float = 0.6,
-) -> Dict[str, pd.DataFrame]:
-    """Transform the long dataframe into per-station panels aligned on time."""
+    ffill_limit: Optional[int] = None,
+) -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    """Transform the long dataframe into per-station panels aligned on time.
+
+    Coverage is evaluated on the *observed* mask before any forward-fill. The
+    returned panels retain NaNs and include both observed and filled masks for
+    downstream consumption.
+    """
 
     if stations is not None:
         df = df[df["station"].isin(set(stations))].copy()
@@ -177,15 +207,28 @@ def _build_station_frames(
     feature_cols = [c for c in df.columns if c not in {"station", "datetime"}]
     global_index = pd.date_range(df["datetime"].min(), df["datetime"].max(), freq=freq)
 
-    panels: Dict[str, pd.DataFrame] = {}
+    panels: Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
     for station, group in df.groupby("station"):
         station_df = group.set_index("datetime")[feature_cols]
         station_df = station_df.reindex(global_index)
-        station_df = station_df.ffill()
+        obs_mask = station_df.notna()
+
         required = max(1, int(np.ceil(min_coverage * len(feature_cols))))
-        station_df = station_df.dropna(thresh=required)
-        if not station_df.empty:
-            panels[str(station)] = station_df.astype(np.float32)
+        keep_rows = obs_mask.sum(axis=1) >= required
+        station_df = station_df.loc[keep_rows]
+        obs_mask = obs_mask.loc[keep_rows]
+        if station_df.empty:
+            continue
+
+        if ffill_limit is not None:
+            station_df = station_df.ffill(limit=ffill_limit)
+
+        filled_mask = station_df.notna()
+        panels[str(station)] = (
+            station_df.astype(np.float32),
+            obs_mask.astype(bool),
+            filled_mask.astype(bool),
+        )
 
     if not panels:
         raise ValueError("All station panels became empty after reindexing.")
@@ -228,16 +271,21 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
     raw_root = cfg.raw_data_dir or "./bms_air_quality_data"
     raw_path = download_bms_air_dataset(raw_root)
     raw_df = load_raw_bms_frames(raw_path)
-    clean_df = clean_bms_data(raw_df)
+    clean_df = clean_bms_data(
+        raw_df,
+        ffill_raw=cfg.raw_ffill,
+        ffill_limit=cfg.raw_ffill_limit,
+    )
 
     panels = _build_station_frames(
         clean_df,
         freq=cfg.freq,
         stations=cfg.stations,
         min_coverage=cfg.min_coverage,
+        ffill_limit=cfg.panel_ffill_limit,
     )
 
-    feature_cols = list(next(iter(panels.values())).columns)
+    feature_cols = list(next(iter(panels.values()))[0].columns)
     if TARGET_COLUMN not in feature_cols:
         raise ValueError(f"Target column '{TARGET_COLUMN}' missing from features.")
     # Ensure the target is the first column to make downstream inspection easier.
@@ -255,9 +303,13 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
     stop_times: List[np.datetime64] = []
 
     min_required = cfg.window + cfg.horizon
-    valid_panels: Dict[str, pd.DataFrame] = {}
+    valid_panels: Dict[str, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = {}
     for asset in sorted(panels.keys()):
-        panel = panels[asset][feature_cols]
+        panel, obs_mask, filled_mask = panels[asset]
+        panel = panel[feature_cols]
+        obs_mask = obs_mask[feature_cols]
+        filled_mask = filled_mask[feature_cols]
+
         total_rows = panel.shape[0]
         if total_rows < min_required:
             raise ValueError(
@@ -266,7 +318,7 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
         targets = panel[TARGET_COLUMN].to_numpy(dtype=np.float32, copy=False)
         if not np.isfinite(targets).any():
             continue
-        valid_panels[asset] = panel
+        valid_panels[asset] = (panel, obs_mask, filled_mask)
 
     if not valid_panels:
         raise RuntimeError("No station panels with observed targets remain after cleaning.")
@@ -283,15 +335,19 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
     )
 
     for asset in assets:
-        panel = valid_panels[asset]
+        panel, obs_mask, filled_mask = valid_panels[asset]
         features = panel.to_numpy(dtype=np.float32, copy=True)
         targets = panel[TARGET_COLUMN].to_numpy(dtype=np.float32, copy=True)
         times = panel.index.to_numpy(dtype="datetime64[ns]")
+        obs_mask_np = obs_mask.to_numpy(dtype=bool, copy=False)
+        filled_mask_np = filled_mask.to_numpy(dtype=bool, copy=False)
 
         aid = asset_to_id[asset]
         np.save(paths.features / f"{aid}.npy", features.astype(np.float16, copy=False))
         np.save(paths.targets / f"{aid}.npy", targets.astype(np.float16, copy=False))
         np.save(paths.times / f"{aid}.npy", times)
+        np.save(paths.obs_masks / f"{aid}.npy", obs_mask_np)
+        np.save(paths.fill_masks / f"{aid}.npy", filled_mask_np)
 
         norm_acc.update(aid, features, targets)
 
@@ -340,6 +396,9 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
         "normalize_per_ticker": cfg.normalize_per_station,
         "clamp_sigma": cfg.clamp_sigma,
         "freq": cfg.freq or DEFAULT_SAMPLE_FREQ,
+        "raw_ffill": bool(cfg.raw_ffill),
+        "raw_ffill_limit": cfg.raw_ffill_limit,
+        "panel_ffill_limit": cfg.panel_ffill_limit,
         "start": str(dataset_start) if dataset_start is not None else None,
         "end": str(dataset_end) if dataset_end is not None else None,
     }
