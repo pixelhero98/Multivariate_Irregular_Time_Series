@@ -30,6 +30,8 @@ import numpy as np
 import pandas as pd
 import requests
 
+from numpy.lib.stride_tricks import sliding_window_view
+
 from ._normalization import NormalizationStatsAccumulator
 from ._types import PathLike
 from .fin_dataset import (
@@ -339,7 +341,8 @@ def prepare_uci_air_cache(cfg: UCIAirCacheConfig) -> Mapping[str, List[str]]:
 
     panel = clean_df[feature_cols]
     total_rows = panel.shape[0]
-    if total_rows < cfg.window + cfg.horizon:
+    min_required = cfg.window + cfg.horizon
+    if total_rows < min_required:
         raise ValueError("Insufficient history for the requested window/horizon configuration.")
 
     features = panel.to_numpy(dtype=np.float32, copy=True)
@@ -357,11 +360,18 @@ def prepare_uci_air_cache(cfg: UCIAirCacheConfig) -> Mapping[str, List[str]]:
     )
     norm_acc.update(0, features, targets)
 
-    max_start = total_rows - (cfg.window + cfg.horizon) + 1
+    max_start = total_rows - min_required + 1
     if max_start <= 0:
         raise RuntimeError("No valid context windows available for the requested configuration.")
 
     starts = np.arange(0, max_start, dtype=np.int32)
+    if cfg.horizon > 0:
+        obs = np.isfinite(targets)
+        future_obs = sliding_window_view(obs, window_shape=cfg.horizon)
+        valid = future_obs[cfg.window : cfg.window + max_start].any(axis=1)
+        starts = starts[valid]
+    if starts.size == 0:
+        raise RuntimeError("No valid context windows with observed targets in the forecast horizon.")
     window_end_times = times[starts + cfg.window - 1].astype("datetime64[ns]")
     global_pairs = np.stack([np.zeros_like(starts), starts], axis=1).astype(np.int32)
     np.save(paths.windows / "global_pairs.npy", global_pairs)
@@ -523,4 +533,3 @@ __all__ = [
     "load_uci_dataloaders_with_ratio_split",
     "run_experiment",
 ]
-

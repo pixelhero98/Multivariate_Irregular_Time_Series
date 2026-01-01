@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler as _Sampler
@@ -390,13 +391,22 @@ def prepare_features_and_index_cache(
     for a in assets:
         aid = asset2id[a]
         times = np.load(paths.times / f"{aid}.npy")
-        T = times.shape[0]
-        if T < (window + horizon):
+        times_arr = times.astype("datetime64[ns]")
+        T = times_arr.shape[0]
+        min_required = window + horizon
+        if T < min_required:
             continue
-        start_idxs = np.arange(0, T - window - horizon + 1, dtype=np.int32)
+        start_idxs = np.arange(0, T - min_required + 1, dtype=np.int32)
         if max_windows_per_ticker is not None and start_idxs.size > max_windows_per_ticker:
             start_idxs = start_idxs[:max_windows_per_ticker]
-        end_times = times[start_idxs + window - 1]
+        if horizon > 0:
+            obs = np.isfinite(Y)
+            future_obs = sliding_window_view(obs, window_shape=horizon)
+            valid = future_obs[window : window + start_idxs.size].any(axis=1)
+            start_idxs = start_idxs[valid]
+        if start_idxs.size == 0:
+            continue
+        end_times = times_arr[start_idxs + window - 1]
         pairs.append(np.stack([np.full_like(start_idxs, aid), start_idxs], axis=1))
         ends.append(end_times.astype('datetime64[ns]'))
 
@@ -518,12 +528,21 @@ def rebuild_window_index_only(
         if not tp.exists():
             continue
         times = np.load(tp)  # datetime64[ns]
+        targets = np.load(paths.targets / f"{aid}.npy").astype(np.float32)
         T = int(times.shape[0])
-        if T < window + horizon:
+        min_required = window + horizon
+        if T < min_required:
             continue
-        starts = np.arange(0, T - window - horizon + 1, dtype=np.int32)
+        starts = np.arange(0, T - min_required + 1, dtype=np.int32)
         if max_windows_per_ticker is not None and starts.size > max_windows_per_ticker:
             starts = starts[:max_windows_per_ticker]
+        if horizon > 0:
+            obs = np.isfinite(targets)
+            future_obs = sliding_window_view(obs, window_shape=horizon)
+            valid = future_obs[window : window + starts.size].any(axis=1)
+            starts = starts[valid]
+        if starts.size == 0:
+            continue
         end_times = times[starts + window - 1]
         pairs_list.append(np.stack([np.full_like(starts, aid), starts], axis=1))
         ends_list.append(end_times.astype("datetime64[ns]"))

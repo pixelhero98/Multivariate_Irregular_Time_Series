@@ -26,6 +26,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 
 
 def _initialise_isd_backend() -> Tuple[Optional[object], Optional[str]]:
@@ -608,7 +609,8 @@ def prepare_isd_cache(cfg: ISDCacheConfig) -> Mapping[str, List[str]]:
         aid = asset_to_id[asset]
         panel = panels[asset][feature_cols]
         total_rows = panel.shape[0]
-        if total_rows < cfg.window + cfg.horizon:
+        min_required = cfg.window + cfg.horizon
+        if total_rows < min_required:
             raise ValueError(
                 f"Station '{asset}' has insufficient history for the requested window/horizon."
             )
@@ -623,10 +625,17 @@ def prepare_isd_cache(cfg: ISDCacheConfig) -> Mapping[str, List[str]]:
 
         norm_acc.update(aid, features, targets)
 
-        max_start = total_rows - (cfg.window + cfg.horizon) + 1
+        max_start = total_rows - min_required + 1
         if max_start <= 0:
             continue
         starts = np.arange(0, max_start, dtype=np.int32)
+        if cfg.horizon > 0:
+            obs = np.isfinite(targets)
+            future_obs = sliding_window_view(obs, window_shape=cfg.horizon)
+            valid = future_obs[cfg.window : cfg.window + max_start].any(axis=1)
+            starts = starts[valid]
+        if starts.size == 0:
+            continue
         window_end_times = times[starts + cfg.window - 1].astype("datetime64[ns]")
         pairs.append(np.stack([np.full_like(starts, aid), starts], axis=1))
         end_times.append(window_end_times)
