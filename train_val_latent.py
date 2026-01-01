@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
-import crypto_config
+import config
 from Dataset.fin_dataset import run_experiment
 from Latent_Space.latent_vae import LatentVAE
 from Latent_Space.latent_vae_utils import normalize_and_check
@@ -33,7 +33,7 @@ def _ensure_loaders(
     val_dl: Optional[DataLoader],
     test_dl: Optional[DataLoader],
     sizes: Optional[Sequence[int]],
-    config=crypto_config,
+    config=config,
 ) -> Tuple[LoaderTuple, Optional[Tuple[int, int, int]]]:
     """Return dataloaders, creating them if necessary, and infer dataset sizes."""
 
@@ -174,7 +174,7 @@ def run(
     val_dl: Optional[DataLoader] = None,
     test_dl: Optional[DataLoader] = None,
     sizes: Optional[Sequence[int]] = None,
-    config=crypto_config,
+    config=config,
 ) -> Dict[str, object]:
     (train_dl, val_dl, test_dl), sizes = _ensure_loaders(train_dl, val_dl, test_dl, sizes, config)
     _log_dataset_summary(train_dl, sizes)
