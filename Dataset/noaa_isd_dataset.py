@@ -514,12 +514,19 @@ def _build_station_panels(
         station_df = station_df.apply(pd.to_numeric, errors="coerce")
         station_df = station_df.resample(freq).mean()
         station_df = station_df.ffill()
-        coverage = 1.0 - station_df.isna().any(axis=1).mean() if len(station_df) else 0.0
+        if station_df.empty:
+            continue
+        row_coverage = 1.0 - station_df.isna().mean(axis=1)
+        coverage = float(row_coverage.mean()) if len(row_coverage) else 0.0
         if coverage < min_coverage:
             continue
-        station_df = station_df.dropna()
-        if not station_df.empty:
-            panels[str(station_id)] = station_df.astype(np.float32)
+        required = max(1, int(np.ceil(min_coverage * len(feature_cols))))
+        station_df = station_df.dropna(thresh=required)
+        if station_df.empty:
+            continue
+        if not np.isfinite(station_df[TARGET_COLUMN].to_numpy(dtype=np.float32, copy=False)).any():
+            continue
+        panels[str(station_id)] = station_df.astype(np.float32)
 
     if not panels:
         raise RuntimeError("All stations were filtered out during panel construction.")

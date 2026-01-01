@@ -61,6 +61,7 @@ class BMSCacheConfig:
     data_dir: PathLike = "./bms_air_cache"
     raw_data_dir: Optional[PathLike] = "./bms_air_quality_data"
     normalize_per_station: bool = True
+    min_coverage: float = 0.6
     clamp_sigma: float = 5.0
     keep_time_meta: str = "end"  # "full" | "end" | "none"
     freq: str = DEFAULT_SAMPLE_FREQ
@@ -162,6 +163,8 @@ def _build_station_frames(
     df: pd.DataFrame,
     freq: str = DEFAULT_SAMPLE_FREQ,
     stations: Optional[Sequence[str]] = None,
+    *,
+    min_coverage: float = 0.6,
 ) -> Dict[str, pd.DataFrame]:
     """Transform the long dataframe into per-station panels aligned on time."""
 
@@ -179,7 +182,8 @@ def _build_station_frames(
         station_df = group.set_index("datetime")[feature_cols]
         station_df = station_df.reindex(global_index)
         station_df = station_df.ffill()
-        station_df = station_df.dropna()
+        required = max(1, int(np.ceil(min_coverage * len(feature_cols))))
+        station_df = station_df.dropna(thresh=required)
         if not station_df.empty:
             panels[str(station)] = station_df.astype(np.float32)
 
@@ -226,10 +230,12 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
     raw_df = load_raw_bms_frames(raw_path)
     clean_df = clean_bms_data(raw_df)
 
-    panels = _build_station_frames(clean_df, freq=cfg.freq, stations=cfg.stations)
-
-    assets = sorted(panels.keys())
-    asset_to_id = {asset: idx for idx, asset in enumerate(assets)}
+    panels = _build_station_frames(
+        clean_df,
+        freq=cfg.freq,
+        stations=cfg.stations,
+        min_coverage=cfg.min_coverage,
+    )
 
     feature_cols = list(next(iter(panels.values())).columns)
     if TARGET_COLUMN not in feature_cols:
@@ -248,6 +254,26 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
     start_times: List[np.datetime64] = []
     stop_times: List[np.datetime64] = []
 
+    min_required = cfg.window + cfg.horizon
+    valid_panels: Dict[str, pd.DataFrame] = {}
+    for asset in sorted(panels.keys()):
+        panel = panels[asset][feature_cols]
+        total_rows = panel.shape[0]
+        if total_rows < min_required:
+            raise ValueError(
+                f"Station '{asset}' has insufficient history for the requested window/horizon."
+            )
+        targets = panel[TARGET_COLUMN].to_numpy(dtype=np.float32, copy=False)
+        if not np.isfinite(targets).any():
+            continue
+        valid_panels[asset] = panel
+
+    if not valid_panels:
+        raise RuntimeError("No station panels with observed targets remain after cleaning.")
+
+    assets: List[str] = sorted(valid_panels.keys())
+    asset_to_id: Dict[str, int] = {asset: idx for idx, asset in enumerate(assets)}
+
     # Normalization statistics accumulator.
     feature_dim = len(feature_cols)
     norm_acc = NormalizationStatsAccumulator(
@@ -257,19 +283,12 @@ def prepare_bms_air_cache(cfg: BMSCacheConfig) -> Mapping[str, List[str]]:
     )
 
     for asset in assets:
-        aid = asset_to_id[asset]
-        panel = panels[asset][feature_cols]
-        total_rows = panel.shape[0]
-        min_required = cfg.window + cfg.horizon
-        if total_rows < min_required:
-            raise ValueError(
-                f"Station '{asset}' has insufficient history for the requested window/horizon."
-            )
-
+        panel = valid_panels[asset]
         features = panel.to_numpy(dtype=np.float32, copy=True)
         targets = panel[TARGET_COLUMN].to_numpy(dtype=np.float32, copy=True)
         times = panel.index.to_numpy(dtype="datetime64[ns]")
 
+        aid = asset_to_id[asset]
         np.save(paths.features / f"{aid}.npy", features.astype(np.float16, copy=False))
         np.save(paths.targets / f"{aid}.npy", targets.astype(np.float16, copy=False))
         np.save(paths.times / f"{aid}.npy", times)

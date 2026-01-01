@@ -11,9 +11,11 @@ monitoring station in an Italian city.  We model the future concentration of
 ``NO2(GT)`` (nitrogen dioxide) as the regression target while the context
 features include the remaining pollutant and meteorological readings provided
 by the original dataset.  Missing values are denoted with ``-200`` in the raw
-files; the cleaning pipeline replaces those entries with ``NaN`` and performs
-time-based interpolation followed by forward/backward filling.  The processed
-panel is resampled at one-hour intervals by default.
+files; the cleaning pipeline replaces those entries with ``NaN`` and preserves
+missingness during resampling.  Values are forward-filled when possible and
+rows with insufficient feature coverage are dropped, allowing masked training
+to exploit the remaining ``NaN`` structure.  The processed panel is resampled
+at one-hour intervals by default.
 """
 
 from __future__ import annotations
@@ -80,6 +82,7 @@ class UCIAirCacheConfig:
     target_column: str = TARGET_COLUMN
     feature_columns: Optional[Sequence[str]] = None
     normalize_per_asset: bool = False
+    min_coverage: float = 0.6
     clamp_sigma: float = 5.0
     keep_time_meta: str = "end"  # "full" | "end" | "none"
     overwrite: bool = False
@@ -252,6 +255,7 @@ def clean_uci_air_quality(
     freq: str = DEFAULT_FREQ,
     feature_columns: Optional[Sequence[str]] = None,
     target_column: str = TARGET_COLUMN,
+    min_coverage: float = 0.6,
 ) -> pd.DataFrame:
     """Clean the raw Air Quality dataframe and return a panel of features.
 
@@ -283,9 +287,14 @@ def clean_uci_air_quality(
         resample_freq = freq.lower() if isinstance(freq, str) else freq
         numeric = numeric.resample(resample_freq).mean()
 
-    numeric = numeric.interpolate(method="time", limit_direction="both")
-    numeric = numeric.ffill().bfill()
-    numeric = numeric.dropna(how="any")
+    numeric = numeric.ffill()
+
+    required = max(1, int(np.ceil(min_coverage * len(feature_cols))))
+    numeric = numeric.dropna(thresh=required)
+    if not np.isfinite(numeric[target_column]).any():
+        raise RuntimeError("No observed target values remain after cleaning the UCI Air Quality data.")
+    if numeric.empty:
+        raise RuntimeError("No usable rows remain after applying coverage filtering.")
 
     return numeric.astype(np.float32)
 
@@ -326,6 +335,7 @@ def prepare_uci_air_cache(cfg: UCIAirCacheConfig) -> Mapping[str, List[str]]:
         freq=cfg.freq,
         feature_columns=feature_cols,
         target_column=cfg.target_column,
+        min_coverage=cfg.min_coverage,
     )
 
     data_dir = Path(cfg.data_dir).expanduser().resolve()
