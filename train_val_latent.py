@@ -307,7 +307,8 @@ def run(
 
     if all_mu:
         latents = torch.cat(all_mu, dim=0)
-        normalize_and_check(latents, plot=True)
+        plot_latents = bool(getattr(config, "VAE_PLOT_LATENTS", False))
+        normalize_and_check(latents, plot=plot_latents)
     else:
         print("No latent means collected (empty dataloader batches?).")
 
