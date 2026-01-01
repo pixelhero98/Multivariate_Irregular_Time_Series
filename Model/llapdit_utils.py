@@ -30,6 +30,37 @@ def sample_t_uniform(scheduler: "NoiseScheduler", n: int, device: torch.device) 
     return torch.randint(1, scheduler.timesteps, (n,), device=device)
 
 
+@torch.no_grad()
+def sample_t_karras(
+    scheduler: "NoiseScheduler",
+    n: int,
+    device: torch.device,
+    *,
+    rho: float = 7.5,
+    exclude_t0: bool = True,
+) -> torch.Tensor:
+    """
+    Sample discrete timesteps by sampling sigma from a Karras distribution
+    and mapping sigma -> nearest timestep index.
+    """
+    ab = scheduler.alpha_bars.to(device=device, dtype=torch.float32)  # [T]
+    sigmas = torch.sqrt((1.0 - ab) / (ab + 1e-12))                    # [T], increasing with t
+
+    t_min = 1 if exclude_t0 else 0
+    sigma_min = sigmas[t_min].item()
+    sigma_max = sigmas[-1].item()
+
+    u = torch.rand(n, device=device, dtype=torch.float32)
+    inv_rho = 1.0 / float(rho)
+    target = (sigma_max**inv_rho + u * (sigma_min**inv_rho - sigma_max**inv_rho)) ** float(rho)
+
+    idx = torch.searchsorted(sigmas, target).clamp(min=t_min, max=sigmas.numel() - 1)
+    idxm = (idx - 1).clamp(min=t_min)
+    pick_lower = (torch.abs(sigmas[idxm] - target) <= torch.abs(sigmas[idx] - target))
+    t = torch.where(pick_lower, idxm, idx)
+    return t.long()
+
+
 def make_warmup_cosine(
     optimizer: torch.optim.Optimizer,
     total_steps: int,
