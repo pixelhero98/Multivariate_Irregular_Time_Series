@@ -145,13 +145,17 @@ class LLapDiT(nn.Module):
         if n >= T:
             step_indices = torch.arange(T - 1, -1, -1, device=device, dtype=torch.long)
         else:
-            smin, smax = sigmas[0].item(), sigmas[-1].item()
+            t_min = 1
+            smin, smax = sigmas[t_min].item(), sigmas[-1].item()
+            
             i = torch.linspace(0, 1, n, device=device)
             target = (smax ** (1 / rho) + i * (smin ** (1 / rho) - smax ** (1 / rho))) ** rho
-            idx = torch.searchsorted(sigmas, target).clamp(max=T - 1)
-            idxm = (idx - 1).clamp(min=0)
+            
+            idx = torch.searchsorted(sigmas, target).clamp(min=t_min, max=T - 1)
+            idxm = (idx - 1).clamp(min=t_min)
             pick_lower = (torch.abs(sigmas[idxm] - target) <= torch.abs(sigmas[idx] - target))
             idx = torch.where(pick_lower, idxm, idx)
+            
             step_indices = torch.flip(torch.unique(idx, sorted=True), dims=[0])
 
         ts_prev = torch.cat([step_indices[1:], step_indices.new_tensor([-1])])
