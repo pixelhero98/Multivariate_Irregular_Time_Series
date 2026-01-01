@@ -529,6 +529,7 @@ def run(
             guidance_power=config.GUIDANCE_POWER,
             lambda_rec_anchor=config.DECODER_FT_ANCHOR,
             self_cond=config.SELF_COND,
+            eta=getattr(config, "GEN_ETA", 0.0),
             dynamic_thresh_p=getattr(config, "DYNAMIC_THRESH_P", 0.0),
             dynamic_thresh_max=getattr(config, "DYNAMIC_THRESH_MAX", 1.0),
             rho=getattr(config, "KARRAS_RHO", 7.5),
@@ -548,7 +549,7 @@ def run(
         steps=config.GEN_STEPS,
         guidance_strength=config.GUIDANCE_STRENGTH,
         guidance_power=config.GUIDANCE_POWER,
-        eta=1.0, # FIX: Explicitly request stochastic sampling
+        eta=getattr(config, "GEN_ETA", 1.0), # FIX: Explicitly request stochastic sampling
         aggregation_method='mean',
         quantiles=(0.1, 0.5, 0.9),
         dynamic_thresh_p=getattr(config, "DYNAMIC_THRESH_P", 0.995), 
@@ -590,6 +591,7 @@ def finetune_vae_decoder(
         gen_steps: int = 36,
         guidance_strength: float = 2.0,
         guidance_power: float = 0.3,
+        eta: float = 0.0,
         lambda_rec_anchor: float = 0.25,
         self_cond: bool = False,
         dynamic_thresh_p: float = 0.0,
@@ -642,6 +644,7 @@ def finetune_vae_decoder(
                 x0_norm_gen = diff_model.generate(
                     shape=(Beff, Hcur, Z), steps=gen_steps,
                     guidance_strength=guidance_strength, guidance_power=guidance_power,
+                    eta=eta,
                     cond_summary=cs, self_cond=self_cond, cfg_rescale=True,
                     # FIX: Added parameter names
                     dynamic_thresh_p=dynamic_thresh_p, 
