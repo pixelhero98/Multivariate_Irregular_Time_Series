@@ -123,28 +123,28 @@ def _batch_elements(mask: torch.Tensor, steps: int) -> float:
 
 
 def _prepare_batch(
-    batch: Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]],
-    device: torch.device,
+        batch: Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Dict[str, torch.Tensor]],
+        device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
     (V, T), _, meta = batch
-    
+
     # 1. Calculate finite masks on the original (Batch, Entity, Time, Feat) data.
     #    This ensures the output shape is (Batch, Entity) and catches NaNs before removal.
     v_finite = _entity_finite_mask(V).to(device)
     t_finite = _entity_finite_mask(T).to(device)
-    
+
     mask = meta["entity_mask"].to(device=device, dtype=torch.bool)
     mask = mask & v_finite & t_finite
 
     # 2. Permute and sanitize (NaN -> 0.0)
     V = _nan_to_num(_permute_to_seq_first(V)).to(device)
     T = _nan_to_num(_permute_to_seq_first(T)).to(device)
-    
+
     # 3. Apply the combined mask
     V = _apply_entity_mask(V, mask)
     T = _apply_entity_mask(T, mask)
     elems = _batch_elements(mask, V.size(1))
-    
+
     return V, T, mask, elems
 
 
