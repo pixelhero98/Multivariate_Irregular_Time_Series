@@ -187,11 +187,13 @@ class LLapDiT(nn.Module):
 
             return (guided - mu_g) / std_g * std_c + mu_c
 
-        def _dynamic_threshold(x0: torch.Tensor, p: float, max_val: float) -> torch.Tensor:
+        def _dynamic_threshold(x0, p, max_val):
             if p <= 0.0:
                 return x0
-            s = torch.quantile(x0.reshape(B, -1).abs(), q=p, dim=1).clamp_min(1.0).view(B, 1, 1)
-            return (x0 / s).clamp_(-max_val, max_val)
+            x = x0.float()
+            s = torch.quantile(x.reshape(B, -1).abs(), q=p, dim=1).clamp_min(1.0).view(B,1,1)
+            x = (x / s).clamp(-max_val, max_val)
+            return x.to(dtype=x0.dtype)
 
         # ---- init state (+ optional inpainting obs at t=T) ----
         x_t = torch.randn(B, L, D, device=device)
