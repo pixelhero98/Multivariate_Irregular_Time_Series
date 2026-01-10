@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class TVHead(nn.Module):
     """Single-hidden-layer MLP that projects features to scalar signals."""
     def __init__(self, feat_dim: int, hidden: int = 32) -> None:
