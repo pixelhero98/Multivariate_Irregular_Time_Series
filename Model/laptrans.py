@@ -11,7 +11,7 @@ __all__ = ["LaplaceTransformEncoder", "LaplacePseudoInverse"]
 
 class LaplaceTransformEncoder(nn.Module):
     """
-    Learned Modal Projection via Spectral Cross-Attention (no ridge solve).
+    Learned Modal Projection via Spectral Cross-Attention.
 
     Output:
         theta: [B, 2K, D]  (first K -> cosine residues, last K -> sine residues)
