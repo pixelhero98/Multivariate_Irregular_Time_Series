@@ -3,15 +3,11 @@ from typing import List, Optional, Union
 import torch
 import torch.nn as nn
 
-from Model.laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
-
-
-def _canon_mode(mode: str) -> str:
-    """Validate that ``mode`` selects either the effective or exact backbone."""
-    mode_lower = mode.lower()
-    if mode_lower not in {"effective", "exact"}:
-        raise ValueError("lap_mode must be 'effective' or 'exact'")
-    return mode_lower
+# Support both repository layouts
+try:
+    from Model.laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
+except Exception:
+    from laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
 
 
 class AdaLayerNorm(nn.Module):
@@ -28,13 +24,7 @@ class AdaLayerNorm(nn.Module):
         nn.init.zeros_(self.to_ss[-1].bias)
 
     def forward(self, x: torch.Tensor, c: Optional[torch.Tensor]) -> torch.Tensor:
-        """Apply normalisation followed by conditioned scale and bias.
-
-        If ``c`` is ``None`` the block falls back to standard layer normalisation
-        with unit scale and zero bias, which is convenient when conditioning is
-        temporarily unavailable (e.g. unconditional guidance passes).
-        """
-
+        """Apply normalisation followed by conditioned scale and bias."""
         h = self.norm(x)
         if c is None:
             scale = torch.zeros(h.size(0), h.size(-1), device=h.device, dtype=h.dtype)
@@ -56,6 +46,7 @@ class TransformerBlock(nn.Module):
         attn_dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         
@@ -81,8 +72,7 @@ class TransformerBlock(nn.Module):
         attn_bias: Optional[torch.Tensor] = None,
         t_vec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Apply multi-head self-attention and an MLP with residuals."""
-
+        
         batch, seq_len, hidden = x.shape
         h = self.norm1(x, t_vec)
         qkv = (
@@ -138,15 +128,16 @@ class CrossAttnBlock(nn.Module):
         x_kv: torch.Tensor,
         t_vec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Attend query tokens ``x_q`` to key/value tokens ``x_kv``."""
-
+        
         batch, seq_len, hidden = x_q.shape
         xq = self.norm_q(x_q, t_vec)
         xkv = self.norm_kv(x_kv, t_vec)
+        
         q = self.q(xq).reshape(batch, seq_len, self.num_heads, hidden // self.num_heads).transpose(1, 2)
         kv = self.kv(xkv).reshape(batch, x_kv.shape[1], 2, self.num_heads, hidden // self.num_heads)
         k = kv[:, :, 0].transpose(1, 2)
         v = kv[:, :, 1].transpose(1, 2)
+        
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (k.shape[-1] ** 0.5)
         attn = torch.softmax(attn_scores, dim=-1)
         attn = self.attn_dropout(attn)
@@ -156,7 +147,9 @@ class CrossAttnBlock(nn.Module):
 
 
 class LaplaceSandwichBlock(nn.Module):
-    """Bridge between Laplace coefficients and transformer style processing."""
+    """
+    Bridge between Laplace coefficients and transformer style processing.
+    """
 
     def __init__(
         self,
@@ -164,22 +157,32 @@ class LaplaceSandwichBlock(nn.Module):
         hidden_dim: int,
         num_heads: int,
         k: int,
-        lap_mode: str = "effective",
         dropout: float = 0.0,
         attn_dropout: float = 0.0,
         cross_first: bool = True,
     ) -> None:
         super().__init__()
-        self.mode = _canon_mode(lap_mode)
         self.cross_first = cross_first
+        self.k = k
 
-        self.analysis = LaplaceTransformEncoder(k=k, feat_dim=input_dim, mode=self.mode)
-        self.synthesis = LaplacePseudoInverse(self.analysis)
+        # Analysis with adaptive ridge
+        self.analysis = LaplaceTransformEncoder(
+            k=k,
+            feat_dim=input_dim,
+            cond_dim=2 * hidden_dim,
+            ridge_lambda=1e-3,
+            adaptive_ridge=True,
+        )
+        self.synthesis = LaplacePseudoInverse(self.analysis, hidden_dim=hidden_dim)
 
-        self.lap2hid = nn.Linear(2 * k, hidden_dim)
-        self.hid2lap = nn.Linear(hidden_dim, 2 * k)
-        nn.init.zeros_(self.hid2lap.weight)
-        nn.init.zeros_(self.hid2lap.bias)
+        # Coefficient-token processing (2K tokens)
+        self.coef2hid = nn.Linear(input_dim, hidden_dim)
+        self.hid2coef = nn.Linear(hidden_dim, input_dim)
+        nn.init.zeros_(self.hid2coef.weight)
+        nn.init.zeros_(self.hid2coef.bias)
+
+        # Learned positional embedding over the modal token index
+        self.mode_pos = nn.Parameter(torch.zeros(1, 2 * k, hidden_dim))
 
         self.self_blk = TransformerBlock(
             hidden_dim,
@@ -198,69 +201,60 @@ class LaplaceSandwichBlock(nn.Module):
     def forward(
         self,
         x_time: torch.Tensor,
-        pos_emb: torch.Tensor,
         t_vec: torch.Tensor,
         attn_bias: Optional[torch.Tensor] = None,
         summary_kv_H: Optional[torch.Tensor] = None,
-        sc_add_H: Optional[torch.Tensor] = None,
+        sc_feat: Optional[torch.Tensor] = None,
         dt: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Process temporal tokens through Laplace and attention stacks.
-
+        """
         Args:
-            x_time: Input sequence ``[B, T, D]`` in the data space.
-            pos_emb: Positional encodings aligned with ``x_time``.
-            t_vec: Conditioning vector ``[B, H]`` (typically a time embedding).
-            attn_bias: Optional pre-computed attention bias for the self-attn block.
-            summary_kv_H: Optional context tokens ``[B, S, H]`` for cross-attention.
-            sc_add_H: Optional additive self-conditioning feature in the hidden space.
-            dt: Optional inter-sample spacing for the "exact" Laplace backbone.
-
-        Returns:
-            Updated time-domain representation with the same shape as ``x_time``.
+            x_time:     [B, T, D_in]
+            t_vec:      [B, H]
+            sc_feat:    [B, T, D_in] - Self conditioning guess in data space
+            dt:         [B, T] or [B, T, 1]
         """
 
-        # Laplace analysis (the exact variant incorporates variable step sizes).
-        if self.mode == "exact":
-            z = self.analysis(x_time, dt=dt)
+        # Conditioning: concat(diffusion embedding, pooled summary).
+        if summary_kv_H is None:
+            summary_pool = torch.zeros_like(t_vec)
         else:
-            z = self.analysis(x_time)
+            summary_pool = summary_kv_H.mean(dim=1)
+        cond_vec = torch.cat([t_vec, summary_pool], dim=-1)
 
-        # Token embedding + time/pos + additive context (FiLM-style adds can be done before this if desired)
-        h = self.lap2hid(z) + pos_emb + t_vec.unsqueeze(1)
-        if sc_add_H is not None:
-            h = h + sc_add_H
+        # 1. Modal projection: x_time -> Theta [B, 2K, D]
+        # Uses adaptive ridge regression driven by cond_vec (noise level).
+        theta, basis, _, _ = self.analysis(x_time, dt=dt, cond=cond_vec, return_basis=True)
+
+        # 2. Embed coefficient tokens
+        h = self.coef2hid(theta) + self.mode_pos + t_vec.unsqueeze(1)
+
+        # 3. Modal Self-Conditioning:
+        # Instead of projecting the mean of sc_feat, we project sc_feat onto the
+        # SAME basis to get modal hints, preserving temporal structure.
+        if sc_feat is not None:
+            # Note: We reuse the same analysis module. Ideally, we would reuse 'basis'
+            # directly to avoid re-computation, but calling forward is cleaner for integration.
+            # cond_vec ensures the same poles/basis are generated.
+            theta_sc = self.analysis(sc_feat, dt=dt, cond=cond_vec, return_basis=False)
+            h = h + self.coef2hid(theta_sc)
 
         def apply_cross(block_input: torch.Tensor) -> torch.Tensor:
             if summary_kv_H is None:
                 return block_input
             return self.cross_blk(block_input, summary_kv_H, t_vec=t_vec)
 
+        # 4. Mixing
         if self.cross_first:
-            # Use global context first, then perform local mixing.
             h = apply_cross(h)
-            h = self.self_blk(
-                h,
-                attn_mask=None,
-                key_padding_mask=None,
-                attn_bias=attn_bias,
-                t_vec=t_vec,
-            )
+            h = self.self_blk(h, attn_mask=None, key_padding_mask=None, attn_bias=attn_bias, t_vec=t_vec)
         else:
-            # Mix locally first, then consult the context summary.
-            h = self.self_blk(
-                h,
-                attn_mask=None,
-                key_padding_mask=None,
-                attn_bias=attn_bias,
-                t_vec=t_vec,
-            )
+            h = self.self_blk(h, attn_mask=None, key_padding_mask=None, attn_bias=attn_bias, t_vec=t_vec)
             h = apply_cross(h)
 
-        # Update Laplace features and synthesise back to the time domain.
-        z_upd = z + self.hid2lap(h)
-        y_time = self.synthesis(z_upd)
-        return y_time
+        # 5. Synthesis: Update modal residues and synthesize back to time domain.
+        theta_upd = theta + self.hid2coef(h)
+        return self.synthesis(theta_upd, basis)
 
 
 class LapFormer(nn.Module):
@@ -273,7 +267,6 @@ class LapFormer(nn.Module):
         num_layers: int,
         num_heads: int,
         laplace_k: Union[int, List[int]] = 8,
-        lap_mode: str = "effective",
         dropout: float = 0.0,
         attn_dropout: float = 0.0,
         self_conditioning: bool = False,
@@ -281,21 +274,13 @@ class LapFormer(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.self_conditioning = self_conditioning
-        self.lap_mode = _canon_mode(lap_mode)
 
         if hidden_dim % num_heads != 0:
-            raise ValueError("hidden_dim must be divisible by num_heads for multi-head attention")
+            raise ValueError("hidden_dim must be divisible by num_heads")
 
         ks = [laplace_k] * num_layers if isinstance(laplace_k, int) else laplace_k
         if len(ks) != num_layers:
             raise ValueError("laplace_k list must match num_layers")
-
-        self.summary2lap = nn.ModuleList([nn.Linear(hidden_dim, 2 * k) for k in ks])
-        self.summary2hid = nn.ModuleList([nn.Linear(2 * k, hidden_dim) for k in ks])
-
-        self.self_cond_proj = (
-            nn.Linear(input_dim, hidden_dim) if self.self_conditioning else None
-        )
 
         self.blocks = nn.ModuleList(
             [
@@ -304,7 +289,6 @@ class LapFormer(nn.Module):
                     hidden_dim=hidden_dim,
                     num_heads=num_heads,
                     k=k,
-                    lap_mode=self.lap_mode,
                     dropout=dropout,
                     attn_dropout=attn_dropout,
                 )
@@ -317,11 +301,6 @@ class LapFormer(nn.Module):
         nn.init.zeros_(self.head_proj.weight)
         nn.init.zeros_(self.head_proj.bias)
 
-    def _pos(self, seq_len: int, batch: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Return a zero positional embedding to disable sinusoidal encodings."""
-
-        return torch.zeros(batch, seq_len, self.hidden_dim, device=device, dtype=dtype)
-
     def forward(
         self,
         x_tokens: torch.Tensor,
@@ -330,57 +309,37 @@ class LapFormer(nn.Module):
         sc_feat: Optional[torch.Tensor] = None,
         dt: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Execute the full LapFormer stack on an input sequence.
+        """
+        Execute the full LapFormer stack.
 
         Args:
-            x_tokens: Input tokens ``[B, T, D]`` (typically noisy samples).
-            t_vec: Global conditioning vector ``[B, H]`` (e.g. time embedding).
-            cond_summary: Optional context tokens ``[B, S, H]`` from a summariser.
-            sc_feat: Optional self-conditioning tensor in the data space.
-            dt: Optional per-step spacing for the "exact" Laplace backbone.
-
-        Returns:
-            Processed tokens with the same shape as ``x_tokens``.
+            x_tokens:       [B, T, D]
+            t_vec:          [B, H]
+            cond_summary:   [B, S, H]
+            sc_feat:        [B, T, D] (Self-conditioning guess)
+            dt:             [B, T] or [B, T, 1]
         """
-
         batch, seq_len, _ = x_tokens.shape
-        device = x_tokens.device
         if t_vec.dim() != 2 or t_vec.shape[0] != batch or t_vec.shape[1] != self.hidden_dim:
-            raise ValueError(
-                f"t_vec must be [B, hidden_dim]={batch, self.hidden_dim}; got {tuple(t_vec.shape)}"
-            )
-        pos = self._pos(seq_len, batch, device, x_tokens.dtype)
-
-        sc_add_H = (
-            self.self_cond_proj(sc_feat)
-            if (self.self_conditioning and sc_feat is not None)
-            else None
-        )
-
-        kvs: List[Optional[torch.Tensor]] = [None] * len(self.blocks)
+            raise ValueError(f"t_vec must be [B, hidden_dim]")
+            
         if cond_summary is not None:
-            if (
-                cond_summary.dim() != 3
-                or cond_summary.shape[0] != batch
-                or cond_summary.shape[2] != self.hidden_dim
-            ):
-                raise ValueError(
-                    "cond_summary must be [B, S, hidden_dim] with "
-                    f"hidden_dim={self.hidden_dim}; got {tuple(cond_summary.shape)}"
-                )
-            for i, summary_to_lap in enumerate(self.summary2lap):
-                summary_lap = summary_to_lap(cond_summary)
-                kvs[i] = self.summary2hid[i](summary_lap)
+            if cond_summary.dim() != 3 or cond_summary.shape[2] != self.hidden_dim:
+                raise ValueError("cond_summary dimension mismatch")
 
         h_time = x_tokens
-        for i, blk in enumerate(self.blocks):
+        
+        # Pass self-conditioning feature (sc_feat) explicitly to each block.
+        # The block handles the projection onto the basis.
+        sc_input = sc_feat if (self.self_conditioning and sc_feat is not None) else None
+        
+        for blk in self.blocks:
             h_time = blk(
                 h_time,
-                pos,
                 t_vec,
                 attn_bias=None,
-                summary_kv_H=kvs[i],
-                sc_add_H=sc_add_H,
+                summary_kv_H=cond_summary,
+                sc_feat=sc_input,
                 dt=dt,
             )
 
