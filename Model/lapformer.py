@@ -238,7 +238,7 @@ class LapFormer(nn.Module):
             feat_dim=input_dim,
             hidden_dim=hidden_dim,
             num_heads=num_heads,
-            cond_dim=2 * hidden_dim,
+            cond_dim=hidden_dim,
             attn_dropout=attn_dropout,
         )
         self.synthesis = ModalSynthesizer(
@@ -289,22 +289,23 @@ class LapFormer(nn.Module):
                 raise ValueError(
                     f"cond_summary must be [B,S,hidden_dim]={B,'S',self.hidden_dim}; got {tuple(cond_summary.shape)}"
                 )
-            summary_pool = cond_summary.mean(dim=1)
-        else:
-            summary_pool = torch.zeros_like(t_vec)
-
-        # Conditioning vector used for pole prediction
-        cond_vec = torch.cat([t_vec, summary_pool], dim=-1)  # [B,2H]
 
         # Compute poles once per forward (reused for x and optional self-conditioning)
-        rho, omega = self.analysis.effective_poles(B, x_tokens.dtype, x_tokens.device, cond=cond_vec)
+        rho, omega = self.analysis.effective_poles(
+            B,
+            x_tokens.dtype,
+            x_tokens.device,
+            diffusion_time_emb=t_vec,
+            history_context=cond_summary,
+        )
 
         # Modal analysis: x_time -> theta
         theta, _, _, _ = self.analysis(
             x_tokens,
             dt=dt,
             t=t,
-            cond=cond_vec,
+            diffusion_time_emb=t_vec,
+            history_context=cond_summary,
             poles=(rho, omega),
             return_t_rel=False,
         )
@@ -315,7 +316,8 @@ class LapFormer(nn.Module):
                 sc_feat,
                 dt=dt,
                 t=t,
-                cond=cond_vec,
+                diffusion_time_emb=t_vec,
+                history_context=cond_summary,
                 poles=(rho, omega),
                 return_t_rel=False,
             )
