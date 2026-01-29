@@ -65,31 +65,39 @@ class LaplaceTransformEncoder(nn.Module):
 
         # Conditioned bounded perturbations for poles
         if cond_dim is not None:
-            self.to_poles = nn.Sequential(
+            self.rho_refine = nn.Sequential(
+                nn.Linear(cond_dim, hidden_dim),
                 nn.SiLU(),
-                nn.Linear(cond_dim, 2 * self.k),
+                nn.Linear(hidden_dim, self.k),
             )
-            nn.init.zeros_(self.to_poles[-1].weight)
-            nn.init.zeros_(self.to_poles[-1].bias)
+            self.omega_refine = nn.Sequential(
+                nn.Linear(cond_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, self.k),
+            )
+            nn.init.zeros_(self.rho_refine[-1].weight)
+            nn.init.zeros_(self.rho_refine[-1].bias)
+            nn.init.zeros_(self.omega_refine[-1].weight)
+            nn.init.zeros_(self.omega_refine[-1].bias)
 
         # --- Spectral cross-attention path (optional) ---
-        # Queries from (rho, omega, component_id) where component_id=0 (cos) or 1 (sin)
+        # Queries from (rho, omega, component_id) where component_id=0 (cos) or 1 (sin).
+        # A learned query bank captures mode-specific priors.
+        self.mode_queries = nn.Parameter(torch.randn(1, 2 * self.k, hidden_dim) * 0.02)
         self.pole_embedding = nn.Sequential(
             nn.Linear(3, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        self.comp_emb = nn.Parameter(torch.zeros(1, 2 * self.k, hidden_dim))
-        nn.init.normal_(self.comp_emb, mean=0.0, std=0.02)
 
-        # Keys from time only (no Fourier features): k_j = f_k(t_j)
-        self.time_key_proj = nn.Sequential(
+        # Time embedding used to inject ordering into attention keys.
+        self.time_emb = nn.Sequential(
             nn.Linear(1, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        # Values from x: v_j = f_v(x_j)
-        self.value_proj = nn.Linear(feat_dim, hidden_dim)
+        # Shared projection for keys/values from x.
+        self.input_proj = nn.Linear(feat_dim, hidden_dim)
 
         self.attention = nn.MultiheadAttention(
             embed_dim=hidden_dim,
@@ -127,22 +135,46 @@ class LaplaceTransformEncoder(nn.Module):
         omega = self.omega_max * torch.sigmoid(self._omega_raw.to(device=device, dtype=dtype))
         return rho, omega
 
+    def _merge_condition(
+        self,
+        cond: Optional[torch.Tensor],
+        diffusion_time_emb: Optional[torch.Tensor],
+        history_context: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if cond is not None:
+            return cond
+        if history_context is None and diffusion_time_emb is None:
+            return None
+        if history_context is None:
+            global_ctx = diffusion_time_emb
+        elif history_context.dim() == 3:
+            global_ctx = history_context.mean(dim=1)
+        else:
+            global_ctx = history_context
+        if diffusion_time_emb is not None:
+            if diffusion_time_emb.dim() == 3:
+                diffusion_time_emb = diffusion_time_emb.squeeze(1)
+            global_ctx = global_ctx + diffusion_time_emb
+        return global_ctx
+
     def effective_poles(
         self,
         batch_size: int,
         dtype: torch.dtype,
         device: torch.device,
         cond: Optional[torch.Tensor] = None,
+        diffusion_time_emb: Optional[torch.Tensor] = None,
+        history_context: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return per-sample effective poles rho, omega with stability constraints."""
         rho0, omega0 = self._base_poles(dtype, device)  # [K], [K]
         rho = rho0.unsqueeze(0).expand(batch_size, self.k).contiguous()
         omega = omega0.unsqueeze(0).expand(batch_size, self.k).contiguous()
 
+        cond = self._merge_condition(cond, diffusion_time_emb, history_context)
         if self.cond_dim is not None and cond is not None:
-            delta = self.to_poles(cond).view(batch_size, 2, self.k)
-            d_rho = self.rho_perturb_scale * torch.tanh(delta[:, 0])
-            d_omega = self.omega_perturb_scale * torch.tanh(delta[:, 1])
+            d_rho = self.rho_perturb_scale * torch.tanh(self.rho_refine(cond))
+            d_omega = self.omega_perturb_scale * torch.tanh(self.omega_refine(cond))
 
             rho = F.softplus(rho0.unsqueeze(0) + d_rho) + self.alpha_min
 
@@ -196,7 +228,7 @@ class LaplaceTransformEncoder(nn.Module):
 
     def _theta_time_attention(self, x: torch.Tensor, t_rel: torch.Tensor, rho: torch.Tensor, omega: torch.Tensor) -> torch.Tensor:
         """Learned spectral cross-attention to obtain residues."""
-        B, T, D = x.shape
+        B, T, _ = x.shape
         # Build 2K queries from poles + component id
         rho2 = rho.repeat(1, 2).unsqueeze(-1)   # [B,2K,1]
         omg2 = omega.repeat(1, 2).unsqueeze(-1) # [B,2K,1]
@@ -208,11 +240,12 @@ class LaplaceTransformEncoder(nn.Module):
             dim=1,
         )  # [B,2K,1]
         pole_feat = torch.cat([rho2, omg2, comp], dim=-1)  # [B,2K,3]
-        q = self.q_norm(self.pole_embedding(pole_feat) + self.comp_emb)  # [B,2K,H]
+        q = self.q_norm(self.mode_queries + self.pole_embedding(pole_feat))  # [B,2K,H]
 
-        # Keys from time only; values from x only
-        k = self.k_norm(self.time_key_proj(t_rel))        # [B,T,H]
-        v = self.v_norm(self.value_proj(x))               # [B,T,H]
+        # Keys/values from x with time embedding for ordering.
+        z_emb = self.input_proj(x) + self.time_emb(t_rel)
+        k = self.k_norm(z_emb)
+        v = self.v_norm(z_emb)
 
         out, _ = self.attention(q, k, v, need_weights=False)  # [B,2K,H]
         theta = self.out_proj(out)  # [B,2K,D]
@@ -224,6 +257,8 @@ class LaplaceTransformEncoder(nn.Module):
         dt: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
         cond: Optional[torch.Tensor] = None,
+        diffusion_time_emb: Optional[torch.Tensor] = None,
+        history_context: Optional[torch.Tensor] = None,
         use_time_attn: bool = True,
         poles: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         return_t_rel: bool = False,
@@ -234,6 +269,8 @@ class LaplaceTransformEncoder(nn.Module):
             x: [B,T,D]
             dt/t: timing info
             cond: [B,cond_dim]
+            diffusion_time_emb: [B,cond_dim] or [B,1,cond_dim]
+            history_context: [B,cond_dim] or [B,T_hist,cond_dim]
             use_time_attn: whether to use spectral cross-attention (True) or
                            diagonal projection (False)
             poles: optional precomputed (rho, omega), each [B,K]
@@ -251,7 +288,14 @@ class LaplaceTransformEncoder(nn.Module):
 
         t_rel = self.relative_time(B, T, x.dtype, x.device, dt=dt, t=t)
         if poles is None:
-            rho, omega = self.effective_poles(B, x.dtype, x.device, cond)
+            rho, omega = self.effective_poles(
+                B,
+                x.dtype,
+                x.device,
+                cond=cond,
+                diffusion_time_emb=diffusion_time_emb,
+                history_context=history_context,
+            )
         else:
             rho, omega = poles
             if rho.shape != (B, self.k) or omega.shape != (B, self.k):
