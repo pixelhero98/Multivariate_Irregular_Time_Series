@@ -17,12 +17,6 @@ class ModalPredictor(nn.Module):
     diffusion-conditioned (stable by construction), and obtain cosine/sine residues
     (c, b) as *modal coefficients* (one vector in R^{D} per mode).
 
-    Computational modes:
-        - use_time_attn=True: learned spectral cross-attention (mode queries attend
-          over time keys, values from x).
-        - use_time_attn=False: fast diagonal projection using the analytic basis
-          (normalized correlations; no ridge solve).
-
     Output:
         theta: [B, 2K, D]  (first K cosine residues, last K sine residues)
         rho:   [B, K]
@@ -40,7 +34,6 @@ class ModalPredictor(nn.Module):
         cond_dim: Optional[int] = None,
         rho_perturb_scale: float = 0.5,
         omega_perturb_scale: float = 0.5,
-        proj_eps: float = 1e-6,
         attn_dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -52,7 +45,6 @@ class ModalPredictor(nn.Module):
         self.cond_dim = cond_dim
         self.rho_perturb_scale = float(rho_perturb_scale)
         self.omega_perturb_scale = float(omega_perturb_scale)
-        self.proj_eps = float(proj_eps)
 
         if self.hidden_dim % num_heads != 0:
             raise ValueError(
@@ -218,14 +210,6 @@ class ModalPredictor(nn.Module):
         sin_basis = decay * torch.sin(angle)
         return torch.cat([cos_basis, sin_basis], dim=-1).contiguous()
 
-    def _theta_diag_projection(self, x: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
-        """Fast approximate projection (no solve): theta = (A^T x) / (diag(A^T A)+eps)."""
-        # x: [B,T,D], basis: [B,T,2K]
-        Bt = basis.transpose(1, 2)  # [B,2K,T]
-        num = torch.bmm(Bt, x)      # [B,2K,D]
-        den = (basis * basis).sum(dim=1).clamp_min(self.proj_eps)  # [B,2K]
-        return (num / den.unsqueeze(-1)).contiguous()
-
     def _theta_time_attention(self, x: torch.Tensor, t_rel: torch.Tensor, rho: torch.Tensor, omega: torch.Tensor) -> torch.Tensor:
         """Learned spectral cross-attention to obtain residues."""
         B, T, _ = x.shape
@@ -259,7 +243,6 @@ class ModalPredictor(nn.Module):
         cond: Optional[torch.Tensor] = None,
         diffusion_time_emb: Optional[torch.Tensor] = None,
         history_context: Optional[torch.Tensor] = None,
-        use_time_attn: bool = True,
         poles: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         return_t_rel: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -271,8 +254,6 @@ class ModalPredictor(nn.Module):
             cond: [B,cond_dim]
             diffusion_time_emb: [B,cond_dim] or [B,1,cond_dim]
             history_context: [B,cond_dim] or [B,T_hist,cond_dim]
-            use_time_attn: whether to use spectral cross-attention (True) or
-                           diagonal projection (False)
             poles: optional precomputed (rho, omega), each [B,K]
             return_t_rel: if True, also returns t_rel [B,T,1]
 
@@ -301,11 +282,7 @@ class ModalPredictor(nn.Module):
             if rho.shape != (B, self.k) or omega.shape != (B, self.k):
                 raise ValueError("poles must be (rho, omega) with shape [B,K]")
 
-        if use_time_attn:
-            theta = self._theta_time_attention(x, t_rel, rho, omega)
-        else:
-            basis = self.basis_matrix(t_rel, rho, omega)
-            theta = self._theta_diag_projection(x, basis)
+        theta = self._theta_time_attention(x, t_rel, rho, omega)
 
         return theta, rho, omega, (t_rel if return_t_rel else None)
 
