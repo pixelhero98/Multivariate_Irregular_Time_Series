@@ -146,7 +146,7 @@ class ModalPredictor(nn.Module):
             global_ctx = global_ctx + diffusion_time_emb
         return global_ctx
 
-    def effective_poles(
+    def modal_poles(
         self,
         batch_size: int,
         dtype: torch.dtype,
@@ -263,7 +263,7 @@ class ModalPredictor(nn.Module):
 
         t_rel = self.relative_time(B, T, x.dtype, x.device, dt=dt, t=t)
         if poles is None:
-            rho, omega = self.effective_poles(
+            rho, omega = self.modal_poles(
                 B,
                 x.dtype,
                 x.device,
