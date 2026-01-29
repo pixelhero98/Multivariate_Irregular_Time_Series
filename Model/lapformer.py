@@ -5,9 +5,9 @@ import torch.nn as nn
 
 # Support both repository layouts
 try:
-    from Model.laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
+    from Model.laptrans import ModalPredictor, ModalSynthesizer
 except Exception:
-    from laptrans import LaplaceTransformEncoder, LaplacePseudoInverse
+    from laptrans import ModalPredictor, ModalSynthesizer
 
 
 class AdaLayerNorm(nn.Module):
@@ -233,7 +233,7 @@ class LapFormer(nn.Module):
         self.k = int(laplace_k)
 
         # Modal analysis/synthesis
-        self.analysis = LaplaceTransformEncoder(
+        self.analysis = ModalPredictor(
             k=self.k,
             feat_dim=input_dim,
             hidden_dim=hidden_dim,
@@ -241,7 +241,7 @@ class LapFormer(nn.Module):
             cond_dim=2 * hidden_dim,
             attn_dropout=attn_dropout,
         )
-        self.synthesis = LaplacePseudoInverse(
+        self.synthesis = ModalSynthesizer(
             self.analysis,
             hidden_dim=hidden_dim,
             use_mlp_residual=use_mlp_residual,
