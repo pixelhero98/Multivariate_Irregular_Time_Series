@@ -6,10 +6,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 
-__all__ = ["LaplaceTransformEncoder", "LaplacePseudoInverse"]
+__all__ = ["ModalPredictor", "ModalSynthesizer"]
 
 
-class LaplaceTransformEncoder(nn.Module):
+class ModalPredictor(nn.Module):
     """Modal analysis that maps a time sequence to modal residues.
 
     This module implements the paper-aligned notion of *effective* modal parameters
@@ -310,7 +310,7 @@ class LaplaceTransformEncoder(nn.Module):
         return theta, rho, omega, (t_rel if return_t_rel else None)
 
 
-class LaplacePseudoInverse(nn.Module):
+class ModalSynthesizer(nn.Module):
     """Explicit synthesis from residues and effective poles.
 
     Computes y(t) = A_lap(t; rho, omega) @ theta, then optionally applies a small
@@ -319,7 +319,7 @@ class LaplacePseudoInverse(nn.Module):
 
     def __init__(
         self,
-        encoder: LaplaceTransformEncoder,
+        encoder: ModalPredictor,
         hidden_dim: Optional[int] = None,
         use_mlp_residual: bool = True,
     ) -> None:

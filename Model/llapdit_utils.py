@@ -299,10 +299,10 @@ class NoiseScheduler(nn.Module):
 
 # ============================ Laplace pole logging ============================
 def iter_laplace_bases(module: nn.Module):
-    from Model.laptrans import LaplaceTransformEncoder
+    from Model.laptrans import ModalPredictor
 
     for m in module.modules():
-        if isinstance(m, LaplaceTransformEncoder):
+        if isinstance(m, ModalPredictor):
             yield m
 
 
@@ -332,7 +332,7 @@ def collect_laplace_poles(
     """Return decay/frequency pairs for all Laplace encoders under ``modules``.
 
     Args:
-        modules: Sequence of modules to search for :class:`LaplaceTransformEncoder`.
+        modules: Sequence of modules to search for :class:`ModalPredictor`.
         tag_prefix: Optional prefix applied to every recorded pole set label.
         prediction_length: Optional horizon identifier added to each entry to
             distinguish plots produced for different prediction lengths.
@@ -341,12 +341,12 @@ def collect_laplace_poles(
         List of dictionaries with ``label``, ``alpha`` and ``omega`` tensors on CPU.
     """
 
-    from Model.laptrans import LaplaceTransformEncoder
+    from Model.laptrans import ModalPredictor
 
     poles = []
     for mod in modules:
         for name, lap in mod.named_modules():
-            if isinstance(lap, LaplaceTransformEncoder):
+            if isinstance(lap, ModalPredictor):
                 tau = torch.nn.functional.softplus(lap._tau) + 1e-3
                 alpha = lap.s_real.clamp_min(lap.alpha_min) * tau
                 # FIX: Apply .abs() to fold negative frequencies onto the positive half-plane
