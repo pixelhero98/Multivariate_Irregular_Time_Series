@@ -278,7 +278,6 @@ class LapFormer(nn.Module):
         sc_feat: Optional[torch.Tensor] = None,       # [B,T,D]
         dt: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
-        use_time_attn: bool = True,
     ) -> torch.Tensor:
         B, T, D = x_tokens.shape
         if t_vec.dim() != 2 or t_vec.shape[0] != B or t_vec.shape[1] != self.hidden_dim:
@@ -306,7 +305,6 @@ class LapFormer(nn.Module):
             dt=dt,
             t=t,
             cond=cond_vec,
-            use_time_attn=use_time_attn,
             poles=(rho, omega),
             return_t_rel=False,
         )
@@ -318,7 +316,6 @@ class LapFormer(nn.Module):
                 dt=dt,
                 t=t,
                 cond=cond_vec,
-                use_time_attn=use_time_attn,
                 poles=(rho, omega),
                 return_t_rel=False,
             )
