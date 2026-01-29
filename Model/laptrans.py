@@ -9,16 +9,27 @@ from torch.nn.utils import spectral_norm
 __all__ = ["ModalPredictor", "ModalSynthesizer"]
 
 
-class ModalPredictor(nn.Module):
-    """Modal analysis that maps a time sequence to modal residues.
+def inv_softplus(y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Inverse of softplus function:
+        softplus(x) = log(1 + exp(x))
+        x = log(exp(y) - 1)   (for y > 0)
 
-    This module implements the paper-aligned notion of modal parameters
-    conditioned on a history summary. We treat poles (rho, omega) as history- and
-    diffusion-conditioned (stable by construction), and obtain cosine/sine residues
-    (c, b) as *modal coefficients* (one vector in R^{D} per mode).
+    Used for precise initialization of parameters constrained by Softplus.
+    """
+    return torch.log(torch.expm1(y.clamp_min(eps)))
+
+
+class ModalPredictor(nn.Module):
+    """
+    Modal analysis encoder: maps a time sequence to modal residues.
+
+    - Poles (rho, omega): global dictionary + instance-specific refinement.
+      Constrained via Softplus/Sigmoid to ensure stability (rho > 0 => Re(s) < 0).
+    - Residues (theta): spectral cross-attention (modes query time).
 
     Output:
-        theta: [B, 2K, D]  (first K cosine residues, last K sine residues)
+        theta: [B, 2K, D]  (first K cosine coeffs, last K sine coeffs)
         rho:   [B, K]
         omega: [B, K]
     """
@@ -35,6 +46,9 @@ class ModalPredictor(nn.Module):
         rho_perturb_scale: float = 0.5,
         omega_perturb_scale: float = 0.5,
         attn_dropout: float = 0.0,
+        proj_dropout: float = 0.0,
+        time_scale: float = 1.0,        # scale timestamps to avoid exp underflow
+        learn_time_scale: bool = False, # optionally learn the time scale
     ) -> None:
         super().__init__()
         self.k = int(k)
@@ -47,16 +61,23 @@ class ModalPredictor(nn.Module):
         self.omega_perturb_scale = float(omega_perturb_scale)
 
         if self.hidden_dim % num_heads != 0:
-            raise ValueError(
-                f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}"
-            )
+            raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}")
 
-        # Base poles
-        self._rho_raw = nn.Parameter(torch.empty(self.k))
-        self._omega_raw = nn.Parameter(torch.empty(self.k))
+        # --- Time Scaling (log-param ensures positivity) ---
+        init_scale = math.log(max(time_scale, 1e-6))
+        if learn_time_scale:
+            self.log_time_scale = nn.Parameter(torch.tensor(init_scale, dtype=torch.float32))
+        else:
+            self.register_buffer("log_time_scale", torch.tensor(init_scale, dtype=torch.float32))
 
-        # Conditioned bounded perturbations for poles
+        # --- Base Poles (global learnable dictionary) ---
+        self._rho_raw = nn.Parameter(torch.empty(self.k))   # pre-softplus
+        self._omega_raw = nn.Parameter(torch.empty(self.k)) # pre-sigmoid (logit)
+
+        # --- Context Refinement Heads ---
         if cond_dim is not None:
+            self.cond_norm = nn.LayerNorm(cond_dim)
+
             self.rho_refine = nn.Sequential(
                 nn.Linear(cond_dim, hidden_dim),
                 nn.SiLU(),
@@ -67,29 +88,28 @@ class ModalPredictor(nn.Module):
                 nn.SiLU(),
                 nn.Linear(hidden_dim, self.k),
             )
+            # Zero-init: start training at base poles
             nn.init.zeros_(self.rho_refine[-1].weight)
             nn.init.zeros_(self.rho_refine[-1].bias)
             nn.init.zeros_(self.omega_refine[-1].weight)
             nn.init.zeros_(self.omega_refine[-1].bias)
 
-        # --- Spectral cross-attention path (optional) ---
-        # Queries from (rho, omega, component_id) where component_id=0 (cos) or 1 (sin).
-        # A learned query bank captures mode-specific priors.
+        # --- Spectral Cross-Attention ---
         self.mode_queries = nn.Parameter(torch.randn(1, 2 * self.k, hidden_dim) * 0.02)
+
         self.pole_embedding = nn.Sequential(
             nn.Linear(3, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Time embedding used to inject ordering into attention keys.
         self.time_emb = nn.Sequential(
             nn.Linear(1, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        # Shared projection for keys/values from x.
         self.input_proj = nn.Linear(feat_dim, hidden_dim)
+        self.proj_drop = nn.Dropout(proj_dropout)
 
         self.attention = nn.MultiheadAttention(
             embed_dim=hidden_dim,
@@ -99,51 +119,48 @@ class ModalPredictor(nn.Module):
         )
         self.out_proj = nn.Linear(hidden_dim, feat_dim)
 
-        # Norms help stability of attention when T is large
         self.q_norm = nn.LayerNorm(hidden_dim)
         self.k_norm = nn.LayerNorm(hidden_dim)
         self.v_norm = nn.LayerNorm(hidden_dim)
 
+        # NOTE: precompute component ids (cos/sin) to avoid allocating every forward.
+        comp = torch.cat([torch.zeros(1, self.k, 1), torch.ones(1, self.k, 1)], dim=1)  # [1,2K,1]
+        self.register_buffer("_comp_id", comp)
+
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        """Initialize poles using inverse activations to guarantee specific start ranges."""
         with torch.no_grad():
-            # rho init in (0.01, 0.2)
+            # rho ~ U(0.01, 0.2) for stable decay
             target_rho = torch.empty_like(self._rho_raw).uniform_(0.01, 0.2)
-            y = (target_rho - self.rho_min).clamp_min(1e-8)
-            self._rho_raw.copy_(torch.log(torch.expm1(y)))
+            self._rho_raw.copy_(inv_softplus((target_rho - self.rho_min).clamp_min(1e-6)))
 
-            # omega init in [0.01*omega_max, 0.95*omega_max]
+            # omega ~ LogUniform(0.01*max, 0.95*max) for frequency diversity
             low_log = math.log(0.01 * self.omega_max)
             high_log = math.log(0.95 * self.omega_max)
-            target_omega = torch.exp(
-                torch.empty_like(self._omega_raw).uniform_(low_log, high_log)
-            )
+            target_omega = torch.exp(torch.empty_like(self._omega_raw).uniform_(low_log, high_log))
             p = (target_omega / self.omega_max).clamp(1e-4, 1 - 1e-4)
-            self._omega_raw.copy_(torch.log(p) - torch.log1p(-p))
+            self._omega_raw.copy_(torch.log(p) - torch.log1p(-p))  # inverse sigmoid
 
-    def _base_poles(self, dtype: torch.dtype, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        rho = F.softplus(self._rho_raw.to(device=device, dtype=dtype)) + self.rho_min
-        omega = self.omega_max * torch.sigmoid(self._omega_raw.to(device=device, dtype=dtype))
-        return rho, omega
+    def time_scale_value(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        return torch.exp(self.log_time_scale.to(device=device, dtype=dtype)).clamp_min(1e-6)
 
     def _merge_condition(
         self,
         diffusion_time_emb: Optional[torch.Tensor],
         history_context: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
-        if history_context is None and diffusion_time_emb is None:
-            return None
-        if history_context is None:
-            global_ctx = diffusion_time_emb
-        elif history_context.dim() == 3:
-            global_ctx = history_context.mean(dim=1)
-        else:
-            global_ctx = history_context
+        """Merge diffusion embedding and history context into a single conditioning vector [B, cond_dim]."""
+        global_ctx = None
+
+        if history_context is not None:
+            global_ctx = history_context.mean(dim=1) if history_context.dim() == 3 else history_context
+
         if diffusion_time_emb is not None:
-            if diffusion_time_emb.dim() == 3:
-                diffusion_time_emb = diffusion_time_emb.squeeze(1)
-            global_ctx = global_ctx + diffusion_time_emb
+            dt_emb = diffusion_time_emb.squeeze(1) if diffusion_time_emb.dim() == 3 else diffusion_time_emb
+            global_ctx = dt_emb if global_ctx is None else (global_ctx + dt_emb)
+
         return global_ctx
 
     def modal_poles(
@@ -154,144 +171,134 @@ class ModalPredictor(nn.Module):
         diffusion_time_emb: Optional[torch.Tensor] = None,
         history_context: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return per-sample effective poles rho, omega with stability constraints."""
-        rho0, omega0 = self._base_poles(dtype, device)  # [K], [K]
-        rho = rho0.unsqueeze(0).expand(batch_size, self.k).contiguous()
-        omega = omega0.unsqueeze(0).expand(batch_size, self.k).contiguous()
+        """Compute effective poles (rho, omega), refining in raw/logit space before activation."""
+        rho_raw0 = self._rho_raw.to(device=device, dtype=dtype)        # [K]
+        omega_logit0 = self._omega_raw.to(device=device, dtype=dtype)  # [K]
+
+        rho_raw = rho_raw0.unsqueeze(0).expand(batch_size, self.k).contiguous()
+        omega_logit = omega_logit0.unsqueeze(0).expand(batch_size, self.k).contiguous()
 
         cond = self._merge_condition(diffusion_time_emb, history_context)
         if self.cond_dim is not None and cond is not None:
-            d_rho = self.rho_perturb_scale * torch.tanh(self.rho_refine(cond))
-            d_omega = self.omega_perturb_scale * torch.tanh(self.omega_refine(cond))
+            if cond.shape[-1] != self.cond_dim:
+                raise ValueError(f"cond last dim {cond.shape[-1]} != cond_dim {self.cond_dim}")
 
-            rho = F.softplus(rho0.unsqueeze(0) + d_rho) + self.rho_min
+            cond = self.cond_norm(cond)
 
-            p0 = (omega0 / self.omega_max).clamp(1e-4, 1 - 1e-4)
-            logit0 = torch.log(p0) - torch.log1p(-p0)
-            omega = self.omega_max * torch.sigmoid(logit0.unsqueeze(0) + d_omega)
+            d_rho = self.rho_perturb_scale * torch.tanh(self.rho_refine(cond))       # [B,K]
+            d_omega = self.omega_perturb_scale * torch.tanh(self.omega_refine(cond)) # [B,K]
 
-        return rho, omega  # [B,K], [B,K]
+            rho_raw = rho_raw + d_rho
+            omega_logit = omega_logit + d_omega
 
-    @staticmethod
+        rho = F.softplus(rho_raw) + self.rho_min
+        omega = self.omega_max * torch.sigmoid(omega_logit)
+        return rho, omega
+
     def relative_time(
+        self,
         B: int,
         T: int,
         dtype: torch.dtype,
         device: torch.device,
-        dt: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Return relative time t_rel with t_rel[:,0]=0, shape [B,T,1]."""
+        """
+        Compute scaled relative time t_rel normalized to start at 0.
+        Returns: [B, T, 1]
+        """
+        scale = self.time_scale_value(dtype, device)
+
         if t is not None:
             t = t.to(device=device, dtype=dtype)
             if t.dim() == 2:
                 t = t.unsqueeze(-1)
-            return t - t[:, :1]
-        if dt is not None:
-            dt = dt.to(device=device, dtype=dtype)
-            if dt.dim() == 2:
-                dt = dt.unsqueeze(-1)
-            t_abs = torch.cumsum(dt, dim=1)
-            return t_abs - t_abs[:, :1]
-        return torch.arange(T, device=device, dtype=dtype).view(1, T, 1).expand(B, T, 1)
+            t_rel = t - t[:, :1]
+            return t_rel / scale
+
+        return torch.arange(T, device=device, dtype=dtype).view(1, T, 1).expand(B, T, 1) / scale
 
     @staticmethod
     def basis_matrix(t_rel: torch.Tensor, rho: torch.Tensor, omega: torch.Tensor) -> torch.Tensor:
-        """Compute damped cosine/sine basis matrix A_lap, shape [B,T,2K]."""
+        """Compute damped sinusoidal basis matrix. Returns: [B, T, 2K]"""
         rho_ = rho.unsqueeze(1)      # [B,1,K]
         omega_ = omega.unsqueeze(1)  # [B,1,K]
         decay = torch.exp(-t_rel * rho_)
         angle = t_rel * omega_
-        cos_basis = decay * torch.cos(angle)
-        sin_basis = decay * torch.sin(angle)
-        return torch.cat([cos_basis, sin_basis], dim=-1).contiguous()
+        return torch.cat([decay * torch.cos(angle), decay * torch.sin(angle)], dim=-1).contiguous()
 
-    def _theta_time_attention(self, x: torch.Tensor, t_rel: torch.Tensor, rho: torch.Tensor, omega: torch.Tensor) -> torch.Tensor:
-        """Learned spectral cross-attention to obtain residues."""
-        B, T, _ = x.shape
-        # Build 2K queries from poles + component id
-        rho2 = rho.repeat(1, 2).unsqueeze(-1)   # [B,2K,1]
-        omg2 = omega.repeat(1, 2).unsqueeze(-1) # [B,2K,1]
-        comp = torch.cat(
-            [
-                torch.zeros(B, self.k, 1, device=x.device, dtype=x.dtype),
-                torch.ones(B, self.k, 1, device=x.device, dtype=x.dtype),
-            ],
-            dim=1,
-        )  # [B,2K,1]
+    def _theta_time_attention(
+        self,
+        x: torch.Tensor,
+        t_rel: torch.Tensor,
+        rho: torch.Tensor,
+        omega: torch.Tensor,
+    ) -> torch.Tensor:
+        """Extract residues via spectral cross-attention."""
+        B, _, _ = x.shape
+
+        # Pole features for each of 2K modes: [rho, omega, comp_id]
+        rho2 = rho.repeat(1, 2).unsqueeze(-1)     # [B,2K,1]
+        omg2 = omega.repeat(1, 2).unsqueeze(-1)   # [B,2K,1]
+        comp = self._comp_id.expand(B, -1, -1).to(device=x.device, dtype=x.dtype)  # [B,2K,1]
         pole_feat = torch.cat([rho2, omg2, comp], dim=-1)  # [B,2K,3]
-        q = self.q_norm(self.mode_queries + self.pole_embedding(pole_feat))  # [B,2K,H]
 
-        # Keys/values from x with time embedding for ordering.
-        z_emb = self.input_proj(x) + self.time_emb(t_rel)
-        k = self.k_norm(z_emb)
-        v = self.v_norm(z_emb)
+        # Queries: learned embeddings + pole embedding (broadcast to B)
+        mq = self.mode_queries.to(device=x.device, dtype=x.dtype).expand(B, -1, -1)  # [B,2K,H]
+        q = self.q_norm(mq + self.pole_embedding(pole_feat))
 
-        out, _ = self.attention(q, k, v, need_weights=False)  # [B,2K,H]
-        theta = self.out_proj(out)  # [B,2K,D]
-        return theta.contiguous()
+        # Keys/values: projected input + time embedding
+        z = self.input_proj(x) + self.time_emb(t_rel)
+        z = self.proj_drop(z)
+        k = self.k_norm(z)
+        v = self.v_norm(z)
+
+        out, _ = self.attention(q, k, v, need_weights=False)
+        return self.out_proj(out).contiguous()
 
     def forward(
         self,
         x: torch.Tensor,
-        dt: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
         diffusion_time_emb: Optional[torch.Tensor] = None,
         history_context: Optional[torch.Tensor] = None,
         poles: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         return_t_rel: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Compute modal residues and effective poles.
-
-        Args:
-            x: [B,T,D]
-            dt/t: timing info
-            diffusion_time_emb: [B,cond_dim] or [B,1,cond_dim]
-            history_context: [B,cond_dim] or [B,T_hist,cond_dim]
-            poles: optional precomputed (rho, omega), each [B,K]
-            return_t_rel: if True, also returns t_rel [B,T,1]
-
-        Returns:
-            theta: [B,2K,D]
-            rho:   [B,K]
-            omega: [B,K]
-            t_rel: [B,T,1] if return_t_rel else None
-        """
         if x.dim() != 3 or x.size(-1) != self.feat_dim:
             raise ValueError(f"Input x must be [B, T, {self.feat_dim}]")
-        B, T, _ = x.shape
 
-        t_rel = self.relative_time(B, T, x.dtype, x.device, dt=dt, t=t)
+        B, T, _ = x.shape
+        t_rel = self.relative_time(B, T, x.dtype, x.device, t=t)
+
         if poles is None:
             rho, omega = self.modal_poles(
-                B,
-                x.dtype,
-                x.device,
+                B, x.dtype, x.device,
                 diffusion_time_emb=diffusion_time_emb,
                 history_context=history_context,
             )
         else:
+            # NOTE: ensure dtype/device correctness when poles are cached or produced elsewhere.
             rho, omega = poles
+            rho = rho.to(device=x.device, dtype=x.dtype)
+            omega = omega.to(device=x.device, dtype=x.dtype)
             if rho.shape != (B, self.k) or omega.shape != (B, self.k):
-                raise ValueError("poles must be (rho, omega) with shape [B,K]")
+                raise ValueError(f"poles must be [B,K]; got rho {rho.shape}, omega {omega.shape}")
 
         theta = self._theta_time_attention(x, t_rel, rho, omega)
-
         return theta, rho, omega, (t_rel if return_t_rel else None)
 
 
 class ModalSynthesizer(nn.Module):
-    """Explicit synthesis from residues and effective poles.
-
-    Computes y(t) = A_lap(t; rho, omega) @ theta, then optionally applies a small
-    residual MLP to capture transients.
-    """
+    """Explicit synthesis: y(t) = A_lap(t) @ theta + MLP(residual)."""
 
     def __init__(
         self,
         encoder: ModalPredictor,
         hidden_dim: Optional[int] = None,
         use_mlp_residual: bool = True,
+        residual_dropout: float = 0.0,
+        use_spectral_norm: bool = True,
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -299,38 +306,47 @@ class ModalSynthesizer(nn.Module):
         D = encoder.feat_dim
         H = int(hidden_dim if hidden_dim is not None else D * 2)
 
+        self.res_drop = nn.Dropout(residual_dropout)
+
         if self.use_mlp_residual:
             self.norm = nn.LayerNorm(D)
-            self.mlp_in = spectral_norm(nn.Linear(D, H * 2))
-            self.mlp_out = spectral_norm(nn.Linear(H, D))
+            lin1 = nn.Linear(D, H * 2)
+            lin2 = nn.Linear(H, D)
+
+            if use_spectral_norm:
+                lin1 = spectral_norm(lin1)
+                lin2 = spectral_norm(lin2)
+
+            self.mlp_in = lin1
+            self.mlp_out = lin2
             nn.init.zeros_(self.mlp_out.weight)
             nn.init.zeros_(self.mlp_out.bias)
 
     def forward(
         self,
-        theta: torch.Tensor,  # [B,2K,D]
-        rho: torch.Tensor,    # [B,K]
-        omega: torch.Tensor,  # [B,K]
-        dt: Optional[torch.Tensor] = None,
+        theta: torch.Tensor,  # [B, 2K, D]
+        rho: torch.Tensor,    # [B, K]
+        omega: torch.Tensor,  # [B, K]
         t: Optional[torch.Tensor] = None,
         target_T: Optional[int] = None,
     ) -> torch.Tensor:
         if theta.dim() != 3:
-            raise ValueError("theta must be [B,2K,D]")
+            raise ValueError("theta must be [B, 2K, D]")
+
         B = theta.shape[0]
 
         if t is not None:
             T = t.shape[1]
-        elif dt is not None:
-            T = dt.shape[1]
         elif target_T is not None:
             T = int(target_T)
         else:
-            raise ValueError("Provide t or dt or target_T to determine output length")
+            raise ValueError("Provide t or target_T")
 
-        t_rel = self.encoder.relative_time(B, T, theta.dtype, theta.device, dt=dt, t=t)
-        basis = self.encoder.basis_matrix(t_rel, rho, omega)  # [B,T,2K]
-        y = torch.bmm(basis, theta)  # [B,T,D]
+        # Use encoder's method to ensure consistent time scaling
+        t_rel = self.encoder.relative_time(B, T, theta.dtype, theta.device, t=t)
+
+        basis = self.encoder.basis_matrix(t_rel, rho, omega)
+        y = torch.bmm(basis, theta)
 
         if not self.use_mlp_residual:
             return y
@@ -338,4 +354,5 @@ class ModalSynthesizer(nn.Module):
         res = self.norm(y)
         gate, val = self.mlp_in(res).chunk(2, dim=-1)
         res = val * F.gelu(gate)
+        res = self.res_drop(res)
         return y + self.mlp_out(res)
