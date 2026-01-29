@@ -29,7 +29,7 @@ class ModalPredictor(nn.Module):
         feat_dim: int,
         hidden_dim: int = 64,
         num_heads: int = 4,
-        alpha_min: float = 1e-6,
+        rho_min: float = 1e-6,
         omega_max: float = math.pi,
         cond_dim: Optional[int] = None,
         rho_perturb_scale: float = 0.5,
@@ -40,7 +40,7 @@ class ModalPredictor(nn.Module):
         self.k = int(k)
         self.feat_dim = int(feat_dim)
         self.hidden_dim = int(hidden_dim)
-        self.alpha_min = float(alpha_min)
+        self.rho_min = float(rho_min)
         self.omega_max = float(omega_max)
         self.cond_dim = cond_dim
         self.rho_perturb_scale = float(rho_perturb_scale)
@@ -110,7 +110,7 @@ class ModalPredictor(nn.Module):
         with torch.no_grad():
             # rho init in (0.01, 0.2)
             target_rho = torch.empty_like(self._rho_raw).uniform_(0.01, 0.2)
-            y = (target_rho - self.alpha_min).clamp_min(1e-8)
+            y = (target_rho - self.rho_min).clamp_min(1e-8)
             self._rho_raw.copy_(torch.log(torch.expm1(y)))
 
             # omega init in [0.01*omega_max, 0.95*omega_max]
@@ -123,18 +123,15 @@ class ModalPredictor(nn.Module):
             self._omega_raw.copy_(torch.log(p) - torch.log1p(-p))
 
     def _base_poles(self, dtype: torch.dtype, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        rho = F.softplus(self._rho_raw.to(device=device, dtype=dtype)) + self.alpha_min
+        rho = F.softplus(self._rho_raw.to(device=device, dtype=dtype)) + self.rho_min
         omega = self.omega_max * torch.sigmoid(self._omega_raw.to(device=device, dtype=dtype))
         return rho, omega
 
     def _merge_condition(
         self,
-        cond: Optional[torch.Tensor],
         diffusion_time_emb: Optional[torch.Tensor],
         history_context: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
-        if cond is not None:
-            return cond
         if history_context is None and diffusion_time_emb is None:
             return None
         if history_context is None:
@@ -154,7 +151,6 @@ class ModalPredictor(nn.Module):
         batch_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        cond: Optional[torch.Tensor] = None,
         diffusion_time_emb: Optional[torch.Tensor] = None,
         history_context: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -163,12 +159,12 @@ class ModalPredictor(nn.Module):
         rho = rho0.unsqueeze(0).expand(batch_size, self.k).contiguous()
         omega = omega0.unsqueeze(0).expand(batch_size, self.k).contiguous()
 
-        cond = self._merge_condition(cond, diffusion_time_emb, history_context)
+        cond = self._merge_condition(diffusion_time_emb, history_context)
         if self.cond_dim is not None and cond is not None:
             d_rho = self.rho_perturb_scale * torch.tanh(self.rho_refine(cond))
             d_omega = self.omega_perturb_scale * torch.tanh(self.omega_refine(cond))
 
-            rho = F.softplus(rho0.unsqueeze(0) + d_rho) + self.alpha_min
+            rho = F.softplus(rho0.unsqueeze(0) + d_rho) + self.rho_min
 
             p0 = (omega0 / self.omega_max).clamp(1e-4, 1 - 1e-4)
             logit0 = torch.log(p0) - torch.log1p(-p0)
@@ -240,7 +236,6 @@ class ModalPredictor(nn.Module):
         x: torch.Tensor,
         dt: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
-        cond: Optional[torch.Tensor] = None,
         diffusion_time_emb: Optional[torch.Tensor] = None,
         history_context: Optional[torch.Tensor] = None,
         poles: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -251,7 +246,6 @@ class ModalPredictor(nn.Module):
         Args:
             x: [B,T,D]
             dt/t: timing info
-            cond: [B,cond_dim]
             diffusion_time_emb: [B,cond_dim] or [B,1,cond_dim]
             history_context: [B,cond_dim] or [B,T_hist,cond_dim]
             poles: optional precomputed (rho, omega), each [B,K]
@@ -273,7 +267,6 @@ class ModalPredictor(nn.Module):
                 B,
                 x.dtype,
                 x.device,
-                cond=cond,
                 diffusion_time_emb=diffusion_time_emb,
                 history_context=history_context,
             )
