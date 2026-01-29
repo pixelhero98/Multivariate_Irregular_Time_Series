@@ -12,7 +12,7 @@ __all__ = ["ModalPredictor", "ModalSynthesizer"]
 class ModalPredictor(nn.Module):
     """Modal analysis that maps a time sequence to modal residues.
 
-    This module implements the paper-aligned notion of *effective* modal parameters
+    This module implements the paper-aligned notion of modal parameters
     conditioned on a history summary. We treat poles (rho, omega) as history- and
     diffusion-conditioned (stable by construction), and obtain cosine/sine residues
     (c, b) as *modal coefficients* (one vector in R^{D} per mode).
